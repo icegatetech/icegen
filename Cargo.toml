@@ -1,0 +1,36 @@
+[package]
+name = "otel-log-generator"
+version = "1.0.0"
+edition = "2021"
+authors = ["TripleCloud Team"]
+description = "OpenTelemetry log generator with HTTP and gRPC support"
+
+[[bin]]
+name = "otel-log-generator"
+path = "src/main.rs"
+
+[lib]
+name = "otel_log_generator"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+tonic = "0.11"
+prost = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+fake = { version = "2.9", features = ["derive", "uuid", "chrono"] }
+rand = "0.8"
+clap = { version = "4.4", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "1.0"
+dotenvy = "0.15"
+tracing-subscriber = "0.3"
+chrono = "0.4"
+hex = "0.4"
+async-trait = "0.1"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+[build-dependencies]
+tonic-build = "0.11"

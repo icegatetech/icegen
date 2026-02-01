@@ -1,0 +1,17 @@
+name: icegen
+
+services:
+  log-generator-otel:
+    build:
+      context: .
+    env_file:
+      - .env
+    command: ["otel", "--endpoint", "${OTEL_LOGS_ENDPOINT}"]
+    profiles: ["otel"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
