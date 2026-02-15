@@ -6,7 +6,6 @@ use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceReque
 use crate::transport::Transport;
 use async_trait::async_trait;
 use prost::Message;
-use rand::Rng;
 use std::time::Duration;
 use tokio::time::sleep;
 use tonic::transport::Channel;
@@ -18,20 +17,11 @@ pub struct GrpcTransport {
 
 impl GrpcTransport {
     pub async fn new(endpoint: String, retry_config: RetryConfig) -> Result<Self> {
-        // Strip http:// or https:// prefix if present
-        let normalized_endpoint = endpoint
+        // Normalize to http:// for tonic (strip any existing scheme first)
+        let host = endpoint
             .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string();
-
-        // Add http:// prefix for tonic
-        let full_endpoint = if normalized_endpoint.starts_with("http://")
-            || normalized_endpoint.starts_with("https://")
-        {
-            normalized_endpoint
-        } else {
-            format!("http://{}", normalized_endpoint)
-        };
+            .trim_start_matches("https://");
+        let full_endpoint = format!("http://{}", host);
 
         let channel = Channel::from_shared(full_endpoint)
             .map_err(|e| GeneratorError::InvalidConfiguration(e.to_string()))?
@@ -47,22 +37,6 @@ impl GrpcTransport {
         })
     }
 
-    fn compute_delay(&self, attempt: u32) -> u64 {
-        let exponential = self
-            .retry_config
-            .base_delay_ms
-            .saturating_mul(1u64 << attempt);
-        let base = exponential.min(self.retry_config.max_delay_ms);
-
-        // Apply ±25% jitter
-        let jitter_range = base / 4;
-        if jitter_range > 0 {
-            let jitter = rand::thread_rng().gen_range(0..=jitter_range * 2);
-            base.saturating_sub(jitter_range).saturating_add(jitter)
-        } else {
-            base
-        }
-    }
 }
 
 #[async_trait]
@@ -78,6 +52,7 @@ impl Transport for GrpcTransport {
         };
 
         let max_attempts = self.retry_config.max_attempts;
+        let mut last_error: Option<GeneratorError> = None;
 
         for attempt in 0..=max_attempts {
             let mut client = self.client.clone();
@@ -88,20 +63,34 @@ impl Transport for GrpcTransport {
                     }
                     return Ok(());
                 }
-                Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                Err(status) if is_retryable_grpc_code(status.code()) => {
                     if attempt == max_attempts {
-                        return Err(GeneratorError::RateLimitExceeded(max_attempts));
+                        return match last_error {
+                            Some(e) => Err(e),
+                            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
+                        };
                     }
 
-                    let delay = self.compute_delay(attempt);
+                    let label = match status.code() {
+                        tonic::Code::ResourceExhausted => "ResourceExhausted",
+                        tonic::Code::Unavailable => "Unavailable",
+                        tonic::Code::Aborted => "Aborted",
+                        tonic::Code::DeadlineExceeded => "DeadlineExceeded",
+                        _ => "transient error",
+                    };
+
+                    let delay = self.retry_config.compute_delay(attempt, None);
 
                     eprintln!(
-                        "  \u{26a0} gRPC ResourceExhausted (attempt {}/{})",
+                        "  \u{26a0} gRPC {} (attempt {}/{}): {}",
+                        label,
                         attempt + 1,
-                        max_attempts + 1
+                        max_attempts + 1,
+                        status.message()
                     );
                     eprintln!("  Waiting {}ms before retry...", delay);
 
+                    last_error = Some(GeneratorError::GrpcError(status));
                     sleep(Duration::from_millis(delay)).await;
                     continue;
                 }
@@ -111,6 +100,19 @@ impl Transport for GrpcTransport {
             }
         }
 
-        Err(GeneratorError::RateLimitExceeded(max_attempts))
+        match last_error {
+            Some(e) => Err(e),
+            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
+        }
     }
+}
+
+fn is_retryable_grpc_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::ResourceExhausted
+            | tonic::Code::Unavailable
+            | tonic::Code::Aborted
+            | tonic::Code::DeadlineExceeded
+    )
 }

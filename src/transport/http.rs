@@ -3,7 +3,6 @@ use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
 use crate::transport::Transport;
 use async_trait::async_trait;
-use rand::Rng;
 use reqwest::Client;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -70,34 +69,35 @@ impl HttpTransport {
         }
     }
 
-    fn compute_delay(&self, attempt: u32, retry_after: Option<u64>) -> u64 {
-        let base = if let Some(retry_after_secs) = retry_after {
-            let retry_after_ms = retry_after_secs * 1000;
-            retry_after_ms.min(self.retry_config.max_delay_ms)
-        } else {
-            let exponential = self.retry_config.base_delay_ms.saturating_mul(1u64 << attempt);
-            exponential.min(self.retry_config.max_delay_ms)
-        };
-
-        // Apply ±25% jitter
-        let jitter_range = base / 4;
-        if jitter_range > 0 {
-            let jitter = rand::thread_rng().gen_range(0..=jitter_range * 2);
-            base.saturating_sub(jitter_range).saturating_add(jitter)
-        } else {
-            base
-        }
-    }
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&self, message: &OTLPLogMessage) -> Result<()> {
         let max_attempts = self.retry_config.max_attempts;
+        let mut last_error: Option<GeneratorError> = None;
 
         for attempt in 0..=max_attempts {
             let request = self.build_request(message);
-            let response = request.send().await?;
+
+            let response = match request.send().await {
+                Ok(resp) => resp,
+                Err(e) if attempt < max_attempts && is_transient_reqwest_error(&e) => {
+                    let delay = self.retry_config.compute_delay(attempt, None);
+                    eprintln!(
+                        "  \u{26a0} Transient network error (attempt {}/{}): {}",
+                        attempt + 1,
+                        max_attempts + 1,
+                        e
+                    );
+                    eprintln!("  Waiting {}ms before retry...", delay);
+                    last_error = Some(GeneratorError::RequestError(e));
+                    sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                Err(e) => return Err(GeneratorError::RequestError(e)),
+            };
+
             let status = response.status();
 
             if status.is_success() {
@@ -119,7 +119,7 @@ impl Transport for HttpTransport {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<u64>().ok());
 
-                let delay = self.compute_delay(attempt, retry_after);
+                let delay = self.retry_config.compute_delay(attempt, retry_after);
 
                 eprintln!(
                     "  \u{26a0} HTTP 429 Too Many Requests (attempt {}/{})",
@@ -132,11 +132,20 @@ impl Transport for HttpTransport {
                 continue;
             }
 
-            // Non-429 error: fail immediately
+            // Non-retryable HTTP error: fail immediately
             let error_text = response.text().await.unwrap_or_default();
             return Err(GeneratorError::HttpError(status.as_u16(), error_text));
         }
 
-        Err(GeneratorError::RateLimitExceeded(max_attempts))
+        // Retries exhausted — return the last network error if that's what consumed them,
+        // otherwise it was all 429s
+        match last_error {
+            Some(e) => Err(e),
+            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
+        }
     }
+}
+
+fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect() || e.is_request()
 }

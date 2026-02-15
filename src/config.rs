@@ -1,10 +1,35 @@
 use crate::error::{GeneratorError, Result};
+use rand::Rng;
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
     pub max_delay_ms: u64,
+}
+
+impl RetryConfig {
+    /// Compute backoff delay for a given attempt.
+    /// If `retry_after` is provided (from an HTTP Retry-After header, in seconds),
+    /// it takes precedence over the exponential calculation, capped at max_delay_ms.
+    /// Applies ±25% jitter to the result.
+    pub fn compute_delay(&self, attempt: u32, retry_after: Option<u64>) -> u64 {
+        let base = if let Some(retry_after_secs) = retry_after {
+            (retry_after_secs * 1000).min(self.max_delay_ms)
+        } else {
+            self.base_delay_ms
+                .saturating_mul(1u64 << attempt)
+                .min(self.max_delay_ms)
+        };
+
+        let jitter_range = base / 4;
+        if jitter_range > 0 {
+            let jitter = rand::thread_rng().gen_range(0..=jitter_range * 2);
+            base.saturating_sub(jitter_range).saturating_add(jitter)
+        } else {
+            base
+        }
+    }
 }
 
 impl Default for RetryConfig {
