@@ -25,11 +25,15 @@ impl OtelLogGenerator {
         println!("  Records per message: {}", config.records_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
 
+        let retry_config = config.retry_config();
+        println!("  Retry: max_attempts={}, base_delay={}ms, max_delay={}ms",
+            retry_config.max_attempts, retry_config.base_delay_ms, retry_config.max_delay_ms);
+
         // Create transport
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
             "http" => {
                 let http_transport =
-                    HttpTransport::new(config.ingest_endpoint.clone(), config.use_protobuf)?;
+                    HttpTransport::new(config.ingest_endpoint.clone(), config.use_protobuf, retry_config)?;
 
                 // Perform health check if configured
                 if let Some(ref health_endpoint) = config.healthcheck_endpoint {
@@ -46,7 +50,7 @@ impl OtelLogGenerator {
                 Arc::new(http_transport)
             }
             "grpc" => {
-                let grpc_transport = GrpcTransport::new(config.ingest_endpoint.clone()).await?;
+                let grpc_transport = GrpcTransport::new(config.ingest_endpoint.clone(), retry_config).await?;
                 Arc::new(grpc_transport)
             }
             _ => unreachable!(), // Already validated in config

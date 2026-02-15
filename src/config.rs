@@ -1,6 +1,23 @@
 use crate::error::{GeneratorError, Result};
 
 #[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 1000,
+            max_delay_ms: 32000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct OtelConfig {
     pub ingest_endpoint: String,
     pub healthcheck_endpoint: Option<String>,
@@ -12,6 +29,9 @@ pub struct OtelConfig {
     pub count: usize,
     pub delay_ms: u64,
     pub continuous: bool,
+    pub retry_max_attempts: u32,
+    pub retry_base_delay_ms: u64,
+    pub retry_max_delay_ms: u64,
 }
 
 impl OtelConfig {
@@ -35,7 +55,33 @@ impl OtelConfig {
             )));
         }
 
+        if self.retry_max_attempts > 10 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "retry_max_attempts must be <= 10".to_string(),
+            ));
+        }
+
+        if self.retry_base_delay_ms < 100 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "retry_base_delay_ms must be >= 100".to_string(),
+            ));
+        }
+
+        if self.retry_max_delay_ms < self.retry_base_delay_ms {
+            return Err(GeneratorError::InvalidConfiguration(
+                "retry_max_delay_ms must be >= retry_base_delay_ms".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    pub fn retry_config(&self) -> RetryConfig {
+        RetryConfig {
+            max_attempts: self.retry_max_attempts,
+            base_delay_ms: self.retry_base_delay_ms,
+            max_delay_ms: self.retry_max_delay_ms,
+        }
     }
 }
 

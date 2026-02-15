@@ -5,6 +5,9 @@ pub enum GeneratorError {
     #[error("HTTP error {0}: {1}")]
     HttpError(u16, String),
 
+    #[error("Rate limit exceeded after {0} retries")]
+    RateLimitExceeded(u32),
+
     #[error("Connection error: {0}")]
     ConnectionError(String),
 
