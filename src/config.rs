@@ -1,14 +1,31 @@
 use crate::error::{GeneratorError, Result};
 use rand::Rng;
 
+const MAX_RETRIES_UPPER_BOUND: u32 = 10;
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub max_attempts: u32,
+    pub max_retries: u32,
     pub base_delay_ms: u64,
     pub max_delay_ms: u64,
 }
 
 impl RetryConfig {
+    /// Create a new RetryConfig, validating that `max_retries` does not exceed the safe upper bound.
+    pub fn new(max_retries: u32, base_delay_ms: u64, max_delay_ms: u64) -> Result<Self> {
+        if max_retries > MAX_RETRIES_UPPER_BOUND {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "max_retries must be <= {}, got {}",
+                MAX_RETRIES_UPPER_BOUND, max_retries
+            )));
+        }
+        Ok(Self {
+            max_retries,
+            base_delay_ms,
+            max_delay_ms,
+        })
+    }
+
     /// Compute backoff delay for a given attempt.
     /// If `retry_after` is provided (from an HTTP Retry-After header, in seconds),
     /// it takes precedence over the exponential calculation, capped at max_delay_ms.
@@ -17,8 +34,9 @@ impl RetryConfig {
         let base = if let Some(retry_after_secs) = retry_after {
             (retry_after_secs * 1000).min(self.max_delay_ms)
         } else {
+            let safe_shift = attempt.min(63);
             self.base_delay_ms
-                .saturating_mul(1u64 << attempt)
+                .saturating_mul(1u64 << safe_shift)
                 .min(self.max_delay_ms)
         };
 
@@ -35,7 +53,7 @@ impl RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 3,
+            max_retries: 3,
             base_delay_ms: 1000,
             max_delay_ms: 32000,
         }
@@ -101,12 +119,12 @@ impl OtelConfig {
         Ok(())
     }
 
-    pub fn retry_config(&self) -> RetryConfig {
-        RetryConfig {
-            max_attempts: self.retry_max_attempts,
-            base_delay_ms: self.retry_base_delay_ms,
-            max_delay_ms: self.retry_max_delay_ms,
-        }
+    pub fn retry_config(&self) -> Result<RetryConfig> {
+        RetryConfig::new(
+            self.retry_max_attempts,
+            self.retry_base_delay_ms,
+            self.retry_max_delay_ms,
+        )
     }
 }
 

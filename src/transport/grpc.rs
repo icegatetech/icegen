@@ -17,11 +17,16 @@ pub struct GrpcTransport {
 
 impl GrpcTransport {
     pub async fn new(endpoint: String, retry_config: RetryConfig) -> Result<Self> {
-        // Normalize to http:// for tonic (strip any existing scheme first)
-        let host = endpoint
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        let full_endpoint = format!("http://{}", host);
+        // Detect the original scheme and preserve it
+        let (scheme, host) = if endpoint.starts_with("https://") {
+            eprintln!("  ⚠ gRPC endpoint uses HTTPS scheme: {}", endpoint);
+            ("https", endpoint.trim_start_matches("https://"))
+        } else if endpoint.starts_with("http://") {
+            ("http", endpoint.trim_start_matches("http://"))
+        } else {
+            ("http", endpoint.as_str())
+        };
+        let full_endpoint = format!("{}://{}", scheme, host);
 
         let channel = Channel::from_shared(full_endpoint)
             .map_err(|e| GeneratorError::InvalidConfiguration(e.to_string()))?
@@ -51,10 +56,10 @@ impl Transport for GrpcTransport {
             }
         };
 
-        let max_attempts = self.retry_config.max_attempts;
+        let max_retries = self.retry_config.max_retries;
         let mut last_error: Option<GeneratorError> = None;
 
-        for attempt in 0..=max_attempts {
+        for attempt in 0..=max_retries {
             let mut client = self.client.clone();
             match client.export(proto_request.clone()).await {
                 Ok(_) => {
@@ -64,11 +69,8 @@ impl Transport for GrpcTransport {
                     return Ok(());
                 }
                 Err(status) if is_retryable_grpc_code(status.code()) => {
-                    if attempt == max_attempts {
-                        return match last_error {
-                            Some(e) => Err(e),
-                            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
-                        };
+                    if attempt == max_retries {
+                        return Err(GeneratorError::GrpcError(status));
                     }
 
                     let label = match status.code() {
@@ -85,7 +87,7 @@ impl Transport for GrpcTransport {
                         "  \u{26a0} gRPC {} (attempt {}/{}): {}",
                         label,
                         attempt + 1,
-                        max_attempts + 1,
+                        max_retries + 1,
                         status.message()
                     );
                     eprintln!("  Waiting {}ms before retry...", delay);
@@ -102,7 +104,7 @@ impl Transport for GrpcTransport {
 
         match last_error {
             Some(e) => Err(e),
-            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
+            None => Err(GeneratorError::RateLimitExceeded(max_retries)),
         }
     }
 }

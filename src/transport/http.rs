@@ -74,20 +74,20 @@ impl HttpTransport {
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&self, message: &OTLPLogMessage) -> Result<()> {
-        let max_attempts = self.retry_config.max_attempts;
+        let max_retries = self.retry_config.max_retries;
         let mut last_error: Option<GeneratorError> = None;
 
-        for attempt in 0..=max_attempts {
+        for attempt in 0..=max_retries {
             let request = self.build_request(message);
 
             let response = match request.send().await {
                 Ok(resp) => resp,
-                Err(e) if attempt < max_attempts && is_transient_reqwest_error(&e) => {
+                Err(e) if attempt < max_retries && is_transient_reqwest_error(&e) => {
                     let delay = self.retry_config.compute_delay(attempt, None);
                     eprintln!(
                         "  \u{26a0} Transient network error (attempt {}/{}): {}",
                         attempt + 1,
-                        max_attempts + 1,
+                        max_retries + 1,
                         e
                     );
                     eprintln!("  Waiting {}ms before retry...", delay);
@@ -108,8 +108,8 @@ impl Transport for HttpTransport {
             }
 
             if status.as_u16() == 429 {
-                if attempt == max_attempts {
-                    return Err(GeneratorError::RateLimitExceeded(max_attempts));
+                if attempt == max_retries {
+                    return Err(GeneratorError::RateLimitExceeded(max_retries));
                 }
 
                 // Parse Retry-After header (integer seconds)
@@ -124,7 +124,7 @@ impl Transport for HttpTransport {
                 eprintln!(
                     "  \u{26a0} HTTP 429 Too Many Requests (attempt {}/{})",
                     attempt + 1,
-                    max_attempts + 1
+                    max_retries + 1
                 );
                 eprintln!("  Waiting {}ms before retry...", delay);
 
@@ -141,7 +141,7 @@ impl Transport for HttpTransport {
         // otherwise it was all 429s
         match last_error {
             Some(e) => Err(e),
-            None => Err(GeneratorError::RateLimitExceeded(max_attempts)),
+            None => Err(GeneratorError::RateLimitExceeded(max_retries)),
         }
     }
 }

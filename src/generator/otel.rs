@@ -25,9 +25,9 @@ impl OtelLogGenerator {
         println!("  Records per message: {}", config.records_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
 
-        let retry_config = config.retry_config();
-        println!("  Retry: max_attempts={}, base_delay={}ms, max_delay={}ms",
-            retry_config.max_attempts, retry_config.base_delay_ms, retry_config.max_delay_ms);
+        let retry_config = config.retry_config()?;
+        println!("  Retry: max_retries={}, base_delay={}ms, max_delay={}ms",
+            retry_config.max_retries, retry_config.base_delay_ms, retry_config.max_delay_ms);
 
         // Create transport
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
