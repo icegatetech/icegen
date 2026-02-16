@@ -33,7 +33,7 @@ impl OtelLogGenerator {
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
             "http" => {
                 let http_transport =
-                    HttpTransport::new(config.ingest_endpoint.clone(), config.use_protobuf, retry_config)?;
+                    HttpTransport::new(config.ingest_endpoint.clone(), config.use_protobuf, retry_config, config.org_id.clone())?;
 
                 // Perform health check if configured
                 if let Some(ref health_endpoint) = config.healthcheck_endpoint {

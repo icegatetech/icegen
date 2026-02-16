@@ -72,9 +72,10 @@ pub struct OtelConfig {
     pub count: usize,
     pub delay_ms: u64,
     pub continuous: bool,
-    pub retry_max_attempts: u32,
+    pub retry_max_retries: u32,
     pub retry_base_delay_ms: u64,
     pub retry_max_delay_ms: u64,
+    pub org_id: String,
 }
 
 impl OtelConfig {
@@ -98,9 +99,9 @@ impl OtelConfig {
             )));
         }
 
-        if self.retry_max_attempts > 10 {
+        if self.retry_max_retries > MAX_RETRIES_UPPER_BOUND {
             return Err(GeneratorError::InvalidConfiguration(
-                "retry_max_attempts must be <= 10".to_string(),
+                format!("retry_max_retries must be <= {}", MAX_RETRIES_UPPER_BOUND),
             ));
         }
 
@@ -121,7 +122,7 @@ impl OtelConfig {
 
     pub fn retry_config(&self) -> Result<RetryConfig> {
         RetryConfig::new(
-            self.retry_max_attempts,
+            self.retry_max_retries,
             self.retry_base_delay_ms,
             self.retry_max_delay_ms,
         )

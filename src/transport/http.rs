@@ -13,10 +13,11 @@ pub struct HttpTransport {
     #[allow(dead_code)]
     use_protobuf: bool,
     retry_config: RetryConfig,
+    org_id: String,
 }
 
 impl HttpTransport {
-    pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig) -> Result<Self> {
+    pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig, org_id: String) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
         Ok(Self {
@@ -24,6 +25,7 @@ impl HttpTransport {
             endpoint,
             use_protobuf,
             retry_config,
+            org_id,
         })
     }
 
@@ -51,20 +53,21 @@ impl HttpTransport {
                 .post(&self.endpoint)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", "tenant1")
+                .header("X-Scope-OrgID", &self.org_id)
                 .json(json_value),
             MessagePayload::Protobuf(bytes) => self
                 .client
                 .post(&self.endpoint)
                 .header("Content-Type", "application/x-protobuf")
                 .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", "tenant1")
+                .header("X-Scope-OrgID", &self.org_id)
                 .body(bytes.clone()),
             MessagePayload::MalformedJson(malformed_string) => self
                 .client
                 .post(&self.endpoint)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "trihub-log-generator/1.0")
+                .header("X-Scope-OrgID", &self.org_id)
                 .body(malformed_string.clone()),
         }
     }
