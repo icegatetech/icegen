@@ -64,6 +64,22 @@ pub struct OtelArgs {
     /// Run in continuous mode
     #[arg(long, env = "CONTINUOUS_MODE", default_value = "false", value_parser = parse_bool)]
     pub continuous: bool,
+
+    /// Maximum number of retries on rate limiting (0-10)
+    #[arg(long, env = "RETRY_MAX_RETRIES", default_value = "3")]
+    pub retry_max_retries: u32,
+
+    /// Base delay in milliseconds for retry backoff
+    #[arg(long, env = "RETRY_BASE_DELAY_MS", default_value = "1000")]
+    pub retry_base_delay_ms: u64,
+
+    /// Maximum delay in milliseconds for retry backoff
+    #[arg(long, env = "RETRY_MAX_DELAY_MS", default_value = "32000")]
+    pub retry_max_delay_ms: u64,
+
+    /// Organization ID for X-Scope-OrgID header
+    #[arg(long, env = "ORG_ID", default_value = "tenant1")]
+    pub org_id: String,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -79,6 +95,10 @@ impl From<OtelArgs> for OtelConfig {
             count: args.count,
             delay_ms: args.delay_ms,
             continuous: args.continuous,
+            retry_max_retries: args.retry_max_retries,
+            retry_base_delay_ms: args.retry_base_delay_ms,
+            retry_max_delay_ms: args.retry_max_delay_ms,
+            org_id: args.org_id,
         }
     }
 }
