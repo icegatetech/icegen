@@ -26,14 +26,24 @@ impl OtelLogGenerator {
         println!("  Invalid record %: {}", config.invalid_record_percent);
 
         let retry_config = config.retry_config()?;
-        println!("  Retry: max_retries={}, base_delay={}ms, max_delay={}ms",
-            retry_config.max_retries, retry_config.base_delay_ms, retry_config.max_delay_ms);
+        println!(
+            "  Retry: max_retries={}, base_delay={}ms, max_delay={}ms",
+            retry_config.max_retries, retry_config.base_delay_ms, retry_config.max_delay_ms
+        );
+        println!(
+            "  Label cardinality limiting: {}",
+            config.label_cardinality_enabled
+        );
 
         // Create transport
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
             "http" => {
-                let http_transport =
-                    HttpTransport::new(config.ingest_endpoint.clone(), config.use_protobuf, retry_config, config.org_id.clone())?;
+                let http_transport = HttpTransport::new(
+                    config.ingest_endpoint.clone(),
+                    config.use_protobuf,
+                    retry_config,
+                    config.org_id.clone(),
+                )?;
 
                 // Perform health check if configured
                 if let Some(ref health_endpoint) = config.healthcheck_endpoint {
@@ -50,13 +60,18 @@ impl OtelLogGenerator {
                 Arc::new(http_transport)
             }
             "grpc" => {
-                let grpc_transport = GrpcTransport::new(config.ingest_endpoint.clone(), retry_config).await?;
+                let grpc_transport =
+                    GrpcTransport::new(config.ingest_endpoint.clone(), retry_config).await?;
                 Arc::new(grpc_transport)
             }
             _ => unreachable!(), // Already validated in config
         };
 
-        let message_generator = OTLPLogMessageGenerator::new("rust-generator".to_string());
+        let cardinality_config = config.label_cardinality_config()?;
+        let message_generator = OTLPLogMessageGenerator::new_with_cardinality(
+            "rust-generator".to_string(),
+            cardinality_config,
+        );
 
         println!("✓ Generator initialized successfully\n");
 
@@ -144,7 +159,8 @@ impl LogGenerator for OtelLogGenerator {
             }
 
             if !self.config.print_logs && (i + 1) % 10 == 0 {
-                let avg_payload_mib = (total_payload_bytes as f64 / (i + 1) as f64) / 1024.0 / 1024.0;
+                let avg_payload_mib =
+                    (total_payload_bytes as f64 / (i + 1) as f64) / 1024.0 / 1024.0;
                 println!(
                     "Progress: {}/{} messages sent, avg payload: {:.4} MiB",
                     i + 1,

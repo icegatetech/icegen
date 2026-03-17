@@ -1,7 +1,43 @@
 use crate::error::{GeneratorError, Result};
 use rand::Rng;
+use std::collections::HashMap;
 
 const MAX_RETRIES_UPPER_BOUND: u32 = 10;
+const DEFAULT_CARDINALITY_LIMITS: &[(&str, usize)] = &[
+    ("k8s.pod.name", 32),
+    ("host.name", 16),
+    ("service.version", 32),
+    ("request.id", 64),
+    ("thread.id", 32),
+    ("user.id", 64),
+];
+
+#[derive(Debug, Clone)]
+pub struct LabelCardinalityConfig {
+    pub enabled: bool,
+    pub default_limit: Option<usize>,
+    pub limits: HashMap<String, usize>,
+}
+
+impl LabelCardinalityConfig {
+    pub fn limit_for(&self, key: &str) -> Option<usize> {
+        self.limits
+            .get(key)
+            .copied()
+            .or(self.default_limit)
+            .filter(|limit| *limit >= 1)
+    }
+}
+
+impl Default for LabelCardinalityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_limit: None,
+            limits: default_cardinality_limits(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -76,6 +112,9 @@ pub struct OtelConfig {
     pub retry_base_delay_ms: u64,
     pub retry_max_delay_ms: u64,
     pub org_id: String,
+    pub label_cardinality_enabled: bool,
+    pub label_cardinality_default_limit: Option<usize>,
+    pub label_cardinality_limits: String,
 }
 
 impl OtelConfig {
@@ -100,9 +139,10 @@ impl OtelConfig {
         }
 
         if self.retry_max_retries > MAX_RETRIES_UPPER_BOUND {
-            return Err(GeneratorError::InvalidConfiguration(
-                format!("retry_max_retries must be <= {}", MAX_RETRIES_UPPER_BOUND),
-            ));
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "retry_max_retries must be <= {}",
+                MAX_RETRIES_UPPER_BOUND
+            )));
         }
 
         if self.retry_base_delay_ms < 100 {
@@ -117,6 +157,16 @@ impl OtelConfig {
             ));
         }
 
+        if let Some(limit) = self.label_cardinality_default_limit {
+            if limit < 1 {
+                return Err(GeneratorError::InvalidConfiguration(
+                    "label_cardinality_default_limit must be >= 1".to_string(),
+                ));
+            }
+        }
+
+        parse_cardinality_limits(&self.label_cardinality_limits)?;
+
         Ok(())
     }
 
@@ -127,6 +177,73 @@ impl OtelConfig {
             self.retry_max_delay_ms,
         )
     }
+
+    pub fn label_cardinality_config(&self) -> Result<LabelCardinalityConfig> {
+        let mut limits = default_cardinality_limits();
+        let custom_limits = parse_cardinality_limits(&self.label_cardinality_limits)?;
+        limits.extend(custom_limits);
+
+        Ok(LabelCardinalityConfig {
+            enabled: self.label_cardinality_enabled,
+            default_limit: self.label_cardinality_default_limit,
+            limits,
+        })
+    }
+}
+
+fn default_cardinality_limits() -> HashMap<String, usize> {
+    DEFAULT_CARDINALITY_LIMITS
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), *value))
+        .collect()
+}
+
+fn parse_cardinality_limits(raw: &str) -> Result<HashMap<String, usize>> {
+    let mut parsed = HashMap::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(parsed);
+    }
+
+    for pair in trimmed.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (key, value_str) = pair.split_once('=').ok_or_else(|| {
+            GeneratorError::InvalidConfiguration(format!(
+                "invalid label cardinality pair '{}', expected key=limit",
+                pair
+            ))
+        })?;
+
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(GeneratorError::InvalidConfiguration(
+                "label cardinality key must not be empty".to_string(),
+            ));
+        }
+
+        let value_str = value_str.trim();
+        let limit = value_str.parse::<usize>().map_err(|_| {
+            GeneratorError::InvalidConfiguration(format!(
+                "invalid label cardinality limit '{}' for key '{}'",
+                value_str, key
+            ))
+        })?;
+
+        if limit < 1 {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "label cardinality limit for key '{}' must be >= 1",
+                key
+            )));
+        }
+
+        parsed.insert(key.to_string(), limit);
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Debug, Clone)]
@@ -159,5 +276,61 @@ impl BatchResult {
 impl Default for BatchResult {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> OtelConfig {
+        OtelConfig {
+            ingest_endpoint: "http://localhost:4318/v1/logs".to_string(),
+            healthcheck_endpoint: None,
+            use_protobuf: false,
+            transport: "http".to_string(),
+            invalid_record_percent: 0.0,
+            records_per_message: 1,
+            print_logs: false,
+            count: 1,
+            delay_ms: 0,
+            continuous: false,
+            retry_max_retries: 3,
+            retry_base_delay_ms: 1000,
+            retry_max_delay_ms: 32000,
+            org_id: "tenant1".to_string(),
+            label_cardinality_enabled: true,
+            label_cardinality_default_limit: None,
+            label_cardinality_limits: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_parse_cardinality_limits_ok() {
+        let parsed = parse_cardinality_limits("k8s.pod.name=32, request.id=64,user.id=10").unwrap();
+        assert_eq!(parsed.get("k8s.pod.name"), Some(&32));
+        assert_eq!(parsed.get("request.id"), Some(&64));
+        assert_eq!(parsed.get("user.id"), Some(&10));
+    }
+
+    #[test]
+    fn test_parse_cardinality_limits_invalid_pairs() {
+        assert!(parse_cardinality_limits("k=").is_err());
+        assert!(parse_cardinality_limits("=1").is_err());
+        assert!(parse_cardinality_limits("k=abc").is_err());
+        assert!(parse_cardinality_limits("k=-1").is_err());
+    }
+
+    #[test]
+    fn test_label_cardinality_config_merges_defaults_and_overrides() {
+        let mut cfg = base_config();
+        cfg.label_cardinality_limits = "k8s.pod.name=7,my.key=3".to_string();
+        cfg.label_cardinality_default_limit = Some(11);
+
+        let cardinality = cfg.label_cardinality_config().unwrap();
+        assert_eq!(cardinality.limit_for("k8s.pod.name"), Some(7));
+        assert_eq!(cardinality.limit_for("request.id"), Some(64));
+        assert_eq!(cardinality.limit_for("my.key"), Some(3));
+        assert_eq!(cardinality.limit_for("unlisted.key"), Some(11));
     }
 }

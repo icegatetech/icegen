@@ -17,7 +17,12 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
-    pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig, org_id: String) -> Result<Self> {
+    pub fn new(
+        endpoint: String,
+        use_protobuf: bool,
+        retry_config: RetryConfig,
+        org_id: String,
+    ) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
         Ok(Self {
@@ -71,7 +76,6 @@ impl HttpTransport {
                 .body(malformed_string.clone()),
         }
     }
-
 }
 
 #[async_trait]

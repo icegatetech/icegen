@@ -80,6 +80,23 @@ pub struct OtelArgs {
     /// Organization ID for X-Scope-OrgID header
     #[arg(long, env = "ORG_ID", default_value = "tenant1")]
     pub org_id: String,
+
+    /// Enable label cardinality limiting
+    #[arg(
+        long,
+        env = "OTEL_LABEL_CARDINALITY_ENABLED",
+        default_value = "true",
+        value_parser = parse_bool
+    )]
+    pub label_cardinality_enabled: bool,
+
+    /// Default label cardinality limit for keys not listed in OTEL_LABEL_CARDINALITY_LIMITS
+    #[arg(long, env = "OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT")]
+    pub label_cardinality_default_limit: Option<usize>,
+
+    /// Per-key cardinality limits as CSV map, e.g. key1=32,key2=64
+    #[arg(long, env = "OTEL_LABEL_CARDINALITY_LIMITS", default_value = "")]
+    pub label_cardinality_limits: String,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -99,6 +116,9 @@ impl From<OtelArgs> for OtelConfig {
             retry_base_delay_ms: args.retry_base_delay_ms,
             retry_max_delay_ms: args.retry_max_delay_ms,
             org_id: args.org_id,
+            label_cardinality_enabled: args.label_cardinality_enabled,
+            label_cardinality_default_limit: args.label_cardinality_default_limit,
+            label_cardinality_limits: args.label_cardinality_limits,
         }
     }
 }

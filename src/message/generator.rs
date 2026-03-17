@@ -1,3 +1,4 @@
+use crate::config::LabelCardinalityConfig;
 use crate::error::{GeneratorError, Result};
 use crate::message::fake_data::FakeDataGenerator;
 use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
@@ -8,11 +9,22 @@ use serde_json::{json, Value};
 
 pub struct OTLPLogMessageGenerator {
     source: String,
+    label_cardinality: LabelCardinalityConfig,
 }
 
 impl OTLPLogMessageGenerator {
     pub fn new(source: String) -> Self {
-        Self { source }
+        Self {
+            source,
+            label_cardinality: LabelCardinalityConfig::default(),
+        }
+    }
+
+    pub fn new_with_cardinality(source: String, label_cardinality: LabelCardinalityConfig) -> Self {
+        Self {
+            source,
+            label_cardinality,
+        }
     }
 
     fn attributes_pairs_to_dict_list(pairs: &[(String, String)]) -> Vec<Value> {
@@ -34,7 +46,7 @@ impl OTLPLogMessageGenerator {
         project_id: &str,
         service_name: &str,
     ) -> Vec<(String, String)> {
-        vec![
+        let attributes = vec![
             ("project_id".to_string(), project_id.to_string()),
             ("service.name".to_string(), service_name.to_string()),
             (
@@ -58,7 +70,9 @@ impl OTLPLogMessageGenerator {
                 FakeDataGenerator::generate_k8s_namespace(),
             ),
             ("generator.source".to_string(), self.source.clone()),
-        ]
+        ];
+
+        self.normalize_attribute_pairs(attributes)
     }
 
     fn generate_scope_attributes_pairs(&self, service_name: &str) -> Vec<(String, String)> {
@@ -104,7 +118,35 @@ impl OTLPLogMessageGenerator {
         log_attributes.push(("request.id".to_string(), request_id.to_string()));
         log_attributes.push(("thread.id".to_string(), thread_id.to_string()));
 
-        log_attributes
+        self.normalize_attribute_pairs(log_attributes)
+    }
+
+    fn normalize_attribute_pairs(&self, pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+        pairs
+            .into_iter()
+            .map(|(key, value)| {
+                let normalized = self.normalize_by_cardinality(&key, &value);
+                (key, normalized)
+            })
+            .collect()
+    }
+
+    fn normalize_by_cardinality(&self, key: &str, value: &str) -> String {
+        if !self.label_cardinality.enabled {
+            return value.to_string();
+        }
+
+        let Some(limit) = self.label_cardinality.limit_for(key) else {
+            return value.to_string();
+        };
+
+        if limit <= 1 {
+            return "bucket_00".to_string();
+        }
+
+        let index = stable_bucket_index(key, value, limit);
+        let width = num_digits(limit.saturating_sub(1));
+        format!("bucket_{index:0width$}")
     }
 
     fn generate_log_body(severity_text: &str, service_name: &str) -> String {
@@ -482,4 +524,40 @@ impl OTLPLogMessageGenerator {
             OTLPLogMessageType::Valid,
         ))
     }
+}
+
+fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+
+    // FNV-1a 64-bit for deterministic, stable bucket assignment across runs.
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in key
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0xff))
+        .chain(value.as_bytes().iter())
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+
+    (hash as usize) % limit
+}
+
+fn num_digits(mut number: usize) -> usize {
+    if number == 0 {
+        return 1;
+    }
+
+    let mut digits = 0;
+    while number > 0 {
+        number /= 10;
+        digits += 1;
+    }
+    digits
 }

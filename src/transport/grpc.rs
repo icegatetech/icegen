@@ -41,7 +41,6 @@ impl GrpcTransport {
             retry_config,
         })
     }
-
 }
 
 #[async_trait]

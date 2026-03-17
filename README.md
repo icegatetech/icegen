@@ -94,6 +94,9 @@ export INVALID_RECORD_PERCENT=0.0
 export RECORDS_PER_MESSAGE=1
 export PRINT_LOGS=false
 export CONTINUOUS_MODE=false
+export OTEL_LABEL_CARDINALITY_ENABLED=true
+export OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT=
+export OTEL_LABEL_CARDINALITY_LIMITS=k8s.pod.name=32,host.name=16,service.version=32,request.id=64,thread.id=32,user.id=64
 
 otel-log-generator otel
 ```
@@ -152,6 +155,44 @@ Boolean environment variables accept the following values:
 | `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message |
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
 | `--continuous` | `CONTINUOUS_MODE` | false | Run in continuous mode |
+| `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
+| `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
+| `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |
+
+## Label Cardinality Limiting
+
+The generator can limit high-cardinality label values at generation time using deterministic
+bucketization (`bucket_00..bucket_N-1`).
+
+- Safe defaults are always applied for:
+  - `k8s.pod.name=32`
+  - `host.name=16`
+  - `service.version=32`
+  - `request.id=64`
+  - `thread.id=32`
+  - `user.id=64`
+- You can override/add per-key limits using `OTEL_LABEL_CARDINALITY_LIMITS`.
+- You can set a catch-all limit using `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT`.
+- Set `OTEL_LABEL_CARDINALITY_ENABLED=false` to disable normalization.
+
+Example for Loki stress tests:
+
+```bash
+export OTEL_LABEL_CARDINALITY_ENABLED=true
+export OTEL_LABEL_CARDINALITY_LIMITS=k8s.pod.name=8,host.name=8,request.id=16,thread.id=8,user.id=16
+export OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT=
+```
+
+Expected cardinality behavior:
+
+| Key | Before | After (default) |
+|-----|--------|------------------|
+| `k8s.pod.name` | very high | `<= 32` |
+| `host.name` | very high | `<= 16` |
+| `service.version` | high | `<= 32` |
+| `request.id` | very high | `<= 64` |
+| `thread.id` | up to ~9000 | `<= 32` |
+| `user.id` | very high | `<= 64` |
 
 ## Message Types
 
