@@ -130,9 +130,11 @@ impl LogGenerator for OtelLogGenerator {
 
     async fn send_messages_batch(&self, count: usize, delay_ms: u64) -> Result<BatchResult> {
         let mut result = BatchResult::new();
+        let mut total_payload_bytes: usize = 0;
 
         for i in 0..count {
             let message = self.generate_message()?;
+            total_payload_bytes += message.payload_size_bytes();
             let success = self.send_message(&message).await?;
 
             if success {
@@ -142,7 +144,13 @@ impl LogGenerator for OtelLogGenerator {
             }
 
             if !self.config.print_logs && (i + 1) % 10 == 0 {
-                println!("Progress: {}/{} messages sent", i + 1, count);
+                let avg_payload_mib = (total_payload_bytes as f64 / (i + 1) as f64) / 1024.0 / 1024.0;
+                println!(
+                    "Progress: {}/{} messages sent, avg payload: {:.4} MiB",
+                    i + 1,
+                    count,
+                    avg_payload_mib
+                );
             }
 
             if delay_ms > 0 && i < count - 1 {

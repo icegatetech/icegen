@@ -36,4 +36,12 @@ impl OTLPLogMessage {
             message_type,
         }
     }
+
+    pub fn payload_size_bytes(&self) -> usize {
+        match &self.message {
+            MessagePayload::Json(json) => serde_json::to_vec(json).map(|v| v.len()).unwrap_or(0),
+            MessagePayload::Protobuf(bytes) => bytes.len(),
+            MessagePayload::MalformedJson(s) => s.len(),
+        }
+    }
 }
