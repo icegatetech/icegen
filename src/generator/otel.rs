@@ -6,7 +6,7 @@ use crate::transport::{GrpcTransport, HttpTransport, Transport};
 use async_trait::async_trait;
 use rand::Rng;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 pub struct OtelLogGenerator {
     config: OtelConfig,
@@ -145,28 +145,43 @@ impl LogGenerator for OtelLogGenerator {
 
     async fn send_messages_batch(&self, count: usize, delay_ms: u64) -> Result<BatchResult> {
         let mut result = BatchResult::new();
-        let mut total_payload_bytes: usize = 0;
+        let mut total_sent_payload_bytes: usize = 0;
+        let mut window_sent_payload_bytes: usize = 0;
+        let batch_started_at = Instant::now();
+        let mut last_progress_at = batch_started_at;
 
         for i in 0..count {
             let message = self.generate_message()?;
-            total_payload_bytes += message.payload_size_bytes();
+            let payload_size_bytes = message.payload_size_bytes();
             let success = self.send_message(&message).await?;
 
             if success {
                 result.add_success();
+                total_sent_payload_bytes += payload_size_bytes;
+                window_sent_payload_bytes += payload_size_bytes;
             } else {
                 result.add_failure();
             }
 
             if !self.config.print_logs && (i + 1) % 10 == 0 {
-                let avg_payload_mib =
-                    (total_payload_bytes as f64 / (i + 1) as f64) / 1024.0 / 1024.0;
+                let total_elapsed_secs = batch_started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+                let window_elapsed_secs = last_progress_at.elapsed().as_secs_f64().max(f64::EPSILON);
+                let total_sent_mib = total_sent_payload_bytes as f64 / 1024.0 / 1024.0;
+                let avg_speed_mib_s = total_sent_mib / total_elapsed_secs;
+                let current_speed_mib_s =
+                    (window_sent_payload_bytes as f64 / 1024.0 / 1024.0) / window_elapsed_secs;
+
                 println!(
-                    "Progress: {}/{} messages sent, avg payload: {:.4} MiB",
+                    "Progress: {}/{} messages sent, payload sent: {:.4} MiB, throughput: avg {:.4} MiB/s, current {:.4} MiB/s",
                     i + 1,
                     count,
-                    avg_payload_mib
+                    total_sent_mib,
+                    avg_speed_mib_s,
+                    current_speed_mib_s
                 );
+
+                last_progress_at = Instant::now();
+                window_sent_payload_bytes = 0;
             }
 
             if delay_ms > 0 && i < count - 1 {
