@@ -106,7 +106,8 @@ pub struct OtelConfig {
     pub records_per_message: usize,
     pub print_logs: bool,
     pub count: usize,
-    pub delay_ms: u64,
+    pub message_interval_ms: u64,
+    pub concurrency: usize,
     pub continuous: bool,
     pub retry_max_retries: u32,
     pub retry_base_delay_ms: u64,
@@ -128,6 +129,12 @@ impl OtelConfig {
         if self.records_per_message < 1 {
             return Err(GeneratorError::InvalidConfiguration(
                 "records_per_message must be >= 1".to_string(),
+            ));
+        }
+
+        if self.concurrency < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "concurrency must be >= 1".to_string(),
             ));
         }
 
@@ -271,6 +278,12 @@ impl BatchResult {
         self.total += 1;
         self.failed += 1;
     }
+
+    pub fn merge(&mut self, other: Self) {
+        self.total += other.total;
+        self.success += other.success;
+        self.failed += other.failed;
+    }
 }
 
 impl Default for BatchResult {
@@ -293,7 +306,8 @@ mod tests {
             records_per_message: 1,
             print_logs: false,
             count: 1,
-            delay_ms: 0,
+            message_interval_ms: 0,
+            concurrency: 1,
             continuous: false,
             retry_max_retries: 3,
             retry_base_delay_ms: 1000,
@@ -332,5 +346,18 @@ mod tests {
         assert_eq!(cardinality.limit_for("request.id"), Some(64));
         assert_eq!(cardinality.limit_for("my.key"), Some(3));
         assert_eq!(cardinality.limit_for("unlisted.key"), Some(11));
+    }
+
+    #[test]
+    fn test_concurrency_validation() {
+        let mut cfg = base_config();
+        cfg.concurrency = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.concurrency = 1;
+        assert!(cfg.validate().is_ok());
+
+        cfg.concurrency = 20;
+        assert!(cfg.validate().is_ok());
     }
 }

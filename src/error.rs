@@ -49,6 +49,9 @@ pub enum GeneratorError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+
+    #[error("Task join error: {0}")]
+    TaskJoinError(#[from] tokio::task::JoinError),
 }
 
 #[allow(clippy::result_large_err)]

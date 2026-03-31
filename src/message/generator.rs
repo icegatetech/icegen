@@ -7,6 +7,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::{json, Value};
 
+#[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
     source: String,
     label_cardinality: LabelCardinalityConfig,

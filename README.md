@@ -11,6 +11,7 @@ High-performance OpenTelemetry log generator with support for HTTP (JSON/Protobu
 - ✅ Configurable invalid record percentage
 - ✅ Health check support
 - ✅ Continuous mode operation
+- ✅ In-process concurrency with fixed worker pool
 - ✅ Graceful shutdown on SIGTERM/SIGINT (Docker-friendly)
 - ✅ Environment variable configuration
 - ✅ Docker support
@@ -41,11 +42,18 @@ docker run otel-log-generator otel --help
 otel-log-generator otel \
   --endpoint http://localhost:4318/v1/logs
 
-# Send 10 messages with 100ms delay
+# Send 10 messages with a 100ms interval between started messages
 otel-log-generator otel \
   --endpoint http://localhost:4318/v1/logs \
   --count 10 \
-  --delay-ms 100
+  --message-interval-ms 100
+
+# Send up to 20 requests in parallel from a single container/process
+otel-log-generator otel \
+  --endpoint http://localhost:4318/v1/logs \
+  --count 10 \
+  --message-interval-ms 100 \
+  --concurrency 20
 
 # Use protobuf encoding
 otel-log-generator otel \
@@ -75,8 +83,7 @@ otel-log-generator otel \
 otel-log-generator otel \
   --endpoint http://localhost:4318/v1/logs \
   --continuous \
-  --count 10 \
-  --delay-ms 1000
+  --message-interval-ms 1000
 ```
 
 ### Environment Variables
@@ -89,7 +96,8 @@ export OTEL_HEALTHCHECK_ENDPOINT=http://localhost:13133/
 export OTEL_USE_PROTOBUF=false
 export OTEL_TRANSPORT=http
 export MESSAGE_COUNT=10
-export MESSAGE_DELAY=100
+export MESSAGE_INTERVAL_MS=100
+export CONCURRENCY=20
 export INVALID_RECORD_PERCENT=0.0
 export RECORDS_PER_MESSAGE=1
 export PRINT_LOGS=false
@@ -119,15 +127,17 @@ The generator handles shutdown signals gracefully, making it Docker-friendly:
 - **SIGINT**: Ctrl+C - triggers graceful shutdown
 
 In continuous mode, the generator will:
-1. Complete the current batch of messages
-2. Close all connections properly
-3. Log shutdown status
+1. Stop starting new sends after `Ctrl+C` or `SIGTERM`
+2. Let in-flight requests finish
+3. Close all connections properly
 4. Exit cleanly
 
 **Docker Example:**
 ```bash
-# Start in continuous mode
-docker run -d --name gen otel-log-generator otel --continuous
+# Start in continuous mode with 20 in-process workers
+docker run -d --name gen \
+  -e CONCURRENCY=20 \
+  otel-log-generator otel --continuous
 
 # Gracefully stop (sends SIGTERM)
 docker stop gen  # Waits up to 10s for graceful shutdown
@@ -149,8 +159,9 @@ Boolean environment variables accept the following values:
 | `--healthcheck-endpoint` | `OTEL_HEALTHCHECK_ENDPOINT` | none | Health check endpoint |
 | `--use-protobuf` | `OTEL_USE_PROTOBUF` | false | Use protobuf encoding |
 | `--transport` | `OTEL_TRANSPORT` | http | Transport type (http/grpc) |
-| `--count` | `MESSAGE_COUNT` | 1 | Number of messages to send |
-| `--delay-ms` | `MESSAGE_DELAY` | 0 | Delay between messages (ms) |
+| `--count` | `MESSAGE_COUNT` | 1 | Number of messages to send in batch mode; ignored in continuous mode |
+| `--message-interval-ms` | `MESSAGE_INTERVAL_MS` | 0 | Minimum interval between started messages in batch mode; per-worker interval in continuous mode (ms) |
+| `--concurrency` | `CONCURRENCY` | 1 | Number of concurrent workers inside one process |
 | `--invalid-record-percent` | `INVALID_RECORD_PERCENT` | 0.0 | % of invalid records (0-100) |
 | `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message |
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
@@ -195,6 +206,18 @@ Expected cardinality behavior:
 | `user.id` | very high | `<= 64` |
 
 ## Message Types
+
+## Concurrency Semantics
+
+- `CONCURRENCY` controls how many long-lived workers run inside one process.
+- In batch mode, total sends = `MESSAGE_COUNT`.
+- Batch work is distributed across up to `CONCURRENCY` workers.
+- In batch mode, `MESSAGE_INTERVAL_MS` is enforced globally between started messages.
+- In continuous mode, `CONCURRENCY` independent workers run in parallel until shutdown.
+- In continuous mode, `MESSAGE_COUNT` is ignored.
+- In continuous mode, `MESSAGE_INTERVAL_MS` is applied independently by each worker.
+- `MESSAGE_DELAY` / `--delay-ms` remain accepted as deprecated aliases for backward compatibility.
+- Recommended Docker setup: one container with `CONCURRENCY=20` instead of scaling container count for this use case.
 
 ### Valid Messages
 

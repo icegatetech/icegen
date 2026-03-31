@@ -41,13 +41,21 @@ pub struct OtelArgs {
     #[arg(long, env = "OTEL_TRANSPORT", default_value = "http")]
     pub transport: String,
 
-    /// Number of messages to send
+    /// Number of messages to send in batch mode; ignored in continuous mode
     #[arg(long, env = "MESSAGE_COUNT", default_value = "1")]
     pub count: usize,
 
-    /// Delay between messages in milliseconds
-    #[arg(long, env = "MESSAGE_DELAY", default_value = "0")]
-    pub delay_ms: u64,
+    /// Minimum interval between started messages in milliseconds; global in batch mode, per worker in continuous mode
+    #[arg(long = "message-interval-ms", env = "MESSAGE_INTERVAL_MS")]
+    pub message_interval_ms: Option<u64>,
+
+    /// Deprecated alias for --message-interval-ms / MESSAGE_INTERVAL_MS
+    #[arg(long = "delay-ms", env = "MESSAGE_DELAY", hide = true)]
+    pub delay_ms_legacy: Option<u64>,
+
+    /// Number of concurrent workers
+    #[arg(long, env = "CONCURRENCY", default_value = "1")]
+    pub concurrency: usize,
 
     /// Percentage of invalid records to generate (0-100)
     #[arg(long, env = "INVALID_RECORD_PERCENT", default_value = "0.0")]
@@ -110,7 +118,8 @@ impl From<OtelArgs> for OtelConfig {
             records_per_message: args.records_per_message,
             print_logs: args.print_logs,
             count: args.count,
-            delay_ms: args.delay_ms,
+            message_interval_ms: args.message_interval_ms.or(args.delay_ms_legacy).unwrap_or(0),
+            concurrency: args.concurrency,
             continuous: args.continuous,
             retry_max_retries: args.retry_max_retries,
             retry_base_delay_ms: args.retry_base_delay_ms,
@@ -120,5 +129,61 @@ impl From<OtelArgs> for OtelConfig {
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_new_message_interval_flag() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--message-interval-ms",
+            "250",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.message_interval_ms, 250);
+    }
+
+    #[test]
+    fn cli_keeps_legacy_delay_flag_as_alias() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--delay-ms",
+            "125",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.message_interval_ms, 125);
+    }
+
+    #[test]
+    fn cli_prefers_new_message_interval_over_legacy_alias() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--delay-ms",
+            "125",
+            "--message-interval-ms",
+            "250",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.message_interval_ms, 250);
     }
 }

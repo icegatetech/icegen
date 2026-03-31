@@ -5,6 +5,7 @@ use crate::transport::Transport;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 pub struct HttpTransport {
@@ -80,9 +81,14 @@ impl HttpTransport {
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn send(&self, message: &OTLPLogMessage) -> Result<()> {
+    async fn send(
+        &self,
+        message: &OTLPLogMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<()> {
         let max_retries = self.retry_config.max_retries;
         let mut last_error: Option<GeneratorError> = None;
+        let mut shutdown_rx = shutdown_rx.clone();
 
         for attempt in 0..=max_retries {
             let request = self.build_request(message);
@@ -99,7 +105,19 @@ impl Transport for HttpTransport {
                     );
                     eprintln!("  Waiting {}ms before retry...", delay);
                     last_error = Some(GeneratorError::RequestError(e));
-                    sleep(Duration::from_millis(delay)).await;
+                    if *shutdown_rx.borrow() {
+                        return Err(
+                            last_error.expect("last_error must be set before shutdown check")
+                        );
+                    }
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(delay)) => {}
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_ok() && *shutdown_rx.borrow() {
+                                return Err(last_error.expect("last_error must be set before waiting"));
+                            }
+                        }
+                    }
                     continue;
                 }
                 Err(e) => return Err(GeneratorError::RequestError(e)),
@@ -135,7 +153,17 @@ impl Transport for HttpTransport {
                 );
                 eprintln!("  Waiting {}ms before retry...", delay);
 
-                sleep(Duration::from_millis(delay)).await;
+                if *shutdown_rx.borrow() {
+                    return Err(GeneratorError::RateLimitExceeded(attempt + 1));
+                }
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(delay)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_ok() && *shutdown_rx.borrow() {
+                            return Err(GeneratorError::RateLimitExceeded(attempt + 1));
+                        }
+                    }
+                }
                 continue;
             }
 

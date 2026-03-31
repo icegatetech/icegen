@@ -7,6 +7,7 @@ use crate::transport::Transport;
 use async_trait::async_trait;
 use prost::Message;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tonic::transport::Channel;
 
@@ -45,7 +46,11 @@ impl GrpcTransport {
 
 #[async_trait]
 impl Transport for GrpcTransport {
-    async fn send(&self, message: &OTLPLogMessage) -> Result<()> {
+    async fn send(
+        &self,
+        message: &OTLPLogMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<()> {
         let proto_request = match &message.message {
             MessagePayload::Protobuf(bytes) => ExportLogsServiceRequest::decode(&bytes[..])?,
             MessagePayload::Json(_) | MessagePayload::MalformedJson(_) => {
@@ -57,6 +62,7 @@ impl Transport for GrpcTransport {
 
         let max_retries = self.retry_config.max_retries;
         let mut last_error: Option<GeneratorError> = None;
+        let mut shutdown_rx = shutdown_rx.clone();
 
         for attempt in 0..=max_retries {
             let mut client = self.client.clone();
@@ -92,7 +98,19 @@ impl Transport for GrpcTransport {
                     eprintln!("  Waiting {}ms before retry...", delay);
 
                     last_error = Some(GeneratorError::GrpcError(status));
-                    sleep(Duration::from_millis(delay)).await;
+                    if *shutdown_rx.borrow() {
+                        return Err(
+                            last_error.expect("last_error must be set before shutdown check")
+                        );
+                    }
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(delay)) => {}
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_ok() && *shutdown_rx.borrow() {
+                                return Err(last_error.expect("last_error must be set before waiting"));
+                            }
+                        }
+                    }
                     continue;
                 }
                 Err(status) => {

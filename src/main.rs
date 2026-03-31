@@ -1,6 +1,8 @@
 use clap::Parser;
 use otel_log_generator::{Cli, GeneratorType, LogGenerator, OtelConfig, OtelLogGenerator};
+use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.generator {
         GeneratorType::Otel(args) => {
             let config: OtelConfig = args.into();
-            let generator = OtelLogGenerator::new(config.clone()).await?;
+            let generator = Arc::new(OtelLogGenerator::new(config.clone()).await?);
 
             if config.continuous {
                 println!("Running in continuous mode. Press Ctrl+C or send SIGTERM to stop.");
@@ -44,31 +46,43 @@ async fn main() -> anyhow::Result<()> {
                     println!("\nReceived Ctrl+C, shutting down gracefully...");
                 };
 
+                let mut generator_task = {
+                    let generator = Arc::clone(&generator);
+                    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                    let generator_task =
+                        tokio::spawn(async move { generator.run_continuous(shutdown_rx).await });
+                    (shutdown_tx, generator_task)
+                };
+
                 tokio::select! {
-                    _ = async {
-                        loop {
-                            let result = generator
-                                .send_messages_batch(config.count, config.delay_ms)
-                                .await.unwrap_or_else(|e| {
-                                    eprintln!("Error sending batch: {}", e);
-                                    Default::default()
-                                });
-                            if !config.print_logs {
-                                println!(
-                                    "Batch complete: {}/{} messages sent successfully",
-                                    result.success, result.total
-                                );
+                    result = &mut generator_task.1 => {
+                        let result = result??;
+                        if !config.print_logs {
+                            println!(
+                                "\nSummary: {}/{} messages sent successfully",
+                                result.success, result.total
+                            );
+                            if result.failed > 0 {
+                                println!("Failed: {} messages", result.failed);
                             }
                         }
-                    } => {}
+                    }
                     _ = shutdown => {
+                        let _ = generator_task.0.send(true);
+                        let result = generator_task.1.await??;
                         generator.close().await?;
-                        println!("Shutdown complete.");
+                        println!(
+                            "Shutdown complete. Final summary: {}/{} messages sent successfully",
+                            result.success, result.total
+                        );
+                        if result.failed > 0 {
+                            println!("Failed: {} messages", result.failed);
+                        }
                     }
                 }
             } else {
                 let result = generator
-                    .send_messages_batch(config.count, config.delay_ms)
+                    .send_messages_batch(config.count, config.message_interval_ms)
                     .await?;
                 println!(
                     "\nSummary: {}/{} messages sent successfully",
