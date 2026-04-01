@@ -114,6 +114,8 @@ pub struct OtelConfig {
     pub retry_max_delay_ms: u64,
     pub tenant_id: String,
     pub tenant_count: usize,
+    pub cloud_account_count_per_tenant: usize,
+    pub service_count_per_tenant: usize,
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
@@ -168,6 +170,18 @@ impl OtelConfig {
         if self.tenant_count < 1 {
             return Err(GeneratorError::InvalidConfiguration(
                 "tenant_count must be >= 1".to_string(),
+            ));
+        }
+
+        if self.cloud_account_count_per_tenant < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "cloud_account_count_per_tenant must be >= 1".to_string(),
+            ));
+        }
+
+        if self.service_count_per_tenant < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "service_count_per_tenant must be >= 1".to_string(),
             ));
         }
 
@@ -344,6 +358,8 @@ mod tests {
             retry_max_delay_ms: 32000,
             tenant_id: "tenant1".to_string(),
             tenant_count: 1,
+            cloud_account_count_per_tenant: 4,
+            service_count_per_tenant: 6,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -396,6 +412,20 @@ mod tests {
     fn test_tenant_count_validation() {
         let mut cfg = base_config();
         cfg.tenant_count = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_cloud_account_count_per_tenant_validation() {
+        let mut cfg = base_config();
+        cfg.cloud_account_count_per_tenant = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_service_count_per_tenant_validation() {
+        let mut cfg = base_config();
+        cfg.service_count_per_tenant = 0;
         assert!(cfg.validate().is_err());
     }
 

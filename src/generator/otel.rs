@@ -13,12 +13,33 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration, Instant};
 
+#[derive(Clone, Debug)]
+struct TenantProfile {
+    tenant_id: String,
+    cloud_account_ids: Arc<[String]>,
+    service_names: Arc<[String]>,
+}
+
+impl TenantProfile {
+    fn select_cloud_account_id(&self) -> String {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..self.cloud_account_ids.len());
+        self.cloud_account_ids[index].clone()
+    }
+
+    fn select_service_name(&self) -> String {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..self.service_names.len());
+        self.service_names[index].clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct OtelLogGenerator {
     config: OtelConfig,
     message_generator: OTLPLogMessageGenerator,
     transport: Arc<dyn Transport>,
-    tenant_pool: Arc<[String]>,
+    tenant_profiles: Arc<[TenantProfile]>,
 }
 
 struct ProgressTracker {
@@ -141,22 +162,39 @@ impl BatchPacer {
 type BatchFuture<'a> = Pin<Box<dyn Future<Output = Result<BatchResult>> + Send + 'a>>;
 
 impl OtelLogGenerator {
-    fn build_tenant_pool(config: &OtelConfig) -> Arc<[String]> {
-        if config.tenant_count == 1 {
-            Arc::from([config.tenant_id.clone()])
+    fn build_tenant_profiles(config: &OtelConfig) -> Arc<[TenantProfile]> {
+        let tenant_ids = if config.tenant_count == 1 {
+            vec![config.tenant_id.clone()]
         } else {
-            Arc::from(
-                (1..=config.tenant_count)
-                    .map(|index| format!("tenant{}", index))
-                    .collect::<Vec<_>>(),
-            )
-        }
+            (1..=config.tenant_count)
+                .map(|index| format!("tenant{}", index))
+                .collect::<Vec<_>>()
+        };
+
+        Arc::from(
+            tenant_ids
+                .into_iter()
+                .map(|tenant_id| TenantProfile {
+                    cloud_account_ids: build_tenant_value_pool(
+                        &tenant_id,
+                        "acc",
+                        config.cloud_account_count_per_tenant,
+                    ),
+                    service_names: build_tenant_value_pool(
+                        &tenant_id,
+                        "svc",
+                        config.service_count_per_tenant,
+                    ),
+                    tenant_id,
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
-    fn select_tenant_id(&self) -> String {
+    fn select_tenant_profile(&self) -> &TenantProfile {
         let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..self.tenant_pool.len());
-        self.tenant_pool[index].clone()
+        let index = rng.gen_range(0..self.tenant_profiles.len());
+        &self.tenant_profiles[index]
     }
 
     fn batch_counts_per_worker(total: usize, concurrency: usize) -> Vec<usize> {
@@ -187,6 +225,10 @@ impl OtelLogGenerator {
                 config.tenant_count, config.tenant_count
             );
         }
+        println!(
+            "  Tenant profile pools: {} cloud accounts/tenant, {} services/tenant",
+            config.cloud_account_count_per_tenant, config.service_count_per_tenant
+        );
 
         let retry_config = config.retry_config()?;
         println!(
@@ -241,14 +283,14 @@ impl OtelLogGenerator {
             "rust-generator".to_string(),
             cardinality_config,
         );
-        let tenant_pool = Self::build_tenant_pool(&config);
+        let tenant_profiles = Self::build_tenant_profiles(&config);
         println!("✓ Generator initialized successfully\n");
 
         Ok(Self {
             config,
             message_generator,
             transport,
-            tenant_pool,
+            tenant_profiles,
         })
     }
 
@@ -403,18 +445,28 @@ impl OtelLogGenerator {
 impl LogGenerator for OtelLogGenerator {
     fn generate_message(&self) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
-        let tenant_id = self.select_tenant_id();
+        let tenant_profile = self.select_tenant_profile();
+        let tenant_id = tenant_profile.tenant_id.clone();
+        let cloud_account_id = tenant_profile.select_cloud_account_id();
+        let service_name = tenant_profile.select_service_name();
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
 
         if should_be_invalid {
-            self.message_generator
-                .generate_invalid_message_for_tenant(tenant_id)
+            self.message_generator.generate_invalid_message(tenant_id)
         } else if self.config.transport == "grpc" || self.config.use_protobuf {
-            self.message_generator
-                .generate_protobuf_message_for_tenant(tenant_id, self.config.records_per_message)
+            self.message_generator.generate_protobuf_message(
+                tenant_id,
+                cloud_account_id,
+                service_name,
+                self.config.records_per_message,
+            )
         } else {
-            self.message_generator
-                .generate_aggregated_message_for_tenant(tenant_id, self.config.records_per_message)
+            self.message_generator.generate_aggregated_message(
+                tenant_id,
+                cloud_account_id,
+                service_name,
+                self.config.records_per_message,
+            )
         }
     }
 
@@ -502,11 +554,21 @@ impl LogGenerator for OtelLogGenerator {
     }
 }
 
+fn build_tenant_value_pool(tenant_id: &str, suffix: &str, count: usize) -> Arc<[String]> {
+    let width = count.to_string().len().max(2);
+    Arc::from(
+        (1..=count)
+            .map(|index| format!("{tenant_id}-{suffix}-{index:0width$}"))
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::GeneratorError;
     use crate::transport::Transport;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -678,6 +740,8 @@ mod tests {
             retry_max_delay_ms: 32000,
             tenant_id: "tenant1".to_string(),
             tenant_count: 1,
+            cloud_account_count_per_tenant: 4,
+            service_count_per_tenant: 6,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -699,6 +763,38 @@ mod tests {
         );
     }
 
+    fn resource_attribute(message: &OTLPLogMessage, key: &str) -> Option<String> {
+        let MessagePayload::Json(json) = &message.message else {
+            return None;
+        };
+
+        json.get("resourceLogs")
+            .and_then(Value::as_array)
+            .and_then(|resource_logs| resource_logs.first())
+            .and_then(|resource_log| resource_log.get("resource"))
+            .and_then(|resource| resource.get("attributes"))
+            .and_then(Value::as_array)
+            .and_then(|attributes| {
+                attributes.iter().find_map(|attribute| {
+                    (attribute.get("key").and_then(Value::as_str) == Some(key)).then(|| {
+                        attribute
+                            .get("value")
+                            .and_then(|value| value.get("stringValue"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })?
+                })
+            })
+    }
+
+    fn profile_for<'a>(generator: &'a OtelLogGenerator, tenant_id: &str) -> &'a TenantProfile {
+        generator
+            .tenant_profiles
+            .iter()
+            .find(|profile| profile.tenant_id == tenant_id)
+            .expect("tenant profile must exist")
+    }
+
     #[tokio::test]
     async fn continuous_worker_continues_after_single_iteration_error() {
         let config = OtelConfig {
@@ -718,6 +814,8 @@ mod tests {
             retry_max_delay_ms: 32000,
             tenant_id: "tenant1".to_string(),
             tenant_count: 1,
+            cloud_account_count_per_tenant: 4,
+            service_count_per_tenant: 6,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -962,6 +1060,93 @@ mod tests {
             let message = generator.generate_message().unwrap();
             assert_eq!(message.tenant_id, "tenant1");
         }
+    }
+
+    #[test]
+    fn single_tenant_builds_one_profile_for_explicit_tenant_id() {
+        let mut config = test_config(3, 0, 1);
+        config.tenant_id = "tenant_custom".to_string();
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        assert_eq!(generator.tenant_profiles.len(), 1);
+        let profile = &generator.tenant_profiles[0];
+        assert_eq!(profile.tenant_id, "tenant_custom");
+        assert_eq!(
+            profile.cloud_account_ids.as_ref(),
+            [
+                "tenant_custom-acc-01",
+                "tenant_custom-acc-02",
+                "tenant_custom-acc-03",
+                "tenant_custom-acc-04"
+            ]
+        );
+        assert_eq!(profile.service_names.len(), 6);
+        assert_eq!(profile.service_names[0], "tenant_custom-svc-01");
+        assert_eq!(profile.service_names[5], "tenant_custom-svc-06");
+    }
+
+    #[test]
+    fn multi_tenant_builds_profiles_for_tenant_range() {
+        let mut config = test_config(3, 0, 1);
+        config.tenant_count = 3;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let tenant_ids = generator
+            .tenant_profiles
+            .iter()
+            .map(|profile| profile.tenant_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tenant_ids, vec!["tenant1", "tenant2", "tenant3"]);
+    }
+
+    #[test]
+    fn generated_message_uses_only_values_from_selected_tenant_profile() {
+        let mut config = test_config(3, 0, 1);
+        config.tenant_count = 3;
+        config.cloud_account_count_per_tenant = 2;
+        config.service_count_per_tenant = 3;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        for _ in 0..50 {
+            let message = generator.generate_message().unwrap();
+            let tenant_id = message.tenant_id.clone();
+            let profile = profile_for(&generator, &tenant_id);
+
+            let cloud_account_id =
+                resource_attribute(&message, "cloud.account.id").expect("cloud.account.id");
+            let service_name =
+                resource_attribute(&message, "service.name").expect("service.name");
+
+            assert!(profile.cloud_account_ids.iter().any(|value| value == &cloud_account_id));
+            assert!(profile.service_names.iter().any(|value| value == &service_name));
+        }
+    }
+
+    #[test]
+    fn multi_tenant_generation_never_crosses_profile_boundaries() {
+        let mut config = test_config(100, 0, 1);
+        config.tenant_count = 4;
+        config.cloud_account_count_per_tenant = 2;
+        config.service_count_per_tenant = 2;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let mut seen_tenants = std::collections::BTreeSet::new();
+
+        for _ in 0..200 {
+            let message = generator.generate_message().unwrap();
+            let tenant_id = message.tenant_id.clone();
+            seen_tenants.insert(tenant_id.clone());
+
+            let cloud_account_id =
+                resource_attribute(&message, "cloud.account.id").expect("cloud.account.id");
+            let service_name =
+                resource_attribute(&message, "service.name").expect("service.name");
+
+            assert!(cloud_account_id.starts_with(&format!("{tenant_id}-acc-")));
+            assert!(service_name.starts_with(&format!("{tenant_id}-svc-")));
+        }
+
+        assert!(seen_tenants.len() > 1);
     }
 
     #[test]

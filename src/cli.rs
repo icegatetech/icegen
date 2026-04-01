@@ -85,13 +85,25 @@ pub struct OtelArgs {
     #[arg(long, env = "RETRY_MAX_DELAY_MS", default_value = "32000")]
     pub retry_max_delay_ms: u64,
 
-    /// Tenant ID for X-Scope-OrgID in single-tenant mode; preferred over deprecated ORG_ID
+    /// Tenant ID for X-Scope-OrgID in single-tenant mode
     #[arg(long, env = "TENANT_ID")]
     pub tenant_id: Option<String>,
 
-    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID / ORG_ID
+    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID
     #[arg(long, env = "TENANT_COUNT", default_value = "1")]
     pub tenant_count: usize,
+
+    /// Number of cloud.account.id values generated per tenant
+    #[arg(
+        long,
+        env = "CLOUD_ACCOUNT_COUNT_PER_TENANT",
+        default_value = "4"
+    )]
+    pub cloud_account_count_per_tenant: usize,
+
+    /// Number of service.name values generated per tenant
+    #[arg(long, env = "SERVICE_COUNT_PER_TENANT", default_value = "6")]
+    pub service_count_per_tenant: usize,
 
     /// Enable label cardinality limiting
     #[arg(
@@ -113,9 +125,7 @@ pub struct OtelArgs {
 
 impl From<OtelArgs> for OtelConfig {
     fn from(args: OtelArgs) -> Self {
-        let tenant_id = args
-            .tenant_id
-            .unwrap_or_else(|| "default".to_string());
+        let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
 
         Self {
             ingest_endpoint: args.endpoint,
@@ -137,6 +147,8 @@ impl From<OtelArgs> for OtelConfig {
             retry_max_delay_ms: args.retry_max_delay_ms,
             tenant_id,
             tenant_count: args.tenant_count,
+            cloud_account_count_per_tenant: args.cloud_account_count_per_tenant,
+            service_count_per_tenant: args.service_count_per_tenant,
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
@@ -219,37 +231,22 @@ mod tests {
     }
 
     #[test]
-    fn cli_reads_legacy_org_id_when_tenant_id_is_missing() {
+    fn cli_reads_tenant_profile_pool_sizes() {
         let cli = Cli::parse_from([
             "otel-log-generator",
             "otel",
             "--endpoint",
             "http://localhost:4318/v1/logs",
-            "--org-id",
-            "legacy_tenant",
+            "--cloud-account-count-per-tenant",
+            "5",
+            "--service-count-per-tenant",
+            "7",
         ]);
 
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
-        assert_eq!(config.tenant_id, "legacy_tenant");
-    }
-
-    #[test]
-    fn cli_prefers_tenant_id_over_legacy_org_id() {
-        let cli = Cli::parse_from([
-            "otel-log-generator",
-            "otel",
-            "--endpoint",
-            "http://localhost:4318/v1/logs",
-            "--org-id",
-            "legacy_tenant",
-            "--tenant-id",
-            "preferred_tenant",
-        ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
-        assert_eq!(config.tenant_id, "preferred_tenant");
+        assert_eq!(config.cloud_account_count_per_tenant, 5);
+        assert_eq!(config.service_count_per_tenant, 7);
     }
 
     #[test]
@@ -264,5 +261,9 @@ mod tests {
         assert!(help.contains("TENANT_ID"));
         assert!(help.contains("--tenant-count"));
         assert!(help.contains("TENANT_COUNT"));
+        assert!(help.contains("--cloud-account-count-per-tenant"));
+        assert!(help.contains("CLOUD_ACCOUNT_COUNT_PER_TENANT"));
+        assert!(help.contains("--service-count-per-tenant"));
+        assert!(help.contains("SERVICE_COUNT_PER_TENANT"));
     }
 }

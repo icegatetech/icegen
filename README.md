@@ -111,8 +111,9 @@ export RECORDS_PER_MESSAGE=1
 export PRINT_LOGS=false
 export CONTINUOUS_MODE=false
 export TENANT_ID=default
-# export ORG_ID=default  # deprecated alias; TENANT_ID has priority
 export TENANT_COUNT=1
+export CLOUD_ACCOUNT_COUNT_PER_TENANT=4
+export SERVICE_COUNT_PER_TENANT=6
 export OTEL_LABEL_CARDINALITY_ENABLED=true
 export OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT=
 export OTEL_LABEL_CARDINALITY_LIMITS=k8s.pod.name=32,host.name=16,service.version=32,request.id=64,thread.id=32,user.id=64
@@ -177,9 +178,10 @@ Boolean environment variables accept the following values:
 | `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message |
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
 | `--continuous` | `CONTINUOUS_MODE` | false | Run in continuous mode |
-| `--tenant-id` | `TENANT_ID` | `default` | Preferred single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
-| `--org-id` | `ORG_ID` | `default` | Deprecated legacy alias for `--tenant-id` / `TENANT_ID`. Used only when `TENANT_ID` is not set |
+| `--tenant-id` | `TENANT_ID` | `default` | Single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
 | `--tenant-count` | `TENANT_COUNT` | 1 | Multi-tenant mode size. When `> 1`, each message picks a random tenant from `tenant1..tenantN` and keeps it for retries |
+| `--cloud-account-count-per-tenant` | `CLOUD_ACCOUNT_COUNT_PER_TENANT` | 4 | Size of the tenant-local `cloud.account.id` pool. Values are generated as `tenantX-acc-YY` |
+| `--service-count-per-tenant` | `SERVICE_COUNT_PER_TENANT` | 6 | Size of the tenant-local `service.name` pool. Values are generated as `tenantX-svc-YY` |
 | `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
 | `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
 | `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |
@@ -189,21 +191,17 @@ Boolean environment variables accept the following values:
 Tenant routing is part of the runtime contract, not an internal detail.
 
 - `TENANT_ID` / `--tenant-id` enables single-tenant mode. Every message uses that tenant.
-- `ORG_ID` / `--org-id` is a deprecated legacy alias. It still works for backward compatibility only when `TENANT_ID` is not set.
 - `TENANT_COUNT` / `--tenant-count` enables random multi-tenant mode when the value is greater than `1`.
-- Priority in single-tenant mode is: `TENANT_ID` first, then legacy `ORG_ID`, then the default tenant `default`.
-- In multi-tenant mode, the generator ignores the configured `TENANT_ID` and `ORG_ID` values for routing and uses a pool `tenant1..tenantN`.
+- `CLOUD_ACCOUNT_COUNT_PER_TENANT` / `--cloud-account-count-per-tenant` controls how many stable `cloud.account.id` values are generated per tenant. Default is `4`.
+- `SERVICE_COUNT_PER_TENANT` / `--service-count-per-tenant` controls how many stable `service.name` values are generated per tenant. Default is `6`.
+- In multi-tenant mode, the generator ignores the configured `TENANT_ID` value for routing and uses a pool `tenant1..tenantN`.
 - The tenant is selected once per message, attached immediately to the generated message, and reused on retry.
+- After the tenant is selected, `service.name` and `cloud.account.id` are selected only from that tenant's local pools.
+- The generated resource attributes are readable and stable: `tenant3-acc-02`, `tenant3-svc-05`, and similar values.
 - HTTP sends the tenant through the `X-Scope-OrgID` header.
 - gRPC sends the tenant through the `x-scope-orgid` metadata key.
 
-This matters for Icegate testing because downstream partitioning and pre-WAL sorting derive `tenant_id` from that header/metadata.
-
-### Migration Notes
-
-- `ORG_ID` still works, but `TENANT_ID` is the recommended variable and CLI flag for new setups.
-- If both `TENANT_ID` and `ORG_ID` are present, `TENANT_ID` wins.
-- If `TENANT_COUNT > 1`, the generator switches to random routing across `tenant1..tenantN` and does not use `TENANT_ID` or `ORG_ID` for message routing.
+This matters for Icegate testing because downstream partitioning and pre-WAL sorting derive `tenant_id` from that header/metadata, while `service_name` and `cloud_account_id` are now generated from tenant-local pools for realistic sorting checks.
 
 ## Label Cardinality Limiting
 
@@ -324,6 +322,30 @@ otel-log-generator otel \
 ```
 
 Each message is routed as one of `tenant1..tenant16` via gRPC metadata `x-scope-orgid`.
+
+### Icegate Sorting Example
+
+Use tenant-local pools when you want to validate sorting inside each tenant by `cloud_account_id`, `service_name`, `timestamp DESC`:
+
+```bash
+otel-log-generator otel \
+  --endpoint http://localhost:4318/v1/logs \
+  --tenant-count 4 \
+  --cloud-account-count-per-tenant 4 \
+  --service-count-per-tenant 6 \
+  --count 5000 \
+  --records-per-message 1 \
+  --concurrency 20
+```
+
+With this setup:
+
+- routing still uses `tenant1..tenant4`
+- each tenant gets its own `cloud.account.id` pool such as `tenant2-acc-01..tenant2-acc-04`
+- each tenant gets its own `service.name` pool such as `tenant2-svc-01..tenant2-svc-06`
+- OTLP resource attributes always include both `cloud.account.id` and `service.name`
+
+That makes it easy to inspect Icegate output and verify that rows are grouped and sorted only within the current tenant.
 
 ## Development
 

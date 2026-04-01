@@ -13,8 +13,6 @@ pub struct OTLPLogMessageGenerator {
     label_cardinality: LabelCardinalityConfig,
 }
 
-const DEFAULT_SINGLE_TENANT_ID: &str = "default";
-
 impl OTLPLogMessageGenerator {
     pub fn new(source: String) -> Self {
         Self {
@@ -47,10 +45,15 @@ impl OTLPLogMessageGenerator {
     fn generate_resource_attributes_pairs(
         &self,
         project_id: &str,
+        cloud_account_id: &str,
         service_name: &str,
     ) -> Vec<(String, String)> {
         let attributes = vec![
             ("project_id".to_string(), project_id.to_string()),
+            (
+                "cloud.account.id".to_string(),
+                cloud_account_id.to_string(),
+            ),
             ("service.name".to_string(), service_name.to_string()),
             (
                 "service.version".to_string(),
@@ -254,12 +257,14 @@ impl OTLPLogMessageGenerator {
     fn wrap_log_records_in_otlp(
         &self,
         project_id: &str,
+        cloud_account_id: &str,
         service_name: &str,
         log_records: Vec<Value>,
     ) -> Value {
         let mut rng = rand::thread_rng();
 
-        let resource_attributes = self.generate_resource_attributes_pairs(project_id, service_name);
+        let resource_attributes =
+            self.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
         let scope_attributes = self.generate_scope_attributes_pairs(service_name);
 
         json!({
@@ -297,13 +302,30 @@ impl OTLPLogMessageGenerator {
         )
     }
 
-    pub fn generate_valid_message_for_tenant(&self, tenant_id: String) -> Result<OTLPLogMessage> {
+    pub fn generate_valid_message(
+        &self,
+        tenant_id: String,
+        cloud_account_id: String,
+        service_name: String,
+    ) -> Result<OTLPLogMessage> {
+        self.build_valid_message(tenant_id, cloud_account_id, service_name)
+    }
+
+    fn build_valid_message(
+        &self,
+        tenant_id: String,
+        cloud_account_id: String,
+        service_name: String,
+    ) -> Result<OTLPLogMessage> {
         let project_id = FakeDataGenerator::generate_project_id();
-        let service_name = FakeDataGenerator::generate_service_name();
 
         let log_record = self.generate_single_log_record(&service_name);
-        let resource_log =
-            self.wrap_log_records_in_otlp(&project_id, &service_name, vec![log_record]);
+        let resource_log = self.wrap_log_records_in_otlp(
+            &project_id,
+            &cloud_account_id,
+            &service_name,
+            vec![log_record],
+        );
 
         let otlp_message = json!({
             "resourceLogs": [resource_log]
@@ -317,18 +339,15 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
-    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
-    pub fn generate_valid_message(&self) -> Result<OTLPLogMessage> {
-        self.generate_valid_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string())
-    }
-
-    pub fn generate_aggregated_message_for_tenant(
+    pub fn generate_aggregated_message(
         &self,
         tenant_id: String,
+        cloud_account_id: String,
+        service_name: String,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         if num_records == 1 {
-            return self.generate_valid_message_for_tenant(tenant_id);
+            return self.build_valid_message(tenant_id, cloud_account_id, service_name);
         }
 
         if num_records < 1 {
@@ -338,13 +357,17 @@ impl OTLPLogMessageGenerator {
         }
 
         let project_id = FakeDataGenerator::generate_project_id();
-        let service_name = FakeDataGenerator::generate_service_name();
 
         let log_records: Vec<Value> = (0..num_records)
             .map(|_| self.generate_single_log_record(&service_name))
             .collect();
 
-        let resource_log = self.wrap_log_records_in_otlp(&project_id, &service_name, log_records);
+        let resource_log = self.wrap_log_records_in_otlp(
+            &project_id,
+            &cloud_account_id,
+            &service_name,
+            log_records,
+        );
 
         let otlp_message = json!({
             "resourceLogs": [resource_log]
@@ -358,15 +381,7 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
-    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
-    pub fn generate_aggregated_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
-        self.generate_aggregated_message_for_tenant(
-            DEFAULT_SINGLE_TENANT_ID.to_string(),
-            num_records,
-        )
-    }
-
-    pub fn generate_invalid_message_for_tenant(&self, tenant_id: String) -> Result<OTLPLogMessage> {
+    pub fn generate_invalid_message(&self, tenant_id: String) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
 
@@ -438,14 +453,11 @@ impl OTLPLogMessageGenerator {
         }
     }
 
-    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
-    pub fn generate_invalid_message(&self) -> Result<OTLPLogMessage> {
-        self.generate_invalid_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string())
-    }
-
-    pub fn generate_protobuf_message_for_tenant(
+    pub fn generate_protobuf_message(
         &self,
         tenant_id: String,
+        cloud_account_id: String,
+        service_name: String,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
@@ -464,7 +476,6 @@ impl OTLPLogMessageGenerator {
 
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
-        let service_name = FakeDataGenerator::generate_service_name();
 
         // Generate log records
         let log_records: Vec<LogRecord> = (0..num_records)
@@ -508,7 +519,7 @@ impl OTLPLogMessageGenerator {
 
         // Resource attributes
         let resource_attributes_pairs =
-            self.generate_resource_attributes_pairs(&project_id, &service_name);
+            self.generate_resource_attributes_pairs(&project_id, &cloud_account_id, &service_name);
         let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -570,10 +581,6 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
-    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
-    pub fn generate_protobuf_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
-        self.generate_protobuf_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string(), num_records)
-    }
 }
 
 fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
