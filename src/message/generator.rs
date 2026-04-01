@@ -13,6 +13,8 @@ pub struct OTLPLogMessageGenerator {
     label_cardinality: LabelCardinalityConfig,
 }
 
+const DEFAULT_SINGLE_TENANT_ID: &str = "default";
+
 impl OTLPLogMessageGenerator {
     pub fn new(source: String) -> Self {
         Self {
@@ -279,7 +281,23 @@ impl OTLPLogMessageGenerator {
         })
     }
 
-    pub fn generate_valid_message(&self) -> Result<OTLPLogMessage> {
+    fn build_message(
+        &self,
+        message: MessagePayload,
+        tenant_id: String,
+        project_id: String,
+        message_type: OTLPLogMessageType,
+    ) -> OTLPLogMessage {
+        OTLPLogMessage::new(
+            message,
+            tenant_id,
+            project_id,
+            self.source.clone(),
+            message_type,
+        )
+    }
+
+    pub fn generate_valid_message_for_tenant(&self, tenant_id: String) -> Result<OTLPLogMessage> {
         let project_id = FakeDataGenerator::generate_project_id();
         let service_name = FakeDataGenerator::generate_service_name();
 
@@ -291,17 +309,26 @@ impl OTLPLogMessageGenerator {
             "resourceLogs": [resource_log]
         });
 
-        Ok(OTLPLogMessage::new(
+        Ok(self.build_message(
             MessagePayload::Json(otlp_message),
+            tenant_id,
             project_id,
-            self.source.clone(),
             OTLPLogMessageType::Valid,
         ))
     }
 
-    pub fn generate_aggregated_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
+    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
+    pub fn generate_valid_message(&self) -> Result<OTLPLogMessage> {
+        self.generate_valid_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string())
+    }
+
+    pub fn generate_aggregated_message_for_tenant(
+        &self,
+        tenant_id: String,
+        num_records: usize,
+    ) -> Result<OTLPLogMessage> {
         if num_records == 1 {
-            return self.generate_valid_message();
+            return self.generate_valid_message_for_tenant(tenant_id);
         }
 
         if num_records < 1 {
@@ -323,15 +350,23 @@ impl OTLPLogMessageGenerator {
             "resourceLogs": [resource_log]
         });
 
-        Ok(OTLPLogMessage::new(
+        Ok(self.build_message(
             MessagePayload::Json(otlp_message),
+            tenant_id,
             project_id,
-            self.source.clone(),
             OTLPLogMessageType::Valid,
         ))
     }
 
-    pub fn generate_invalid_message(&self) -> Result<OTLPLogMessage> {
+    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
+    pub fn generate_aggregated_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
+        self.generate_aggregated_message_for_tenant(
+            DEFAULT_SINGLE_TENANT_ID.to_string(),
+            num_records,
+        )
+    }
+
+    pub fn generate_invalid_message_for_tenant(&self, tenant_id: String) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
 
@@ -348,10 +383,10 @@ impl OTLPLogMessageGenerator {
         match *invalid_type {
             "empty_resource_logs" => {
                 let invalid_message = json!({"resourceLogs": []});
-                Ok(OTLPLogMessage::new(
+                Ok(self.build_message(
                     MessagePayload::Json(invalid_message),
+                    tenant_id,
                     project_id,
-                    self.source.clone(),
                     OTLPLogMessageType::InvalidJson,
                 ))
             }
@@ -360,50 +395,59 @@ impl OTLPLogMessageGenerator {
                     "someOtherField": "value",
                     "timestamp": "2024-01-01T00:00:00Z"
                 });
-                Ok(OTLPLogMessage::new(
+                Ok(self.build_message(
                     MessagePayload::Json(invalid_message),
+                    tenant_id,
                     project_id,
-                    self.source.clone(),
                     OTLPLogMessageType::InvalidJson,
                 ))
             }
             "null_resource_logs" => {
                 let invalid_message = json!({"resourceLogs": null});
-                Ok(OTLPLogMessage::new(
+                Ok(self.build_message(
                     MessagePayload::Json(invalid_message),
+                    tenant_id,
                     project_id,
-                    self.source.clone(),
                     OTLPLogMessageType::InvalidJson,
                 ))
             }
             "invalid_resource_logs_type" => {
                 let invalid_message = json!({"resourceLogs": "not-an-array"});
-                Ok(OTLPLogMessage::new(
+                Ok(self.build_message(
                     MessagePayload::Json(invalid_message),
+                    tenant_id,
                     project_id,
-                    self.source.clone(),
                     OTLPLogMessageType::InvalidJson,
                 ))
             }
-            "malformed_json" => Ok(OTLPLogMessage::new(
+            "malformed_json" => Ok(self.build_message(
                 MessagePayload::MalformedJson(r#"{"resourceLogs": [ invalid json"#.to_string()),
+                tenant_id,
                 project_id,
-                self.source.clone(),
                 OTLPLogMessageType::InvalidMalformedJson,
             )),
             _ => {
                 let invalid_message = json!({"resourceLogs": []});
-                Ok(OTLPLogMessage::new(
+                Ok(self.build_message(
                     MessagePayload::Json(invalid_message),
+                    tenant_id,
                     project_id,
-                    self.source.clone(),
                     OTLPLogMessageType::InvalidJson,
                 ))
             }
         }
     }
 
-    pub fn generate_protobuf_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
+    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
+    pub fn generate_invalid_message(&self) -> Result<OTLPLogMessage> {
+        self.generate_invalid_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string())
+    }
+
+    pub fn generate_protobuf_message_for_tenant(
+        &self,
+        tenant_id: String,
+        num_records: usize,
+    ) -> Result<OTLPLogMessage> {
         use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
         use crate::pb::opentelemetry::proto::common::v1::{
             any_value, AnyValue, InstrumentationScope, KeyValue,
@@ -518,12 +562,17 @@ impl OTLPLogMessageGenerator {
         let mut buf = Vec::new();
         request.encode(&mut buf)?;
 
-        Ok(OTLPLogMessage::new(
+        Ok(self.build_message(
             MessagePayload::Protobuf(buf),
+            tenant_id,
             project_id,
-            self.source.clone(),
             OTLPLogMessageType::Valid,
         ))
+    }
+
+    /// Backward-compatible single-tenant wrapper for tests and legacy callers.
+    pub fn generate_protobuf_message(&self, num_records: usize) -> Result<OTLPLogMessage> {
+        self.generate_protobuf_message_for_tenant(DEFAULT_SINGLE_TENANT_ID.to_string(), num_records)
     }
 }
 

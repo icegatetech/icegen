@@ -18,6 +18,7 @@ pub struct OtelLogGenerator {
     config: OtelConfig,
     message_generator: OTLPLogMessageGenerator,
     transport: Arc<dyn Transport>,
+    tenant_pool: Arc<[String]>,
 }
 
 struct ProgressTracker {
@@ -140,6 +141,24 @@ impl BatchPacer {
 type BatchFuture<'a> = Pin<Box<dyn Future<Output = Result<BatchResult>> + Send + 'a>>;
 
 impl OtelLogGenerator {
+    fn build_tenant_pool(config: &OtelConfig) -> Arc<[String]> {
+        if config.tenant_count == 1 {
+            Arc::from([config.tenant_id.clone()])
+        } else {
+            Arc::from(
+                (1..=config.tenant_count)
+                    .map(|index| format!("tenant{}", index))
+                    .collect::<Vec<_>>(),
+            )
+        }
+    }
+
+    fn select_tenant_id(&self) -> String {
+        let mut rng = rand::thread_rng();
+        let index = rng.gen_range(0..self.tenant_pool.len());
+        self.tenant_pool[index].clone()
+    }
+
     fn batch_counts_per_worker(total: usize, concurrency: usize) -> Vec<usize> {
         let workers = concurrency.max(1);
         let base = total / workers;
@@ -160,6 +179,14 @@ impl OtelLogGenerator {
         println!("  Records per message: {}", config.records_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
         println!("  Concurrency: {}", config.concurrency);
+        if config.tenant_count == 1 {
+            println!("  Tenant routing: single tenant '{}'", config.tenant_id);
+        } else {
+            println!(
+                "  Tenant routing: {} tenants, random tenant1..tenant{}",
+                config.tenant_count, config.tenant_count
+            );
+        }
 
         let retry_config = config.retry_config()?;
         println!(
@@ -177,7 +204,6 @@ impl OtelLogGenerator {
                     config.ingest_endpoint.clone(),
                     config.use_protobuf,
                     retry_config,
-                    config.org_id.clone(),
                 )?;
 
                 if let Some(ref health_endpoint) = config.healthcheck_endpoint {
@@ -215,12 +241,14 @@ impl OtelLogGenerator {
             "rust-generator".to_string(),
             cardinality_config,
         );
+        let tenant_pool = Self::build_tenant_pool(&config);
         println!("✓ Generator initialized successfully\n");
 
         Ok(Self {
             config,
             message_generator,
             transport,
+            tenant_pool,
         })
     }
 
@@ -288,10 +316,14 @@ impl OtelLogGenerator {
                 break;
             }
 
-            let batch =
-                match run_batch(self, message_interval_ms, &mut shutdown_rx, progress.clone())
-                    .await
-                {
+            let batch = match run_batch(
+                self,
+                message_interval_ms,
+                &mut shutdown_rx,
+                progress.clone(),
+            )
+            .await
+            {
                 Ok(batch) => batch,
                 Err(error) => {
                     eprintln!("Continuous worker iteration failed, continuing: {}", error);
@@ -371,20 +403,19 @@ impl OtelLogGenerator {
 impl LogGenerator for OtelLogGenerator {
     fn generate_message(&self) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
-
+        let tenant_id = self.select_tenant_id();
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
 
-        let message = if should_be_invalid {
-            self.message_generator.generate_invalid_message()?
+        if should_be_invalid {
+            self.message_generator
+                .generate_invalid_message_for_tenant(tenant_id)
         } else if self.config.transport == "grpc" || self.config.use_protobuf {
             self.message_generator
-                .generate_protobuf_message(self.config.records_per_message)?
+                .generate_protobuf_message_for_tenant(tenant_id, self.config.records_per_message)
         } else {
             self.message_generator
-                .generate_aggregated_message(self.config.records_per_message)?
-        };
-
-        Ok(message)
+                .generate_aggregated_message_for_tenant(tenant_id, self.config.records_per_message)
+        }
     }
 
     async fn send_message(
@@ -394,6 +425,7 @@ impl LogGenerator for OtelLogGenerator {
     ) -> Result<bool> {
         if self.config.print_logs {
             println!("Sending message:");
+            println!("  Tenant ID: {}", message.tenant_id);
             println!("  Project ID: {}", message.project_id);
             println!("  Source: {}", message.source);
             println!("  Type: {:?}", message.message_type);
@@ -644,7 +676,8 @@ mod tests {
             retry_max_retries: 3,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 32000,
-            org_id: "tenant1".to_string(),
+            tenant_id: "tenant1".to_string(),
+            tenant_count: 1,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -683,7 +716,8 @@ mod tests {
             retry_max_retries: 3,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 32000,
-            org_id: "tenant1".to_string(),
+            tenant_id: "tenant1".to_string(),
+            tenant_count: 1,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -917,5 +951,32 @@ mod tests {
         assert_eq!(result.total, 3);
         assert_eq!(result.success, 3);
         assert_eq!(transport.max_active(), 1);
+    }
+
+    #[test]
+    fn generate_message_uses_single_tenant_config() {
+        let config = test_config(3, 0, 1);
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        for _ in 0..5 {
+            let message = generator.generate_message().unwrap();
+            assert_eq!(message.tenant_id, "tenant1");
+        }
+    }
+
+    #[test]
+    fn generate_message_uses_only_multi_tenant_pool() {
+        let mut config = test_config(3, 0, 1);
+        config.tenant_count = 3;
+        config.tenant_id = "legacy_tenant".to_string();
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        for _ in 0..50 {
+            let message = generator.generate_message().unwrap();
+            assert!(matches!(
+                message.tenant_id.as_str(),
+                "tenant1" | "tenant2" | "tenant3"
+            ));
+        }
     }
 }

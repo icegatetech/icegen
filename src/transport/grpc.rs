@@ -42,15 +42,13 @@ impl GrpcTransport {
             retry_config,
         })
     }
-}
 
-#[async_trait]
-impl Transport for GrpcTransport {
-    async fn send(
-        &self,
+    fn prepare_export_parts(
         message: &OTLPLogMessage,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> Result<(
+        ExportLogsServiceRequest,
+        tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    )> {
         let proto_request = match &message.message {
             MessagePayload::Protobuf(bytes) => ExportLogsServiceRequest::decode(&bytes[..])?,
             MessagePayload::Json(_) | MessagePayload::MalformedJson(_) => {
@@ -60,13 +58,43 @@ impl Transport for GrpcTransport {
             }
         };
 
+        let tenant =
+            tonic::metadata::MetadataValue::try_from(message.tenant_id.as_str()).map_err(|_| {
+                GeneratorError::InvalidConfiguration(format!(
+                    "invalid tenant_id for gRPC metadata: {}",
+                    message.tenant_id
+                ))
+            })?;
+
+        Ok((proto_request, tenant))
+    }
+
+    fn build_export_request(
+        proto_request: ExportLogsServiceRequest,
+        tenant: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    ) -> tonic::Request<ExportLogsServiceRequest> {
+        let mut request = tonic::Request::new(proto_request);
+        request.metadata_mut().insert("x-scope-orgid", tenant);
+        request
+    }
+}
+
+#[async_trait]
+impl Transport for GrpcTransport {
+    async fn send(
+        &self,
+        message: &OTLPLogMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<()> {
         let max_retries = self.retry_config.max_retries;
         let mut last_error: Option<GeneratorError> = None;
         let mut shutdown_rx = shutdown_rx.clone();
+        let (proto_request, tenant) = Self::prepare_export_parts(message)?;
 
         for attempt in 0..=max_retries {
             let mut client = self.client.clone();
-            match client.export(proto_request.clone()).await {
+            let request = Self::build_export_request(proto_request.clone(), tenant.clone());
+            match client.export(request).await {
                 Ok(_) => {
                     if attempt > 0 {
                         eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
@@ -134,4 +162,67 @@ fn is_retryable_grpc_code(code: tonic::Code) -> bool {
             | tonic::Code::Aborted
             | tonic::Code::DeadlineExceeded
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::OTLPLogMessageType;
+    use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+    use prost::Message;
+
+    fn protobuf_message(tenant_id: &str) -> OTLPLogMessage {
+        let request = ExportLogsServiceRequest {
+            resource_logs: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        request.encode(&mut buf).unwrap();
+
+        OTLPLogMessage::new(
+            MessagePayload::Protobuf(buf),
+            tenant_id.to_string(),
+            "project1".to_string(),
+            "source1".to_string(),
+            OTLPLogMessageType::Valid,
+        )
+    }
+
+    #[test]
+    fn grpc_metadata_uses_message_tenant_id() {
+        let (proto_request, tenant) =
+            GrpcTransport::prepare_export_parts(&protobuf_message("tenant2")).unwrap();
+        let request = GrpcTransport::build_export_request(proto_request, tenant);
+        assert_eq!(request.metadata().get("x-scope-orgid").unwrap(), "tenant2");
+    }
+
+    #[test]
+    fn grpc_rejects_non_protobuf_payload() {
+        let message = OTLPLogMessage::new(
+            MessagePayload::Json(serde_json::json!({"resourceLogs": []})),
+            "tenant2".to_string(),
+            "project1".to_string(),
+            "source1".to_string(),
+            OTLPLogMessageType::Valid,
+        );
+
+        let error =
+            GrpcTransport::prepare_export_parts(&message).expect_err("expected invalid payload");
+        assert!(matches!(error, GeneratorError::InvalidMessageType(_)));
+    }
+
+    #[test]
+    fn grpc_prepared_parts_can_build_multiple_requests_without_redecode() {
+        let message = protobuf_message("tenant2");
+        let (proto_request, tenant) = GrpcTransport::prepare_export_parts(&message).unwrap();
+
+        let request1 = GrpcTransport::build_export_request(proto_request.clone(), tenant.clone());
+        let request2 = GrpcTransport::build_export_request(proto_request, tenant);
+
+        assert_eq!(request1.metadata().get("x-scope-orgid").unwrap(), "tenant2");
+        assert_eq!(request2.metadata().get("x-scope-orgid").unwrap(), "tenant2");
+        assert_eq!(
+            request1.get_ref().resource_logs.len(),
+            request2.get_ref().resource_logs.len()
+        );
+    }
 }

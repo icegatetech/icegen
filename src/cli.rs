@@ -85,9 +85,13 @@ pub struct OtelArgs {
     #[arg(long, env = "RETRY_MAX_DELAY_MS", default_value = "32000")]
     pub retry_max_delay_ms: u64,
 
-    /// Organization ID for X-Scope-OrgID header
-    #[arg(long, env = "ORG_ID", default_value = "tenant1")]
-    pub org_id: String,
+    /// Tenant ID for X-Scope-OrgID in single-tenant mode; preferred over deprecated ORG_ID
+    #[arg(long, env = "TENANT_ID")]
+    pub tenant_id: Option<String>,
+
+    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID / ORG_ID
+    #[arg(long, env = "TENANT_COUNT", default_value = "1")]
+    pub tenant_count: usize,
 
     /// Enable label cardinality limiting
     #[arg(
@@ -109,6 +113,10 @@ pub struct OtelArgs {
 
 impl From<OtelArgs> for OtelConfig {
     fn from(args: OtelArgs) -> Self {
+        let tenant_id = args
+            .tenant_id
+            .unwrap_or_else(|| "default".to_string());
+
         Self {
             ingest_endpoint: args.endpoint,
             healthcheck_endpoint: args.healthcheck_endpoint,
@@ -118,13 +126,17 @@ impl From<OtelArgs> for OtelConfig {
             records_per_message: args.records_per_message,
             print_logs: args.print_logs,
             count: args.count,
-            message_interval_ms: args.message_interval_ms.or(args.delay_ms_legacy).unwrap_or(0),
+            message_interval_ms: args
+                .message_interval_ms
+                .or(args.delay_ms_legacy)
+                .unwrap_or(0),
             concurrency: args.concurrency,
             continuous: args.continuous,
             retry_max_retries: args.retry_max_retries,
             retry_base_delay_ms: args.retry_base_delay_ms,
             retry_max_delay_ms: args.retry_max_delay_ms,
-            org_id: args.org_id,
+            tenant_id,
+            tenant_count: args.tenant_count,
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
@@ -135,7 +147,7 @@ impl From<OtelArgs> for OtelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn cli_accepts_new_message_interval_flag() {
@@ -185,5 +197,72 @@ mod tests {
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
         assert_eq!(config.message_interval_ms, 250);
+    }
+
+    #[test]
+    fn cli_reads_tenant_count_and_tenant_id() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--tenant-id",
+            "tenant_custom",
+            "--tenant-count",
+            "3",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.tenant_id, "tenant_custom");
+        assert_eq!(config.tenant_count, 3);
+    }
+
+    #[test]
+    fn cli_reads_legacy_org_id_when_tenant_id_is_missing() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--org-id",
+            "legacy_tenant",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.tenant_id, "legacy_tenant");
+    }
+
+    #[test]
+    fn cli_prefers_tenant_id_over_legacy_org_id() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--org-id",
+            "legacy_tenant",
+            "--tenant-id",
+            "preferred_tenant",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.tenant_id, "preferred_tenant");
+    }
+
+    #[test]
+    fn cli_help_documents_tenant_routing_inputs() {
+        let mut command = Cli::command();
+        let otel = command.find_subcommand_mut("otel").unwrap();
+        let mut help = Vec::new();
+        otel.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--tenant-id"));
+        assert!(help.contains("TENANT_ID"));
+        assert!(help.contains("--tenant-count"));
+        assert!(help.contains("TENANT_COUNT"));
     }
 }

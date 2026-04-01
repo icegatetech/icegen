@@ -10,6 +10,7 @@ fn test_generate_valid_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
+    assert!(!message.tenant_id.is_empty());
     assert_eq!(message.source, "test-source");
     assert_eq!(message.message_type, OTLPLogMessageType::Valid);
 
@@ -28,6 +29,7 @@ fn test_generate_aggregated_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
+    assert!(!message.tenant_id.is_empty());
 
     match message.message {
         MessagePayload::Json(json) => {
@@ -53,6 +55,7 @@ fn test_generate_invalid_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
+    assert!(!message.tenant_id.is_empty());
 
     // Should be either InvalidJson or InvalidMalformedJson
     assert!(
@@ -68,6 +71,7 @@ fn test_generate_protobuf_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
+    assert!(!message.tenant_id.is_empty());
     assert_eq!(message.message_type, OTLPLogMessageType::Valid);
 
     match message.message {
@@ -76,6 +80,23 @@ fn test_generate_protobuf_message() {
         }
         _ => panic!("Expected Protobuf payload"),
     }
+}
+
+#[test]
+fn test_all_public_generation_methods_return_non_empty_tenant_id() {
+    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+
+    let valid = generator.generate_valid_message().unwrap();
+    assert!(!valid.tenant_id.is_empty());
+
+    let aggregated = generator.generate_aggregated_message(2).unwrap();
+    assert!(!aggregated.tenant_id.is_empty());
+
+    let invalid = generator.generate_invalid_message().unwrap();
+    assert!(!invalid.tenant_id.is_empty());
+
+    let protobuf = generator.generate_protobuf_message(2).unwrap();
+    assert!(!protobuf.tenant_id.is_empty());
 }
 
 #[test]

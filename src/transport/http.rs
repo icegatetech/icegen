@@ -14,16 +14,10 @@ pub struct HttpTransport {
     #[allow(dead_code)]
     use_protobuf: bool,
     retry_config: RetryConfig,
-    org_id: String,
 }
 
 impl HttpTransport {
-    pub fn new(
-        endpoint: String,
-        use_protobuf: bool,
-        retry_config: RetryConfig,
-        org_id: String,
-    ) -> Result<Self> {
+    pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
         Ok(Self {
@@ -31,7 +25,6 @@ impl HttpTransport {
             endpoint,
             use_protobuf,
             retry_config,
-            org_id,
         })
     }
 
@@ -59,21 +52,21 @@ impl HttpTransport {
                 .post(&self.endpoint)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &self.org_id)
+                .header("X-Scope-OrgID", &message.tenant_id)
                 .json(json_value),
             MessagePayload::Protobuf(bytes) => self
                 .client
                 .post(&self.endpoint)
                 .header("Content-Type", "application/x-protobuf")
                 .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &self.org_id)
+                .header("X-Scope-OrgID", &message.tenant_id)
                 .body(bytes.clone()),
             MessagePayload::MalformedJson(malformed_string) => self
                 .client
                 .post(&self.endpoint)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &self.org_id)
+                .header("X-Scope-OrgID", &message.tenant_id)
                 .body(malformed_string.clone()),
         }
     }
@@ -183,4 +176,62 @@ impl Transport for HttpTransport {
 
 fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn retry_config() -> RetryConfig {
+        RetryConfig::new(1, 1000, 2000).unwrap()
+    }
+
+    fn message(tenant_id: &str) -> OTLPLogMessage {
+        OTLPLogMessage::new(
+            MessagePayload::Json(json!({"resourceLogs": []})),
+            tenant_id.to_string(),
+            "project1".to_string(),
+            "source1".to_string(),
+            crate::message::OTLPLogMessageType::Valid,
+        )
+    }
+
+    #[test]
+    fn http_header_uses_message_tenant_id() {
+        let transport = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+        )
+        .unwrap();
+
+        let request = transport
+            .build_request(&message("tenant2"))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers().get("X-Scope-OrgID").unwrap(), "tenant2");
+    }
+
+    #[test]
+    fn consecutive_requests_can_use_different_tenants() {
+        let transport = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+        )
+        .unwrap();
+
+        let first = transport
+            .build_request(&message("tenant1"))
+            .build()
+            .unwrap();
+        let second = transport
+            .build_request(&message("tenant3"))
+            .build()
+            .unwrap();
+
+        assert_eq!(first.headers().get("X-Scope-OrgID").unwrap(), "tenant1");
+        assert_eq!(second.headers().get("X-Scope-OrgID").unwrap(), "tenant3");
+    }
 }

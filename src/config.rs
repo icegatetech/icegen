@@ -112,7 +112,8 @@ pub struct OtelConfig {
     pub retry_max_retries: u32,
     pub retry_base_delay_ms: u64,
     pub retry_max_delay_ms: u64,
-    pub org_id: String,
+    pub tenant_id: String,
+    pub tenant_count: usize,
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
@@ -164,6 +165,16 @@ impl OtelConfig {
             ));
         }
 
+        if self.tenant_count < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "tenant_count must be >= 1".to_string(),
+            ));
+        }
+
+        if self.tenant_count == 1 {
+            validate_tenant_id(&self.tenant_id)?;
+        }
+
         if let Some(limit) = self.label_cardinality_default_limit {
             if limit < 1 {
                 return Err(GeneratorError::InvalidConfiguration(
@@ -203,6 +214,25 @@ fn default_cardinality_limits() -> HashMap<String, usize> {
         .iter()
         .map(|(key, value)| ((*key).to_string(), *value))
         .collect()
+}
+
+fn validate_tenant_id(tenant_id: &str) -> Result<()> {
+    if tenant_id.is_empty() {
+        return Err(GeneratorError::InvalidConfiguration(
+            "tenant_id must not be empty".to_string(),
+        ));
+    }
+
+    if tenant_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(GeneratorError::InvalidConfiguration(
+            "tenant_id must contain only ASCII alphanumeric characters, '-' or '_'".to_string(),
+        ))
+    }
 }
 
 fn parse_cardinality_limits(raw: &str) -> Result<HashMap<String, usize>> {
@@ -312,7 +342,8 @@ mod tests {
             retry_max_retries: 3,
             retry_base_delay_ms: 1000,
             retry_max_delay_ms: 32000,
-            org_id: "tenant1".to_string(),
+            tenant_id: "tenant1".to_string(),
+            tenant_count: 1,
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
@@ -358,6 +389,31 @@ mod tests {
         assert!(cfg.validate().is_ok());
 
         cfg.concurrency = 20;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tenant_count_validation() {
+        let mut cfg = base_config();
+        cfg.tenant_count = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_single_tenant_id_validation() {
+        let mut cfg = base_config();
+        cfg.tenant_id = "tenant with spaces".to_string();
+        assert!(cfg.validate().is_err());
+
+        cfg.tenant_id = "tenant_1-ok".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multi_tenant_mode_ignores_legacy_single_tenant_value_validation() {
+        let mut cfg = base_config();
+        cfg.tenant_count = 3;
+        cfg.tenant_id = "tenant with spaces".to_string();
         assert!(cfg.validate().is_ok());
     }
 }

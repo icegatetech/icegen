@@ -55,6 +55,13 @@ otel-log-generator otel \
   --message-interval-ms 100 \
   --concurrency 20
 
+# Send HTTP logs in random multi-tenant mode (tenant1..tenant8)
+otel-log-generator otel \
+  --endpoint http://localhost:4318/v1/logs \
+  --tenant-count 8 \
+  --count 100 \
+  --concurrency 20
+
 # Use protobuf encoding
 otel-log-generator otel \
   --endpoint http://localhost:4318/v1/logs \
@@ -65,6 +72,7 @@ otel-log-generator otel \
 otel-log-generator otel \
   --endpoint http://localhost:4317 \
   --transport grpc \
+  --tenant-count 8 \
   --count 10
 
 # Generate aggregated messages (multiple records per message)
@@ -102,6 +110,9 @@ export INVALID_RECORD_PERCENT=0.0
 export RECORDS_PER_MESSAGE=1
 export PRINT_LOGS=false
 export CONTINUOUS_MODE=false
+export TENANT_ID=default
+# export ORG_ID=default  # deprecated alias; TENANT_ID has priority
+export TENANT_COUNT=1
 export OTEL_LABEL_CARDINALITY_ENABLED=true
 export OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT=
 export OTEL_LABEL_CARDINALITY_LIMITS=k8s.pod.name=32,host.name=16,service.version=32,request.id=64,thread.id=32,user.id=64
@@ -166,9 +177,33 @@ Boolean environment variables accept the following values:
 | `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message |
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
 | `--continuous` | `CONTINUOUS_MODE` | false | Run in continuous mode |
+| `--tenant-id` | `TENANT_ID` | `default` | Preferred single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
+| `--org-id` | `ORG_ID` | `default` | Deprecated legacy alias for `--tenant-id` / `TENANT_ID`. Used only when `TENANT_ID` is not set |
+| `--tenant-count` | `TENANT_COUNT` | 1 | Multi-tenant mode size. When `> 1`, each message picks a random tenant from `tenant1..tenantN` and keeps it for retries |
 | `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
 | `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
 | `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |
+
+## Tenant Routing
+
+Tenant routing is part of the runtime contract, not an internal detail.
+
+- `TENANT_ID` / `--tenant-id` enables single-tenant mode. Every message uses that tenant.
+- `ORG_ID` / `--org-id` is a deprecated legacy alias. It still works for backward compatibility only when `TENANT_ID` is not set.
+- `TENANT_COUNT` / `--tenant-count` enables random multi-tenant mode when the value is greater than `1`.
+- Priority in single-tenant mode is: `TENANT_ID` first, then legacy `ORG_ID`, then the default tenant `default`.
+- In multi-tenant mode, the generator ignores the configured `TENANT_ID` and `ORG_ID` values for routing and uses a pool `tenant1..tenantN`.
+- The tenant is selected once per message, attached immediately to the generated message, and reused on retry.
+- HTTP sends the tenant through the `X-Scope-OrgID` header.
+- gRPC sends the tenant through the `x-scope-orgid` metadata key.
+
+This matters for Icegate testing because downstream partitioning and pre-WAL sorting derive `tenant_id` from that header/metadata.
+
+### Migration Notes
+
+- `ORG_ID` still works, but `TENANT_ID` is the recommended variable and CLI flag for new setups.
+- If both `TENANT_ID` and `ORG_ID` are present, `TENANT_ID` wins.
+- If `TENANT_COUNT > 1`, the generator switches to random routing across `tenant1..tenantN` and does not use `TENANT_ID` or `ORG_ID` for message routing.
 
 ## Label Cardinality Limiting
 
@@ -217,6 +252,7 @@ Expected cardinality behavior:
 - In continuous mode, `MESSAGE_COUNT` is ignored.
 - In continuous mode, `MESSAGE_INTERVAL_MS` is applied independently by each worker.
 - `MESSAGE_DELAY` / `--delay-ms` remain accepted as deprecated aliases for backward compatibility.
+- Multi-tenant rotation happens inside the same process and worker pool. It does not require extra containers, extra workers, or shared mutable routing state.
 - Recommended Docker setup: one container with `CONCURRENCY=20` instead of scaling container count for this use case.
 
 ### Valid Messages
@@ -263,6 +299,31 @@ otel-log-generator otel \
   --endpoint http://localhost:4317 \
   --transport grpc
 ```
+
+### HTTP Multi-Tenant Example
+
+```bash
+otel-log-generator otel \
+  --endpoint http://localhost:4318/v1/logs \
+  --tenant-count 16 \
+  --count 1000 \
+  --concurrency 20
+```
+
+Each message is routed as one of `tenant1..tenant16` via `X-Scope-OrgID`.
+
+### gRPC Multi-Tenant Example
+
+```bash
+otel-log-generator otel \
+  --endpoint http://localhost:4317 \
+  --transport grpc \
+  --tenant-count 16 \
+  --count 1000 \
+  --concurrency 20
+```
+
+Each message is routed as one of `tenant1..tenant16` via gRPC metadata `x-scope-orgid`.
 
 ## Development
 
