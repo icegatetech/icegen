@@ -1,7 +1,8 @@
 use crate::config::{BatchResult, OtelConfig};
 use crate::error::Result;
 use crate::generator::base::LogGenerator;
-use crate::message::{MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator};
+use crate::message::{OTLPLogMessage, OTLPLogMessageGenerator};
+use crate::transport::types::MessagePayload;
 use crate::transport::{GrpcTransport, HttpTransport, Transport};
 use async_trait::async_trait;
 use rand::Rng;
@@ -272,7 +273,7 @@ impl OtelLogGenerator {
         Self::with_transport(config, transport)
     }
 
-    pub(crate) fn with_transport(
+    pub fn with_transport(
         config: OtelConfig,
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
@@ -284,7 +285,6 @@ impl OtelLogGenerator {
             cardinality_config,
         );
         let tenant_profiles = Self::build_tenant_profiles(&config);
-        println!("✓ Generator initialized successfully\n");
 
         Ok(Self {
             config,
@@ -477,11 +477,11 @@ impl LogGenerator for OtelLogGenerator {
     ) -> Result<bool> {
         if self.config.print_logs {
             println!("Sending message:");
-            println!("  Tenant ID: {}", message.tenant_id);
-            println!("  Project ID: {}", message.project_id);
-            println!("  Source: {}", message.source);
-            println!("  Type: {:?}", message.message_type);
-            match &message.message {
+            println!("  Tenant ID: {}", message.tenant_id());
+            println!("  Project ID: {}", message.project_id());
+            println!("  Source: {}", message.source());
+            println!("  Type: {:?}", message.message_type());
+            match message.payload() {
                 MessagePayload::Json(json) => {
                     println!(
                         "  Payload: {}",
@@ -497,7 +497,7 @@ impl LogGenerator for OtelLogGenerator {
             }
         }
 
-        match self.transport.send(message, shutdown_rx).await {
+        match self.transport.send(message.as_otlp_message(), shutdown_rx).await {
             Ok(_) => {
                 if self.config.print_logs {
                     println!("✓ Message sent successfully\n");
@@ -568,6 +568,7 @@ mod tests {
     use super::*;
     use crate::error::GeneratorError;
     use crate::transport::Transport;
+    use crate::transport::types::OTLPMessage;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -643,7 +644,7 @@ mod tests {
     impl Transport for NoopTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             _shutdown_rx: &watch::Receiver<bool>,
         ) -> Result<()> {
             Ok(())
@@ -654,7 +655,7 @@ mod tests {
     impl Transport for CountingTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             _shutdown_rx: &watch::Receiver<bool>,
         ) -> Result<()> {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -684,7 +685,7 @@ mod tests {
     impl Transport for RetryAwareTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             shutdown_rx: &watch::Receiver<bool>,
         ) -> Result<()> {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -710,7 +711,7 @@ mod tests {
     impl Transport for TimestampTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             _shutdown_rx: &watch::Receiver<bool>,
         ) -> Result<()> {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -745,6 +746,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
+            enable_logs: true,
+            enable_metrics: false,
         }
     }
 
@@ -764,7 +767,7 @@ mod tests {
     }
 
     fn resource_attribute(message: &OTLPLogMessage, key: &str) -> Option<String> {
-        let MessagePayload::Json(json) = &message.message else {
+        let MessagePayload::Json(json) = message.payload() else {
             return None;
         };
 
@@ -819,6 +822,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
+            enable_logs: true,
+            enable_metrics: false,
         };
 
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
@@ -1058,7 +1063,7 @@ mod tests {
 
         for _ in 0..5 {
             let message = generator.generate_message().unwrap();
-            assert_eq!(message.tenant_id, "tenant1");
+            assert_eq!(message.tenant_id(), "tenant1");
         }
     }
 
@@ -1109,7 +1114,7 @@ mod tests {
 
         for _ in 0..50 {
             let message = generator.generate_message().unwrap();
-            let tenant_id = message.tenant_id.clone();
+            let tenant_id = message.tenant_id().to_string();
             let profile = profile_for(&generator, &tenant_id);
 
             let cloud_account_id =
@@ -1134,7 +1139,7 @@ mod tests {
 
         for _ in 0..200 {
             let message = generator.generate_message().unwrap();
-            let tenant_id = message.tenant_id.clone();
+            let tenant_id = message.tenant_id().to_string();
             seen_tenants.insert(tenant_id.clone());
 
             let cloud_account_id =
@@ -1159,7 +1164,7 @@ mod tests {
         for _ in 0..50 {
             let message = generator.generate_message().unwrap();
             assert!(matches!(
-                message.tenant_id.as_str(),
+                message.tenant_id(),
                 "tenant1" | "tenant2" | "tenant3"
             ));
         }

@@ -1,7 +1,9 @@
 use crate::config::LabelCardinalityConfig;
 use crate::error::{GeneratorError, Result};
+use crate::message::attributes::AttributeGenerator;
 use crate::message::fake_data::FakeDataGenerator;
-use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
+use crate::message::types::{OTLPLogMessage, OTLPLogMessageType};
+use crate::transport::types::MessagePayload;
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -9,90 +11,20 @@ use serde_json::{json, Value};
 
 #[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
-    source: String,
-    label_cardinality: LabelCardinalityConfig,
+    attributes: AttributeGenerator,
 }
 
 impl OTLPLogMessageGenerator {
     pub fn new(source: String) -> Self {
         Self {
-            source,
-            label_cardinality: LabelCardinalityConfig::default(),
+            attributes: AttributeGenerator::new(source, LabelCardinalityConfig::default()),
         }
     }
 
     pub fn new_with_cardinality(source: String, label_cardinality: LabelCardinalityConfig) -> Self {
         Self {
-            source,
-            label_cardinality,
+            attributes: AttributeGenerator::new(source, label_cardinality),
         }
-    }
-
-    fn attributes_pairs_to_dict_list(pairs: &[(String, String)]) -> Vec<Value> {
-        pairs
-            .iter()
-            .map(|(key, value)| {
-                json!({
-                    "key": key,
-                    "value": {
-                        "stringValue": value
-                    }
-                })
-            })
-            .collect()
-    }
-
-    fn generate_resource_attributes_pairs(
-        &self,
-        project_id: &str,
-        cloud_account_id: &str,
-        service_name: &str,
-    ) -> Vec<(String, String)> {
-        let attributes = vec![
-            ("project_id".to_string(), project_id.to_string()),
-            (
-                "cloud.account.id".to_string(),
-                cloud_account_id.to_string(),
-            ),
-            ("service.name".to_string(), service_name.to_string()),
-            (
-                "service.version".to_string(),
-                FakeDataGenerator::generate_service_version(),
-            ),
-            (
-                "deployment.environment".to_string(),
-                FakeDataGenerator::generate_deployment_environment(),
-            ),
-            (
-                "host.name".to_string(),
-                FakeDataGenerator::generate_host_name(),
-            ),
-            (
-                "k8s.pod.name".to_string(),
-                FakeDataGenerator::generate_k8s_pod_name(),
-            ),
-            (
-                "k8s.namespace.name".to_string(),
-                FakeDataGenerator::generate_k8s_namespace(),
-            ),
-            ("generator.source".to_string(), self.source.clone()),
-        ];
-
-        self.normalize_attribute_pairs(attributes)
-    }
-
-    fn generate_scope_attributes_pairs(&self, service_name: &str) -> Vec<(String, String)> {
-        let mut rng = rand::thread_rng();
-        vec![
-            (
-                "library.name".to_string(),
-                format!("trihub-{}", service_name),
-            ),
-            (
-                "library.version".to_string(),
-                format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-            ),
-        ]
     }
 
     fn generate_log_attributes_pairs(
@@ -124,35 +56,7 @@ impl OTLPLogMessageGenerator {
         log_attributes.push(("request.id".to_string(), request_id.to_string()));
         log_attributes.push(("thread.id".to_string(), thread_id.to_string()));
 
-        self.normalize_attribute_pairs(log_attributes)
-    }
-
-    fn normalize_attribute_pairs(&self, pairs: Vec<(String, String)>) -> Vec<(String, String)> {
-        pairs
-            .into_iter()
-            .map(|(key, value)| {
-                let normalized = self.normalize_by_cardinality(&key, &value);
-                (key, normalized)
-            })
-            .collect()
-    }
-
-    fn normalize_by_cardinality(&self, key: &str, value: &str) -> String {
-        if !self.label_cardinality.enabled {
-            return value.to_string();
-        }
-
-        let Some(limit) = self.label_cardinality.limit_for(key) else {
-            return value.to_string();
-        };
-
-        if limit <= 1 {
-            return "bucket_00".to_string();
-        }
-
-        let index = stable_bucket_index(key, value, limit);
-        let width = num_digits(limit.saturating_sub(1));
-        format!("bucket_{index:0width$}")
+        self.attributes.normalize_attribute_pairs(log_attributes)
     }
 
     fn generate_log_body(severity_text: &str, service_name: &str) -> String {
@@ -247,7 +151,7 @@ impl OTLPLogMessageGenerator {
             "body": {
                 "stringValue": body
             },
-            "attributes": Self::attributes_pairs_to_dict_list(&log_attributes),
+            "attributes": AttributeGenerator::attributes_pairs_to_dict_list(&log_attributes),
             "traceId": trace_id,
             "spanId": span_id,
             "flags": rng.gen_range(0..256),
@@ -264,19 +168,19 @@ impl OTLPLogMessageGenerator {
         let mut rng = rand::thread_rng();
 
         let resource_attributes =
-            self.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
-        let scope_attributes = self.generate_scope_attributes_pairs(service_name);
+            self.attributes.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
+        let scope_attributes = self.attributes.generate_scope_attributes_pairs(service_name);
 
         json!({
             "resource": {
-                "attributes": Self::attributes_pairs_to_dict_list(&resource_attributes),
+                "attributes": AttributeGenerator::attributes_pairs_to_dict_list(&resource_attributes),
                 "droppedAttributesCount": rng.gen_range(0..4)
             },
             "scopeLogs": [{
                 "scope": {
                     "name": format!("io.trihub.{}", service_name.replace('-', ".")),
                     "version": format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-                    "attributes": Self::attributes_pairs_to_dict_list(&scope_attributes),
+                    "attributes": AttributeGenerator::attributes_pairs_to_dict_list(&scope_attributes),
                     "droppedAttributesCount": rng.gen_range(0..3)
                 },
                 "logRecords": log_records,
@@ -297,7 +201,7 @@ impl OTLPLogMessageGenerator {
             message,
             tenant_id,
             project_id,
-            self.source.clone(),
+            self.attributes.source().to_string(),
             message_type,
         )
     }
@@ -519,7 +423,7 @@ impl OTLPLogMessageGenerator {
 
         // Resource attributes
         let resource_attributes_pairs =
-            self.generate_resource_attributes_pairs(&project_id, &cloud_account_id, &service_name);
+            self.attributes.generate_resource_attributes_pairs(&project_id, &cloud_account_id, &service_name);
         let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -531,7 +435,7 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         // Scope attributes
-        let scope_attributes_pairs = self.generate_scope_attributes_pairs(&service_name);
+        let scope_attributes_pairs = self.attributes.generate_scope_attributes_pairs(&service_name);
         let scope_attributes: Vec<KeyValue> = scope_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -580,41 +484,4 @@ impl OTLPLogMessageGenerator {
             OTLPLogMessageType::Valid,
         ))
     }
-
-}
-
-fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
-    if limit == 0 {
-        return 0;
-    }
-
-    // FNV-1a 64-bit for deterministic, stable bucket assignment across runs.
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET_BASIS;
-    for byte in key
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0xff))
-        .chain(value.as_bytes().iter())
-    {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-
-    (hash as usize) % limit
-}
-
-fn num_digits(mut number: usize) -> usize {
-    if number == 0 {
-        return 1;
-    }
-
-    let mut digits = 0;
-    while number > 0 {
-        number /= 10;
-        digits += 1;
-    }
-    digits
 }

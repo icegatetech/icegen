@@ -119,10 +119,18 @@ pub struct OtelConfig {
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
+    pub enable_logs: bool,
+    pub enable_metrics: bool,
 }
 
 impl OtelConfig {
     pub fn validate(&self) -> Result<()> {
+        if !self.enable_logs && !self.enable_metrics {
+            return Err(GeneratorError::InvalidConfiguration(
+                "at least one signal must be enabled (--enable-logs or --enable-metrics)".to_string(),
+            ));
+        }
+
         if self.invalid_record_percent < 0.0 || self.invalid_record_percent > 100.0 {
             return Err(GeneratorError::InvalidConfiguration(
                 "invalid_record_percent must be between 0 and 100".to_string(),
@@ -363,6 +371,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
+            enable_logs: true,
+            enable_metrics: false,
         }
     }
 
@@ -444,6 +454,38 @@ mod tests {
         let mut cfg = base_config();
         cfg.tenant_count = 3;
         cfg.tenant_id = "tenant with spaces".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_at_least_one_signal_must_be_enabled() {
+        let mut cfg = base_config();
+        cfg.enable_logs = false;
+        cfg.enable_metrics = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_logs_only_is_valid() {
+        let mut cfg = base_config();
+        cfg.enable_logs = true;
+        cfg.enable_metrics = false;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_metrics_only_is_valid() {
+        let mut cfg = base_config();
+        cfg.enable_logs = false;
+        cfg.enable_metrics = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_both_signals_is_valid() {
+        let mut cfg = base_config();
+        cfg.enable_logs = true;
+        cfg.enable_metrics = true;
         assert!(cfg.validate().is_ok());
     }
 }

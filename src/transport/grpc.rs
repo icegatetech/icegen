@@ -1,8 +1,10 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
-use crate::message::{MessagePayload, OTLPLogMessage};
+use crate::transport::types::{MessagePayload, OTLPMessage, SignalPath};
 use crate::pb::opentelemetry::proto::collector::logs::v1::logs_service_client::LogsServiceClient;
 use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+use crate::pb::opentelemetry::proto::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+use crate::pb::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 use crate::transport::Transport;
 use async_trait::async_trait;
 use prost::Message;
@@ -12,7 +14,8 @@ use tokio::time::sleep;
 use tonic::transport::Channel;
 
 pub struct GrpcTransport {
-    client: LogsServiceClient<Channel>,
+    logs_client: LogsServiceClient<Channel>,
+    metrics_client: MetricsServiceClient<Channel>,
     retry_config: RetryConfig,
 }
 
@@ -20,7 +23,7 @@ impl GrpcTransport {
     pub async fn new(endpoint: String, retry_config: RetryConfig) -> Result<Self> {
         // Detect the original scheme and preserve it
         let (scheme, host) = if endpoint.starts_with("https://") {
-            eprintln!("  ⚠ gRPC endpoint uses HTTPS scheme: {}", endpoint);
+            eprintln!("  \u{26a0} gRPC endpoint uses HTTPS scheme: {}", endpoint);
             ("https", endpoint.trim_start_matches("https://"))
         } else if endpoint.starts_with("http://") {
             ("http", endpoint.trim_start_matches("http://"))
@@ -35,21 +38,23 @@ impl GrpcTransport {
             .connect()
             .await?;
 
-        let client = LogsServiceClient::new(channel);
+        let logs_client = LogsServiceClient::new(channel.clone());
+        let metrics_client = MetricsServiceClient::new(channel);
 
         Ok(Self {
-            client,
+            logs_client,
+            metrics_client,
             retry_config,
         })
     }
 
     fn prepare_export_parts(
-        message: &OTLPLogMessage,
+        message: &OTLPMessage,
     ) -> Result<(
         ExportLogsServiceRequest,
         tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
     )> {
-        let proto_request = match &message.message {
+        let proto_request = match &message.payload {
             MessagePayload::Protobuf(bytes) => ExportLogsServiceRequest::decode(&bytes[..])?,
             MessagePayload::Json(_) | MessagePayload::MalformedJson(_) => {
                 return Err(GeneratorError::InvalidMessageType(
@@ -83,7 +88,20 @@ impl GrpcTransport {
 impl Transport for GrpcTransport {
     async fn send(
         &self,
-        message: &OTLPLogMessage,
+        message: &OTLPMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<()> {
+        match message.signal_path {
+            SignalPath::Logs => self.send_logs(message, shutdown_rx).await,
+            SignalPath::Metrics => self.send_metrics(message, shutdown_rx).await,
+        }
+    }
+}
+
+impl GrpcTransport {
+    async fn send_logs(
+        &self,
+        message: &OTLPMessage,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Result<()> {
         let max_retries = self.retry_config.max_retries;
@@ -92,8 +110,98 @@ impl Transport for GrpcTransport {
         let (proto_request, tenant) = Self::prepare_export_parts(message)?;
 
         for attempt in 0..=max_retries {
-            let mut client = self.client.clone();
+            let mut client = self.logs_client.clone();
             let request = Self::build_export_request(proto_request.clone(), tenant.clone());
+            match client.export(request).await {
+                Ok(_) => {
+                    if attempt > 0 {
+                        eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
+                    }
+                    return Ok(());
+                }
+                Err(status) if is_retryable_grpc_code(status.code()) => {
+                    if attempt == max_retries {
+                        return Err(GeneratorError::GrpcError(status));
+                    }
+
+                    let label = match status.code() {
+                        tonic::Code::ResourceExhausted => "ResourceExhausted",
+                        tonic::Code::Unavailable => "Unavailable",
+                        tonic::Code::Aborted => "Aborted",
+                        tonic::Code::DeadlineExceeded => "DeadlineExceeded",
+                        _ => "transient error",
+                    };
+
+                    let delay = self.retry_config.compute_delay(attempt, None);
+
+                    eprintln!(
+                        "  \u{26a0} gRPC {} (attempt {}/{}): {}",
+                        label,
+                        attempt + 1,
+                        max_retries + 1,
+                        status.message()
+                    );
+                    eprintln!("  Waiting {}ms before retry...", delay);
+
+                    last_error = Some(GeneratorError::GrpcError(status));
+                    if *shutdown_rx.borrow() {
+                        return Err(
+                            last_error.expect("last_error must be set before shutdown check")
+                        );
+                    }
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(delay)) => {}
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_ok() && *shutdown_rx.borrow() {
+                                return Err(last_error.expect("last_error must be set before waiting"));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Err(status) => {
+                    return Err(GeneratorError::GrpcError(status));
+                }
+            }
+        }
+
+        match last_error {
+            Some(e) => Err(e),
+            None => Err(GeneratorError::RateLimitExceeded(max_retries)),
+        }
+    }
+
+    async fn send_metrics(
+        &self,
+        message: &OTLPMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> Result<()> {
+        let max_retries = self.retry_config.max_retries;
+        let mut last_error: Option<GeneratorError> = None;
+        let mut shutdown_rx = shutdown_rx.clone();
+
+        let proto_request = match &message.payload {
+            MessagePayload::Protobuf(bytes) => ExportMetricsServiceRequest::decode(&bytes[..])?,
+            MessagePayload::Json(_) | MessagePayload::MalformedJson(_) => {
+                return Err(GeneratorError::InvalidMessageType(
+                    "gRPC transport only supports protobuf messages".to_string(),
+                ));
+            }
+        };
+
+        let tenant =
+            tonic::metadata::MetadataValue::try_from(message.tenant_id.as_str()).map_err(|_| {
+                GeneratorError::InvalidConfiguration(format!(
+                    "invalid tenant_id for gRPC metadata: {}",
+                    message.tenant_id
+                ))
+            })?;
+
+        for attempt in 0..=max_retries {
+            let mut client = self.metrics_client.clone();
+            let mut request = tonic::Request::new(proto_request.clone());
+            request.metadata_mut().insert("x-scope-orgid", tenant.clone());
+
             match client.export(request).await {
                 Ok(_) => {
                     if attempt > 0 {
@@ -167,7 +275,7 @@ fn is_retryable_grpc_code(code: tonic::Code) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::OTLPLogMessageType;
+    use crate::message::{OTLPLogMessage, OTLPLogMessageType};
     use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use prost::Message;
 
@@ -190,7 +298,8 @@ mod tests {
     #[test]
     fn grpc_metadata_uses_message_tenant_id() {
         let (proto_request, tenant) =
-            GrpcTransport::prepare_export_parts(&protobuf_message("tenant2")).unwrap();
+            GrpcTransport::prepare_export_parts(protobuf_message("tenant2").as_otlp_message())
+                .unwrap();
         let request = GrpcTransport::build_export_request(proto_request, tenant);
         assert_eq!(request.metadata().get("x-scope-orgid").unwrap(), "tenant2");
     }
@@ -205,15 +314,16 @@ mod tests {
             OTLPLogMessageType::Valid,
         );
 
-        let error =
-            GrpcTransport::prepare_export_parts(&message).expect_err("expected invalid payload");
+        let error = GrpcTransport::prepare_export_parts(message.as_otlp_message())
+            .expect_err("expected invalid payload");
         assert!(matches!(error, GeneratorError::InvalidMessageType(_)));
     }
 
     #[test]
     fn grpc_prepared_parts_can_build_multiple_requests_without_redecode() {
         let message = protobuf_message("tenant2");
-        let (proto_request, tenant) = GrpcTransport::prepare_export_parts(&message).unwrap();
+        let (proto_request, tenant) =
+            GrpcTransport::prepare_export_parts(message.as_otlp_message()).unwrap();
 
         let request1 = GrpcTransport::build_export_request(proto_request.clone(), tenant.clone());
         let request2 = GrpcTransport::build_export_request(proto_request, tenant);

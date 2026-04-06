@@ -9,5 +9,7 @@ pub mod transport;
 pub use cli::{Cli, GeneratorType, OtelArgs};
 pub use config::{BatchResult, OtelConfig, RetryConfig};
 pub use error::{GeneratorError, Result};
-pub use generator::{LogGenerator, OtelLogGenerator};
+pub use generator::{LogGenerator, OtelLogGenerator, OtelMetricsGenerator};
 pub use message::{MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator, OTLPLogMessageType};
+pub use transport::types::{MessageType, OTLPMessage, SignalPath};
+pub use transport::{GrpcTransport, HttpTransport, Transport};

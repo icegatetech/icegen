@@ -1,6 +1,6 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
-use crate::message::{MessagePayload, OTLPLogMessage};
+use crate::transport::types::{MessagePayload, OTLPMessage};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -45,8 +45,8 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn build_request(&self, message: &OTLPLogMessage) -> reqwest::RequestBuilder {
-        match &message.message {
+    fn build_request(&self, message: &OTLPMessage) -> reqwest::RequestBuilder {
+        match &message.payload {
             MessagePayload::Json(json_value) => self
                 .client
                 .post(&self.endpoint)
@@ -76,7 +76,7 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     async fn send(
         &self,
-        message: &OTLPLogMessage,
+        message: &OTLPMessage,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Result<()> {
         let max_retries = self.retry_config.max_retries;
@@ -181,6 +181,7 @@ fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{OTLPLogMessage, OTLPLogMessageType};
     use serde_json::json;
 
     fn retry_config() -> RetryConfig {
@@ -193,7 +194,7 @@ mod tests {
             tenant_id.to_string(),
             "project1".to_string(),
             "source1".to_string(),
-            crate::message::OTLPLogMessageType::Valid,
+            OTLPLogMessageType::Valid,
         )
     }
 
@@ -207,7 +208,7 @@ mod tests {
         .unwrap();
 
         let request = transport
-            .build_request(&message("tenant2"))
+            .build_request(message("tenant2").as_otlp_message())
             .build()
             .unwrap();
         assert_eq!(request.headers().get("X-Scope-OrgID").unwrap(), "tenant2");
@@ -223,11 +224,11 @@ mod tests {
         .unwrap();
 
         let first = transport
-            .build_request(&message("tenant1"))
+            .build_request(message("tenant1").as_otlp_message())
             .build()
             .unwrap();
         let second = transport
-            .build_request(&message("tenant3"))
+            .build_request(message("tenant3").as_otlp_message())
             .build()
             .unwrap();
 

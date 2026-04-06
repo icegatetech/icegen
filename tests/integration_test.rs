@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use otel_log_generator::config::LabelCardinalityConfig;
+use otel_log_generator::message::OTLPMetricsMessageGenerator;
 use otel_log_generator::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+use otel_log_generator::pb::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 use otel_log_generator::pb::opentelemetry::proto::common::v1::any_value;
 use otel_log_generator::{MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType};
 use prost::Message;
@@ -17,11 +19,11 @@ fn test_generate_valid_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
-    assert!(!message.tenant_id.is_empty());
-    assert_eq!(message.source, "test-source");
-    assert_eq!(message.message_type, OTLPLogMessageType::Valid);
+    assert!(!message.tenant_id().is_empty());
+    assert_eq!(message.source(), "test-source");
+    assert_eq!(message.message_type(), OTLPLogMessageType::Valid);
 
-    match message.message {
+    match message.payload() {
         MessagePayload::Json(json) => {
             assert!(json.get("resourceLogs").is_some());
         }
@@ -41,9 +43,9 @@ fn test_generate_aggregated_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
-    assert!(!message.tenant_id.is_empty());
+    assert!(!message.tenant_id().is_empty());
 
-    match message.message {
+    match message.payload() {
         MessagePayload::Json(json) => {
             let resource_logs = json.get("resourceLogs").unwrap().as_array().unwrap();
             assert_eq!(resource_logs.len(), 1);
@@ -71,7 +73,7 @@ fn test_json_payload_contains_tenant_aware_resource_attributes() {
         )
         .unwrap();
 
-    let MessagePayload::Json(json) = message.message else {
+    let MessagePayload::Json(json) = message.payload() else {
         panic!("Expected JSON payload");
     };
 
@@ -100,12 +102,12 @@ fn test_generate_invalid_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
-    assert!(!message.tenant_id.is_empty());
+    assert!(!message.tenant_id().is_empty());
 
     // Should be either InvalidJson or InvalidMalformedJson
     assert!(
-        message.message_type == OTLPLogMessageType::InvalidJson
-            || message.message_type == OTLPLogMessageType::InvalidMalformedJson
+        message.message_type() == OTLPLogMessageType::InvalidJson
+            || message.message_type() == OTLPLogMessageType::InvalidMalformedJson
     );
 }
 
@@ -121,10 +123,10 @@ fn test_generate_protobuf_message() {
 
     assert!(result.is_ok());
     let message = result.unwrap();
-    assert!(!message.tenant_id.is_empty());
-    assert_eq!(message.message_type, OTLPLogMessageType::Valid);
+    assert!(!message.tenant_id().is_empty());
+    assert_eq!(message.message_type(), OTLPLogMessageType::Valid);
 
-    match message.message {
+    match message.payload() {
         MessagePayload::Protobuf(bytes) => {
             assert!(!bytes.is_empty());
         }
@@ -144,7 +146,7 @@ fn test_protobuf_payload_contains_tenant_aware_resource_attributes() {
         )
         .unwrap();
 
-    let MessagePayload::Protobuf(bytes) = message.message else {
+    let MessagePayload::Protobuf(bytes) = message.payload() else {
         panic!("Expected Protobuf payload");
     };
 
@@ -186,7 +188,7 @@ fn test_public_generation_methods_return_non_empty_tenant_id() {
             "tenant1-svc-01".to_string(),
         )
         .unwrap();
-    assert!(!valid.tenant_id.is_empty());
+    assert!(!valid.tenant_id().is_empty());
 
     let aggregated = generator
         .generate_aggregated_message(
@@ -196,10 +198,10 @@ fn test_public_generation_methods_return_non_empty_tenant_id() {
             2,
         )
         .unwrap();
-    assert!(!aggregated.tenant_id.is_empty());
+    assert!(!aggregated.tenant_id().is_empty());
 
     let invalid = generator.generate_invalid_message("tenant1".to_string()).unwrap();
-    assert!(!invalid.tenant_id.is_empty());
+    assert!(!invalid.tenant_id().is_empty());
 
     let protobuf = generator
         .generate_protobuf_message(
@@ -209,7 +211,7 @@ fn test_public_generation_methods_return_non_empty_tenant_id() {
             2,
         )
         .unwrap();
-    assert!(!protobuf.tenant_id.is_empty());
+    assert!(!protobuf.tenant_id().is_empty());
 }
 
 #[test]
@@ -257,7 +259,7 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
                 6,
             )
             .unwrap();
-        let MessagePayload::Json(json) = message.message else {
+        let MessagePayload::Json(json) = message.payload() else {
             panic!("Expected JSON payload");
         };
 
@@ -345,7 +347,7 @@ fn test_cardinality_disabled_keeps_original_values() {
             "tenant1-svc-01".to_string(),
         )
         .unwrap();
-    let MessagePayload::Json(json) = message.message else {
+    let MessagePayload::Json(json) = message.payload() else {
         panic!("Expected JSON payload");
     };
 
@@ -380,4 +382,87 @@ fn test_cardinality_disabled_keeps_original_values() {
         !request_id.starts_with("bucket_"),
         "cardinality limiter should be disabled"
     );
+}
+
+#[test]
+fn test_generate_gauge_metric_json() {
+    let generator = OTLPMetricsMessageGenerator::new("test-source".to_string());
+    let msg = generator.generate_gauge_message(
+        "tenant1".to_string(), "tenant1-acc-01".to_string(), "tenant1-svc-01".to_string(),
+    ).unwrap();
+
+    let MessagePayload::Json(json) = msg.payload() else { panic!("Expected JSON") };
+    assert!(json.get("resourceMetrics").is_some());
+    let metrics = &json["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
+    assert_eq!(metrics.as_array().unwrap().len(), 1);
+    assert!(metrics[0].get("gauge").is_some());
+}
+
+#[test]
+fn test_generate_protobuf_metric() {
+    let generator = OTLPMetricsMessageGenerator::new("test-source".to_string());
+    let msg = generator.generate_protobuf_metric_message(
+        "tenant1".to_string(), "tenant1-acc-01".to_string(), "tenant1-svc-01".to_string(),
+    ).unwrap();
+
+    let MessagePayload::Protobuf(bytes) = msg.payload() else { panic!("Expected Protobuf") };
+    let decoded = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+    assert_eq!(decoded.resource_metrics.len(), 1);
+}
+
+#[test]
+fn test_metrics_message_has_correct_signal_path() {
+    use otel_log_generator::SignalPath;
+    let generator = OTLPMetricsMessageGenerator::new("test-source".to_string());
+    let msg = generator.generate_gauge_message(
+        "tenant1".to_string(), "tenant1-acc-01".to_string(), "tenant1-svc-01".to_string(),
+    ).unwrap();
+    assert_eq!(msg.as_otlp_message().signal_path, SignalPath::Metrics);
+}
+
+#[test]
+fn test_metrics_resource_attributes_contain_tenant_fields() {
+    let generator = OTLPMetricsMessageGenerator::new("test-source".to_string());
+    let msg = generator.generate_gauge_message(
+        "tenant1".to_string(), "tenant1-acc-01".to_string(), "tenant1-svc-01".to_string(),
+    ).unwrap();
+
+    let MessagePayload::Json(json) = msg.payload() else { panic!() };
+    let attrs = json["resourceMetrics"][0]["resource"]["attributes"].as_array().unwrap();
+    let as_map: HashMap<&str, &str> = attrs.iter().map(|a| {
+        (a["key"].as_str().unwrap(), a["value"]["stringValue"].as_str().unwrap())
+    }).collect();
+    assert_eq!(as_map.get("cloud.account.id"), Some(&"tenant1-acc-01"));
+    assert_eq!(as_map.get("service.name"), Some(&"tenant1-svc-01"));
+}
+
+#[test]
+fn test_config_rejects_both_signals_disabled() {
+    use otel_log_generator::OtelConfig;
+    let config = OtelConfig {
+        ingest_endpoint: "http://localhost:4318".to_string(),
+        healthcheck_endpoint: None,
+        use_protobuf: false,
+        transport: "http".to_string(),
+        invalid_record_percent: 0.0,
+        records_per_message: 1,
+        print_logs: false,
+        count: 1,
+        message_interval_ms: 0,
+        concurrency: 1,
+        continuous: false,
+        retry_max_retries: 3,
+        retry_base_delay_ms: 1000,
+        retry_max_delay_ms: 32000,
+        tenant_id: "tenant1".to_string(),
+        tenant_count: 1,
+        cloud_account_count_per_tenant: 4,
+        service_count_per_tenant: 6,
+        label_cardinality_enabled: true,
+        label_cardinality_default_limit: None,
+        label_cardinality_limits: String::new(),
+        enable_logs: false,
+        enable_metrics: false,
+    };
+    assert!(config.validate().is_err());
 }

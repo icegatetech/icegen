@@ -240,6 +240,65 @@ Expected cardinality behavior:
 
 ## Message Types
 
+## Metrics Generation
+
+The generator supports OpenTelemetry metrics generation in addition to logs, allowing you to generate various metric types for testing observability pipelines.
+
+### Supported Metric Types
+
+- **Gauge**: Point-in-time measurements (e.g., memory usage, temperature)
+- **Sum**: Cumulative measurements (e.g., bytes transferred, requests handled)
+- **Histogram**: Distribution of values (e.g., request latency)
+- **ExponentialHistogram**: High-resolution distribution with exponential bucketing
+- **Summary**: Quantile-based distribution (similar to histogram with different semantics)
+
+### Configuration
+
+Use these new flags to control metrics and logs generation:
+
+- `--enable-logs` / `ENABLE_LOGS`: Enable log signal generation (default: true)
+- `--enable-metrics` / `ENABLE_METRICS`: Enable metrics signal generation (default: false)
+- `--otel-endpoint` / `OTEL_ENDPOINT`: Base OpenTelemetry endpoint (e.g., `http://localhost:4318`)
+
+### Example Commands
+
+**Metrics only (disable logs):**
+```bash
+cargo run -- otel \
+  --otel-endpoint http://localhost:4318 \
+  --enable-logs=false \
+  --enable-metrics \
+  --count 10
+```
+
+**Both metrics and logs:**
+```bash
+cargo run -- otel \
+  --otel-endpoint http://localhost:4318 \
+  --enable-metrics \
+  --count 10
+```
+
+**Logs only (default behavior):**
+```bash
+cargo run -- otel \
+  --otel-endpoint http://localhost:4318 \
+  --count 10
+```
+
+### Environment Variables
+
+Add these to your `.env` file to configure metrics:
+
+```bash
+# Base OTEL endpoint (preferred)
+OTEL_ENDPOINT=http://localhost:4318
+
+# Signal selection
+ENABLE_LOGS=true
+ENABLE_METRICS=false
+```
+
 ## Concurrency Semantics
 
 - `CONCURRENCY` controls how many long-lived workers run inside one process.

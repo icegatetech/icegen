@@ -1,50 +1,57 @@
-use serde::{Deserialize, Serialize};
+use crate::transport::types::{MessagePayload, MessageType, OTLPMessage, SignalPath};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OTLPLogMessageType {
-    Valid,
-    InvalidJson,
-    InvalidMalformedJson,
-}
-
-#[derive(Debug, Clone)]
-pub enum MessagePayload {
-    Json(serde_json::Value),
-    Protobuf(Vec<u8>),
-    MalformedJson(String),
-}
+pub type OTLPLogMessageType = MessageType;
 
 #[derive(Debug, Clone)]
 pub struct OTLPLogMessage {
-    pub message: MessagePayload,
-    pub tenant_id: String,
-    pub project_id: String,
-    pub source: String,
-    pub message_type: OTLPLogMessageType,
+    pub message: OTLPMessage,
 }
 
 impl OTLPLogMessage {
     pub fn new(
-        message: MessagePayload,
+        payload: MessagePayload,
         tenant_id: String,
         project_id: String,
         source: String,
         message_type: OTLPLogMessageType,
     ) -> Self {
         Self {
-            message,
-            tenant_id,
-            project_id,
-            source,
-            message_type,
+            message: OTLPMessage {
+                payload,
+                tenant_id,
+                project_id,
+                source,
+                message_type,
+                signal_path: SignalPath::Logs,
+            },
         }
     }
 
+    pub fn tenant_id(&self) -> &str {
+        &self.message.tenant_id
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.message.project_id
+    }
+
+    pub fn source(&self) -> &str {
+        &self.message.source
+    }
+
+    pub fn message_type(&self) -> MessageType {
+        self.message.message_type
+    }
+
+    pub fn payload(&self) -> &MessagePayload {
+        &self.message.payload
+    }
+
     pub fn payload_size_bytes(&self) -> usize {
-        match &self.message {
-            MessagePayload::Json(json) => serde_json::to_vec(json).map(|v| v.len()).unwrap_or(0),
-            MessagePayload::Protobuf(bytes) => bytes.len(),
-            MessagePayload::MalformedJson(s) => s.len(),
-        }
+        self.message.payload_size_bytes()
+    }
+
+    pub fn as_otlp_message(&self) -> &OTLPMessage {
+        &self.message
     }
 }

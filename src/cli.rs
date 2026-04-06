@@ -25,6 +25,10 @@ pub enum GeneratorType {
 
 #[derive(Args)]
 pub struct OtelArgs {
+    /// OTEL base endpoint (preferred over --endpoint)
+    #[arg(long, env = "OTEL_ENDPOINT")]
+    pub otel_endpoint: Option<String>,
+
     /// OTEL logs ingest endpoint
     #[arg(long, env = "OTEL_LOGS_ENDPOINT")]
     pub endpoint: String,
@@ -121,14 +125,34 @@ pub struct OtelArgs {
     /// Per-key cardinality limits as CSV map, e.g. key1=32,key2=64
     #[arg(long, env = "OTEL_LABEL_CARDINALITY_LIMITS", default_value = "")]
     pub label_cardinality_limits: String,
+
+    /// Enable log generation
+    #[arg(long, env = "ENABLE_LOGS", default_value = "true", value_parser = parse_bool)]
+    pub enable_logs: bool,
+
+    /// Enable metrics generation
+    #[arg(long, env = "ENABLE_METRICS", default_value = "false", value_parser = parse_bool)]
+    pub enable_metrics: bool,
 }
 
 impl From<OtelArgs> for OtelConfig {
     fn from(args: OtelArgs) -> Self {
         let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
 
+        let ingest_endpoint = if let Some(base) = args.otel_endpoint {
+            base.trim_end_matches('/').to_string()
+        } else {
+            let ep = args.endpoint;
+            if ep.ends_with("/v1/logs") {
+                eprintln!("  ⚠ --endpoint with /v1/logs path is deprecated. Use --otel-endpoint with the base URL instead.");
+                ep.trim_end_matches("/v1/logs").to_string()
+            } else {
+                ep.trim_end_matches('/').to_string()
+            }
+        };
+
         Self {
-            ingest_endpoint: args.endpoint,
+            ingest_endpoint,
             healthcheck_endpoint: args.healthcheck_endpoint,
             use_protobuf: args.use_protobuf,
             transport: args.transport,
@@ -152,6 +176,8 @@ impl From<OtelArgs> for OtelConfig {
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
+            enable_logs: args.enable_logs,
+            enable_metrics: args.enable_metrics,
         }
     }
 }

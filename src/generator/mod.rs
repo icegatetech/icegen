@@ -1,5 +1,7 @@
 pub mod base;
-pub mod otel;
+pub mod logs;
+pub mod metrics;
 
 pub use base::LogGenerator;
-pub use otel::OtelLogGenerator;
+pub use logs::OtelLogGenerator;
+pub use metrics::OtelMetricsGenerator;
