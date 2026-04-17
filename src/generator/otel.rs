@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use rand::Rng;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -48,8 +48,11 @@ struct ProgressTracker {
     last_progress_at: Mutex<Instant>,
     last_reported_step: AtomicUsize,
     processed: AtomicUsize,
+    sent: AtomicUsize,
     total_payload_bytes: AtomicUsize,
     window_payload_bytes: AtomicUsize,
+    total_response_time_micros: AtomicU64,
+    total_responses: AtomicUsize,
 }
 
 impl ProgressTracker {
@@ -61,18 +64,30 @@ impl ProgressTracker {
             last_progress_at: Mutex::new(now),
             last_reported_step: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
+            sent: AtomicUsize::new(0),
             total_payload_bytes: AtomicUsize::new(0),
             window_payload_bytes: AtomicUsize::new(0),
+            total_response_time_micros: AtomicU64::new(0),
+            total_responses: AtomicUsize::new(0),
         }
     }
 
-    fn record(&self, payload_size_bytes: usize) -> usize {
-        if payload_size_bytes > 0 {
+    fn record(&self, sent: bool, payload_size_bytes: usize, response_time: Duration) -> usize {
+        if sent {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if sent && payload_size_bytes > 0 {
             self.total_payload_bytes
                 .fetch_add(payload_size_bytes, Ordering::Relaxed);
             self.window_payload_bytes
                 .fetch_add(payload_size_bytes, Ordering::Relaxed);
         }
+
+        let response_micros = response_time.as_micros().min(u64::MAX as u128) as u64;
+        self.total_response_time_micros
+            .fetch_add(response_micros, Ordering::Relaxed);
+        self.total_responses.fetch_add(1, Ordering::Relaxed);
 
         self.processed.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -92,9 +107,19 @@ impl ProgressTracker {
         }
 
         let total_elapsed_secs = self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let sent = self.sent.load(Ordering::Relaxed);
         let total_payload_bytes = self.total_payload_bytes.load(Ordering::Relaxed);
         let total_sent_mib = total_payload_bytes as f64 / 1024.0 / 1024.0;
         let avg_speed_mib_s = total_sent_mib / total_elapsed_secs;
+        let avg_rps = sent as f64 / total_elapsed_secs;
+
+        let total_response_time_micros = self.total_response_time_micros.load(Ordering::Relaxed);
+        let total_responses = self.total_responses.load(Ordering::Relaxed);
+        let avg_response_time_ms = if total_responses > 0 {
+            (total_response_time_micros as f64 / total_responses as f64) / 1000.0
+        } else {
+            0.0
+        };
 
         let window_payload_bytes = self.window_payload_bytes.swap(0, Ordering::Relaxed);
         let mut last_progress_at = self
@@ -108,19 +133,23 @@ impl ProgressTracker {
 
         match self.total_target {
             Some(total_target) => println!(
-                "Progress: {}/{} messages processed, payload sent: {:.4} MiB, throughput: avg {:.4} MiB/s, current {:.4} MiB/s",
+                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms",
                 processed,
                 total_target,
                 total_sent_mib,
                 avg_speed_mib_s,
-                current_speed_mib_s
+                current_speed_mib_s,
+                avg_rps,
+                avg_response_time_ms
             ),
             None => println!(
-                "Progress: {} messages processed, payload sent: {:.4} MiB, throughput: avg {:.4} MiB/s, current {:.4} MiB/s",
+                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms",
                 processed,
                 total_sent_mib,
                 avg_speed_mib_s,
-                current_speed_mib_s
+                current_speed_mib_s,
+                avg_rps,
+                avg_response_time_ms
             ),
         }
     }
@@ -421,7 +450,9 @@ impl OtelLogGenerator {
 
             let message = self.generate_message()?;
             let payload_size_bytes = message.payload_size_bytes();
+            let send_started = Instant::now();
             let success = self.send_message(&message, shutdown_rx).await?;
+            let response_time = send_started.elapsed();
 
             let sent_payload_bytes = if success {
                 result.add_success();
@@ -432,7 +463,7 @@ impl OtelLogGenerator {
             };
 
             if let Some(progress) = &progress {
-                let processed = progress.record(sent_payload_bytes);
+                let processed = progress.record(success, sent_payload_bytes, response_time);
                 progress.maybe_log(processed);
             }
         }
