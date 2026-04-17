@@ -1,7 +1,7 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
-use crate::transport::Transport;
+use crate::transport::{SendReport, Transport};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
@@ -78,9 +78,8 @@ impl Transport for HttpTransport {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> SendReport {
         let max_retries = self.retry_config.max_retries;
-        let mut last_error: Option<GeneratorError> = None;
         let mut shutdown_rx = shutdown_rx.clone();
 
         for attempt in 0..=max_retries {
@@ -91,43 +90,54 @@ impl Transport for HttpTransport {
                 Err(e) if attempt < max_retries && is_transient_reqwest_error(&e) => {
                     let delay = self.retry_config.compute_delay(attempt, None);
                     eprintln!(
-                        "  \u{26a0} Transient network error (attempt {}/{}): {}",
+                        "  \u{26a0} Retry[http]: transient network error, attempt {}/{}, waiting {}ms, error: {}",
                         attempt + 1,
                         max_retries + 1,
+                        delay,
                         e
                     );
-                    eprintln!("  Waiting {}ms before retry...", delay);
-                    last_error = Some(GeneratorError::RequestError(e));
                     if *shutdown_rx.borrow() {
-                        return Err(
-                            last_error.expect("last_error must be set before shutdown check")
+                        return SendReport::failure(
+                            attempt as usize,
+                            format!("request interrupted by shutdown: {e}"),
                         );
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_millis(delay)) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_ok() && *shutdown_rx.borrow() {
-                                return Err(last_error.expect("last_error must be set before waiting"));
+                                return SendReport::failure(
+                                    attempt as usize,
+                                    format!("request interrupted during retry wait: {e}"),
+                                );
                             }
                         }
                     }
                     continue;
                 }
-                Err(e) => return Err(GeneratorError::RequestError(e)),
+                Err(e) => {
+                    return SendReport::failure(
+                        attempt as usize,
+                        format!("request failed: {e}"),
+                    );
+                }
             };
 
             let status = response.status();
 
             if status.is_success() {
                 if attempt > 0 {
-                    eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
+                    eprintln!("  \u{2713} Retry[http]: request succeeded after {} retries", attempt);
                 }
-                return Ok(());
+                return SendReport::success(attempt as usize);
             }
 
             if status.as_u16() == 429 {
                 if attempt == max_retries {
-                    return Err(GeneratorError::RateLimitExceeded(max_retries));
+                    return SendReport::failure(
+                        attempt as usize,
+                        format!("rate limit exceeded after {} attempts", max_retries + 1),
+                    );
                 }
 
                 // Parse Retry-After header (integer seconds)
@@ -140,20 +150,26 @@ impl Transport for HttpTransport {
                 let delay = self.retry_config.compute_delay(attempt, retry_after);
 
                 eprintln!(
-                    "  \u{26a0} HTTP 429 Too Many Requests (attempt {}/{})",
+                    "  \u{26a0} Retry[http]: 429 Too Many Requests, attempt {}/{}, waiting {}ms",
                     attempt + 1,
-                    max_retries + 1
+                    max_retries + 1,
+                    delay
                 );
-                eprintln!("  Waiting {}ms before retry...", delay);
 
                 if *shutdown_rx.borrow() {
-                    return Err(GeneratorError::RateLimitExceeded(attempt + 1));
+                    return SendReport::failure(
+                        attempt as usize,
+                        "request interrupted by shutdown after 429".to_string(),
+                    );
                 }
                 tokio::select! {
                     _ = sleep(Duration::from_millis(delay)) => {}
                     changed = shutdown_rx.changed() => {
                         if changed.is_ok() && *shutdown_rx.borrow() {
-                            return Err(GeneratorError::RateLimitExceeded(attempt + 1));
+                            return SendReport::failure(
+                                attempt as usize,
+                                "request interrupted during 429 retry wait".to_string(),
+                            );
                         }
                     }
                 }
@@ -162,15 +178,16 @@ impl Transport for HttpTransport {
 
             // Non-retryable HTTP error: fail immediately
             let error_text = response.text().await.unwrap_or_default();
-            return Err(GeneratorError::HttpError(status.as_u16(), error_text));
+            return SendReport::failure(
+                attempt as usize,
+                format!("http error {}: {}", status.as_u16(), error_text),
+            );
         }
 
-        // Retries exhausted — return the last network error if that's what consumed them,
-        // otherwise it was all 429s
-        match last_error {
-            Some(e) => Err(e),
-            None => Err(GeneratorError::RateLimitExceeded(max_retries)),
-        }
+        SendReport::failure(
+            max_retries as usize,
+            format!("request retries exhausted after {} attempts", max_retries + 1),
+        )
     }
 }
 

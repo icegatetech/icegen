@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use rand::Rng;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -48,8 +48,12 @@ struct ProgressTracker {
     last_progress_at: Mutex<Instant>,
     last_reported_step: AtomicUsize,
     processed: AtomicUsize,
+    sent: AtomicUsize,
     total_payload_bytes: AtomicUsize,
     window_payload_bytes: AtomicUsize,
+    total_response_time_micros: AtomicU64,
+    total_responses: AtomicUsize,
+    total_retries: AtomicUsize,
 }
 
 impl ProgressTracker {
@@ -61,18 +65,40 @@ impl ProgressTracker {
             last_progress_at: Mutex::new(now),
             last_reported_step: AtomicUsize::new(0),
             processed: AtomicUsize::new(0),
+            sent: AtomicUsize::new(0),
             total_payload_bytes: AtomicUsize::new(0),
             window_payload_bytes: AtomicUsize::new(0),
+            total_response_time_micros: AtomicU64::new(0),
+            total_responses: AtomicUsize::new(0),
+            total_retries: AtomicUsize::new(0),
         }
     }
 
-    fn record(&self, payload_size_bytes: usize) -> usize {
-        if payload_size_bytes > 0 {
+    fn record(
+        &self,
+        sent: bool,
+        retries: usize,
+        payload_size_bytes: usize,
+        response_time: Duration,
+    ) -> usize {
+        if sent {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+        if retries > 0 {
+            self.total_retries.fetch_add(retries, Ordering::Relaxed);
+        }
+
+        if sent && payload_size_bytes > 0 {
             self.total_payload_bytes
                 .fetch_add(payload_size_bytes, Ordering::Relaxed);
             self.window_payload_bytes
                 .fetch_add(payload_size_bytes, Ordering::Relaxed);
         }
+
+        let response_micros = response_time.as_micros().min(u64::MAX as u128) as u64;
+        self.total_response_time_micros
+            .fetch_add(response_micros, Ordering::Relaxed);
+        self.total_responses.fetch_add(1, Ordering::Relaxed);
 
         self.processed.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -92,9 +118,21 @@ impl ProgressTracker {
         }
 
         let total_elapsed_secs = self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
+        let sent = self.sent.load(Ordering::Relaxed);
         let total_payload_bytes = self.total_payload_bytes.load(Ordering::Relaxed);
         let total_sent_mib = total_payload_bytes as f64 / 1024.0 / 1024.0;
         let avg_speed_mib_s = total_sent_mib / total_elapsed_secs;
+        let avg_rps = sent as f64 / total_elapsed_secs;
+        let total_retries = self.total_retries.load(Ordering::Relaxed);
+        let avg_retries_per_message = total_retries as f64 / processed as f64;
+
+        let total_response_time_micros = self.total_response_time_micros.load(Ordering::Relaxed);
+        let total_responses = self.total_responses.load(Ordering::Relaxed);
+        let avg_response_time_ms = if total_responses > 0 {
+            (total_response_time_micros as f64 / total_responses as f64) / 1000.0
+        } else {
+            0.0
+        };
 
         let window_payload_bytes = self.window_payload_bytes.swap(0, Ordering::Relaxed);
         let mut last_progress_at = self
@@ -108,19 +146,27 @@ impl ProgressTracker {
 
         match self.total_target {
             Some(total_target) => println!(
-                "Progress: {}/{} messages processed, payload sent: {:.4} MiB, throughput: avg {:.4} MiB/s, current {:.4} MiB/s",
+                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; avg retries/msg: {:.3}",
                 processed,
                 total_target,
                 total_sent_mib,
                 avg_speed_mib_s,
-                current_speed_mib_s
+                current_speed_mib_s,
+                avg_rps,
+                avg_response_time_ms,
+                total_retries,
+                avg_retries_per_message
             ),
             None => println!(
-                "Progress: {} messages processed, payload sent: {:.4} MiB, throughput: avg {:.4} MiB/s, current {:.4} MiB/s",
+                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; avg retries/msg: {:.3}",
                 processed,
                 total_sent_mib,
                 avg_speed_mib_s,
-                current_speed_mib_s
+                current_speed_mib_s,
+                avg_rps,
+                avg_response_time_ms,
+                total_retries,
+                avg_retries_per_message
             ),
         }
     }
@@ -421,9 +467,11 @@ impl OtelLogGenerator {
 
             let message = self.generate_message()?;
             let payload_size_bytes = message.payload_size_bytes();
-            let success = self.send_message(&message, shutdown_rx).await?;
+            let send_started = Instant::now();
+            let send_report = self.send_message(&message, shutdown_rx).await?;
+            let response_time = send_started.elapsed();
 
-            let sent_payload_bytes = if success {
+            let sent_payload_bytes = if send_report.success {
                 result.add_success();
                 payload_size_bytes
             } else {
@@ -432,7 +480,12 @@ impl OtelLogGenerator {
             };
 
             if let Some(progress) = &progress {
-                let processed = progress.record(sent_payload_bytes);
+                let processed = progress.record(
+                    send_report.success,
+                    send_report.retries,
+                    sent_payload_bytes,
+                    response_time,
+                );
                 progress.maybe_log(processed);
             }
         }
@@ -474,7 +527,7 @@ impl LogGenerator for OtelLogGenerator {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<bool> {
+    ) -> Result<crate::transport::SendReport> {
         if self.config.print_logs {
             println!("Sending message:");
             println!("  Tenant ID: {}", message.tenant_id);
@@ -497,18 +550,16 @@ impl LogGenerator for OtelLogGenerator {
             }
         }
 
-        match self.transport.send(message, shutdown_rx).await {
-            Ok(_) => {
-                if self.config.print_logs {
-                    println!("✓ Message sent successfully\n");
-                }
-                Ok(true)
+        let report = self.transport.send(message, shutdown_rx).await;
+        if report.success {
+            if self.config.print_logs {
+                println!("✓ Message sent successfully\n");
             }
-            Err(e) => {
-                eprintln!("✗ Failed to send message: {}", e);
-                Ok(false)
-            }
+        } else if let Some(error) = &report.error {
+            eprintln!("✗ Failed to send message: {}", error);
         }
+
+        Ok(report)
     }
 
     async fn send_messages_batch(
@@ -567,6 +618,7 @@ fn build_tenant_value_pool(tenant_id: &str, suffix: &str, count: usize) -> Arc<[
 mod tests {
     use super::*;
     use crate::error::GeneratorError;
+    use crate::transport::SendReport;
     use crate::transport::Transport;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -645,8 +697,8 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> Result<()> {
-            Ok(())
+        ) -> SendReport {
+            SendReport::success(0)
         }
     }
 
@@ -656,7 +708,7 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> Result<()> {
+        ) -> SendReport {
             self.started.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -676,7 +728,7 @@ mod tests {
 
             tokio::time::sleep(self.send_delay).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(())
+            SendReport::success(0)
         }
     }
 
@@ -686,20 +738,20 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             shutdown_rx: &watch::Receiver<bool>,
-        ) -> Result<()> {
+        ) -> SendReport {
             self.started.fetch_add(1, Ordering::SeqCst);
 
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::select! {
                 _ = tokio::time::sleep(self.retry_wait) => {
                     self.started.fetch_add(1, Ordering::SeqCst);
-                    Err(GeneratorError::ConnectionError("retry started after backoff".to_string()))
+                    SendReport::failure(1, "retry started after backoff")
                 }
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
-                        Err(GeneratorError::ConnectionError("retry cancelled by shutdown".to_string()))
+                        SendReport::failure(0, "retry cancelled by shutdown")
                     } else {
-                        Err(GeneratorError::ConnectionError("retry wait ended unexpectedly".to_string()))
+                        SendReport::failure(0, "retry wait ended unexpectedly")
                     }
                 }
             }
@@ -712,13 +764,13 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> Result<()> {
+        ) -> SendReport {
             self.started.fetch_add(1, Ordering::SeqCst);
             self.timestamps
                 .lock()
                 .expect("timestamps mutex poisoned")
                 .push(std::time::Instant::now());
-            Ok(())
+            SendReport::success(0)
         }
     }
 

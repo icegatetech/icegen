@@ -3,7 +3,7 @@ use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
 use crate::pb::opentelemetry::proto::collector::logs::v1::logs_service_client::LogsServiceClient;
 use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
-use crate::transport::Transport;
+use crate::transport::{SendReport, Transport};
 use async_trait::async_trait;
 use prost::Message;
 use std::time::Duration;
@@ -85,11 +85,13 @@ impl Transport for GrpcTransport {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> SendReport {
         let max_retries = self.retry_config.max_retries;
-        let mut last_error: Option<GeneratorError> = None;
         let mut shutdown_rx = shutdown_rx.clone();
-        let (proto_request, tenant) = Self::prepare_export_parts(message)?;
+        let (proto_request, tenant) = match Self::prepare_export_parts(message) {
+            Ok(parts) => parts,
+            Err(e) => return SendReport::failure(0, e.to_string()),
+        };
 
         for attempt in 0..=max_retries {
             let mut client = self.client.clone();
@@ -99,11 +101,14 @@ impl Transport for GrpcTransport {
                     if attempt > 0 {
                         eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
                     }
-                    return Ok(());
+                    return SendReport::success(attempt as usize);
                 }
                 Err(status) if is_retryable_grpc_code(status.code()) => {
                     if attempt == max_retries {
-                        return Err(GeneratorError::GrpcError(status));
+                        return SendReport::failure(
+                            attempt as usize,
+                            format!("grpc retryable error exhausted: {}", status),
+                        );
                     }
 
                     let label = match status.code() {
@@ -117,40 +122,46 @@ impl Transport for GrpcTransport {
                     let delay = self.retry_config.compute_delay(attempt, None);
 
                     eprintln!(
-                        "  \u{26a0} gRPC {} (attempt {}/{}): {}",
+                        " \u{26a0} Retry[grpc]: {}, attempt {}/{}, waiting {}ms, error: {}",
                         label,
                         attempt + 1,
                         max_retries + 1,
+                        delay,
                         status.message()
                     );
-                    eprintln!("  Waiting {}ms before retry...", delay);
 
-                    last_error = Some(GeneratorError::GrpcError(status));
                     if *shutdown_rx.borrow() {
-                        return Err(
-                            last_error.expect("last_error must be set before shutdown check")
+                        return SendReport::failure(
+                            attempt as usize,
+                            format!("grpc request interrupted by shutdown: {}", status),
                         );
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_millis(delay)) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_ok() && *shutdown_rx.borrow() {
-                                return Err(last_error.expect("last_error must be set before waiting"));
+                                return SendReport::failure(
+                                    attempt as usize,
+                                    format!("grpc request interrupted during retry wait: {}", status),
+                                );
                             }
                         }
                     }
                     continue;
                 }
                 Err(status) => {
-                    return Err(GeneratorError::GrpcError(status));
+                    return SendReport::failure(
+                        attempt as usize,
+                        format!("grpc error: {}", status),
+                    );
                 }
             }
         }
 
-        match last_error {
-            Some(e) => Err(e),
-            None => Err(GeneratorError::RateLimitExceeded(max_retries)),
-        }
+        SendReport::failure(
+            max_retries as usize,
+            format!("grpc retries exhausted after {} attempts", max_retries + 1),
+        )
     }
 }
 
