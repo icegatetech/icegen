@@ -74,6 +74,11 @@ impl ProgressTracker {
         }
     }
 
+    fn record(&self, sent: bool, payload_size_bytes: usize, response_time: Duration) -> usize {
+        if sent {
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+
     fn record(
         &self,
         sent: bool,
@@ -467,6 +472,7 @@ impl OtelLogGenerator {
 
             let message = self.generate_message()?;
             let payload_size_bytes = message.payload_size_bytes();
+            let send_started = Instant::now();
             let send_started = Instant::now();
             let send_report = self.send_message(&message, shutdown_rx).await?;
             let response_time = send_started.elapsed();
