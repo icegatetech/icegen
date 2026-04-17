@@ -74,11 +74,6 @@ impl ProgressTracker {
         }
     }
 
-    fn record(&self, sent: bool, payload_size_bytes: usize, response_time: Duration) -> usize {
-        if sent {
-            self.sent.fetch_add(1, Ordering::Relaxed);
-        }
-
     fn record(
         &self,
         sent: bool,
@@ -100,10 +95,12 @@ impl ProgressTracker {
                 .fetch_add(payload_size_bytes, Ordering::Relaxed);
         }
 
-        let response_micros = response_time.as_micros().min(u64::MAX as u128) as u64;
-        self.total_response_time_micros
-            .fetch_add(response_micros, Ordering::Relaxed);
-        self.total_responses.fetch_add(1, Ordering::Relaxed);
+        if sent {
+            let response_micros = response_time.as_micros().min(u64::MAX as u128) as u64;
+            self.total_response_time_micros
+                .fetch_add(response_micros, Ordering::Relaxed);
+            self.total_responses.fetch_add(1, Ordering::Relaxed);
+        }
 
         self.processed.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -129,7 +126,7 @@ impl ProgressTracker {
         let avg_speed_mib_s = total_sent_mib / total_elapsed_secs;
         let avg_rps = sent as f64 / total_elapsed_secs;
         let total_retries = self.total_retries.load(Ordering::Relaxed);
-        let avg_retries_per_message = total_retries as f64 / processed as f64;
+        let retries_per_processed_message = total_retries as f64 / processed as f64;
 
         let total_response_time_micros = self.total_response_time_micros.load(Ordering::Relaxed);
         let total_responses = self.total_responses.load(Ordering::Relaxed);
@@ -151,7 +148,7 @@ impl ProgressTracker {
 
         match self.total_target {
             Some(total_target) => println!(
-                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; avg retries/msg: {:.3}",
+                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; retries/processed: {:.3}",
                 processed,
                 total_target,
                 total_sent_mib,
@@ -160,10 +157,10 @@ impl ProgressTracker {
                 avg_rps,
                 avg_response_time_ms,
                 total_retries,
-                avg_retries_per_message
+                retries_per_processed_message
             ),
             None => println!(
-                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; avg retries/msg: {:.3}",
+                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; retries/processed: {:.3}",
                 processed,
                 total_sent_mib,
                 avg_speed_mib_s,
@@ -171,7 +168,7 @@ impl ProgressTracker {
                 avg_rps,
                 avg_response_time_ms,
                 total_retries,
-                avg_retries_per_message
+                retries_per_processed_message
             ),
         }
     }
@@ -472,7 +469,6 @@ impl OtelLogGenerator {
 
             let message = self.generate_message()?;
             let payload_size_bytes = message.payload_size_bytes();
-            let send_started = Instant::now();
             let send_started = Instant::now();
             let send_report = self.send_message(&message, shutdown_rx).await?;
             let response_time = send_started.elapsed();

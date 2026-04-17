@@ -9,6 +9,8 @@ use tokio::sync::watch;
 #[derive(Debug, Clone)]
 pub struct SendReport {
     pub success: bool,
+    /// Retry attempt index for the final send result (0-based).
+    /// Examples: `0` means no retry; `1` means one retry before success/failure.
     pub retries: usize,
     pub error: Option<String>,
 }

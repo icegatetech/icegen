@@ -14,3 +14,6 @@ stop:
 clean:
 	docker compose down -v
 	cargo clean
+
+test:
+	cargo test

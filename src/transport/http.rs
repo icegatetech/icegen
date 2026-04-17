@@ -192,7 +192,7 @@ impl Transport for HttpTransport {
 }
 
 fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
-    e.is_timeout() || e.is_connect() || e.is_request()
+    e.is_timeout() || e.is_connect()
 }
 
 #[cfg(test)]
