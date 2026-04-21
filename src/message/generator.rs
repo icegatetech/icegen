@@ -225,10 +225,22 @@ impl OTLPLogMessageGenerator {
         bodies.choose(&mut rng).unwrap().clone()
     }
 
+    /// Returns a per-record timestamp jittered uniformly across the past
+    /// `TIMESTAMP_JITTER_NS` window. Without jitter, every record produced in
+    /// the same batch (or burst) shares the same wall-clock nanosecond, which
+    /// makes downstream data appear clustered into specific seconds. Spreading
+    /// each record across the previous second produces a near-uniform
+    /// distribution over time.
+    fn jittered_timestamp_ns() -> i64 {
+        const TIMESTAMP_JITTER_NS: i64 = 10_000_000_000; // 1 second
+        let mut rng = rand::thread_rng();
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        now - rng.gen_range(0..TIMESTAMP_JITTER_NS)
+    }
+
     fn generate_single_log_record(&self, service_name: &str) -> Value {
         let mut rng = rand::thread_rng();
-        let now = Utc::now();
-        let timestamp_ns = now.timestamp_nanos_opt().unwrap_or(0);
+        let timestamp_ns = Self::jittered_timestamp_ns();
 
         let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
         let body = Self::generate_log_body(&severity_text, service_name);
@@ -480,8 +492,7 @@ impl OTLPLogMessageGenerator {
         // Generate log records
         let log_records: Vec<LogRecord> = (0..num_records)
             .map(|_| {
-                let now = Utc::now();
-                let timestamp_ns = now.timestamp_nanos_opt().unwrap_or(0) as u64;
+                let timestamp_ns = Self::jittered_timestamp_ns() as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
                 let body = Self::generate_log_body(&severity_text, &service_name);
                 let trace_id = FakeDataGenerator::generate_trace_id();
