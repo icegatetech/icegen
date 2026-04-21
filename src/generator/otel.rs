@@ -1114,11 +1114,16 @@ mod tests {
 
             let cloud_account_id =
                 resource_attribute(&message, "cloud.account.id").expect("cloud.account.id");
-            let service_name =
-                resource_attribute(&message, "service.name").expect("service.name");
+            let service_name = resource_attribute(&message, "service.name").expect("service.name");
 
-            assert!(profile.cloud_account_ids.iter().any(|value| value == &cloud_account_id));
-            assert!(profile.service_names.iter().any(|value| value == &service_name));
+            assert!(profile
+                .cloud_account_ids
+                .iter()
+                .any(|value| value == &cloud_account_id));
+            assert!(profile
+                .service_names
+                .iter()
+                .any(|value| value == &service_name));
         }
     }
 
@@ -1139,8 +1144,7 @@ mod tests {
 
             let cloud_account_id =
                 resource_attribute(&message, "cloud.account.id").expect("cloud.account.id");
-            let service_name =
-                resource_attribute(&message, "service.name").expect("service.name");
+            let service_name = resource_attribute(&message, "service.name").expect("service.name");
 
             assert!(cloud_account_id.starts_with(&format!("{tenant_id}-acc-")));
             assert!(service_name.starts_with(&format!("{tenant_id}-svc-")));

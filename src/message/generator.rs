@@ -50,10 +50,7 @@ impl OTLPLogMessageGenerator {
     ) -> Vec<(String, String)> {
         let attributes = vec![
             ("project_id".to_string(), project_id.to_string()),
-            (
-                "cloud.account.id".to_string(),
-                cloud_account_id.to_string(),
-            ),
+            ("cloud.account.id".to_string(), cloud_account_id.to_string()),
             ("service.name".to_string(), service_name.to_string()),
             (
                 "service.version".to_string(),
@@ -232,7 +229,7 @@ impl OTLPLogMessageGenerator {
     /// each record across the previous second produces a near-uniform
     /// distribution over time.
     fn jittered_timestamp_ns() -> i64 {
-        const TIMESTAMP_JITTER_NS: i64 = 10_000_000_000; // 1 second
+        const TIMESTAMP_JITTER_NS: i64 = 1_000_000_000; // 1 second
         let mut rng = rand::thread_rng();
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         now - rng.gen_range(0..TIMESTAMP_JITTER_NS)
@@ -492,7 +489,7 @@ impl OTLPLogMessageGenerator {
         // Generate log records
         let log_records: Vec<LogRecord> = (0..num_records)
             .map(|_| {
-                let timestamp_ns = Self::jittered_timestamp_ns() as u64;
+                let timestamp_ns = Self::jittered_timestamp_ns().max(0) as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
                 let body = Self::generate_log_body(&severity_text, &service_name);
                 let trace_id = FakeDataGenerator::generate_trace_id();
@@ -591,7 +588,6 @@ impl OTLPLogMessageGenerator {
             OTLPLogMessageType::Valid,
         ))
     }
-
 }
 
 fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
