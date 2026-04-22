@@ -1,7 +1,7 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
-use crate::transport::{SendReport, Transport};
+use crate::transport::{SendOutcome, Transport};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
@@ -78,7 +78,7 @@ impl Transport for HttpTransport {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendReport {
+    ) -> SendOutcome {
         let max_retries = self.retry_config.max_retries;
         let mut shutdown_rx = shutdown_rx.clone();
 
@@ -97,29 +97,29 @@ impl Transport for HttpTransport {
                         e
                     );
                     if *shutdown_rx.borrow() {
-                        return SendReport::failure(
-                            attempt as usize,
-                            format!("request interrupted by shutdown: {e}"),
-                        );
+                        return SendOutcome::Failure {
+                            retries: attempt as usize,
+                            error: GeneratorError::Interrupted,
+                        };
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_millis(delay)) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_ok() && *shutdown_rx.borrow() {
-                                return SendReport::failure(
-                                    attempt as usize,
-                                    format!("request interrupted during retry wait: {e}"),
-                                );
+                                return SendOutcome::Failure {
+                                    retries: attempt as usize,
+                                    error: GeneratorError::Interrupted,
+                                };
                             }
                         }
                     }
                     continue;
                 }
                 Err(e) => {
-                    return SendReport::failure(
-                        attempt as usize,
-                        format!("request failed: {e}"),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::RequestError(e),
+                    };
                 }
             };
 
@@ -129,15 +129,15 @@ impl Transport for HttpTransport {
                 if attempt > 0 {
                     eprintln!("  \u{2713} Retry[http]: request succeeded after {} retries", attempt);
                 }
-                return SendReport::success(attempt as usize);
+                return SendOutcome::Success { retries: attempt as usize };
             }
 
             if status.as_u16() == 429 {
                 if attempt == max_retries {
-                    return SendReport::failure(
-                        attempt as usize,
-                        format!("rate limit exceeded after {} attempts", max_retries + 1),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::RateLimitExceeded(attempt),
+                    };
                 }
 
                 // Parse Retry-After header (integer seconds)
@@ -157,19 +157,19 @@ impl Transport for HttpTransport {
                 );
 
                 if *shutdown_rx.borrow() {
-                    return SendReport::failure(
-                        attempt as usize,
-                        "request interrupted by shutdown after 429".to_string(),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::Interrupted,
+                    };
                 }
                 tokio::select! {
                     _ = sleep(Duration::from_millis(delay)) => {}
                     changed = shutdown_rx.changed() => {
                         if changed.is_ok() && *shutdown_rx.borrow() {
-                            return SendReport::failure(
-                                attempt as usize,
-                                "request interrupted during 429 retry wait".to_string(),
-                            );
+                            return SendOutcome::Failure {
+                                retries: attempt as usize,
+                                error: GeneratorError::Interrupted,
+                            };
                         }
                     }
                 }
@@ -178,16 +178,13 @@ impl Transport for HttpTransport {
 
             // Non-retryable HTTP error: fail immediately
             let error_text = response.text().await.unwrap_or_default();
-            return SendReport::failure(
-                attempt as usize,
-                format!("http error {}: {}", status.as_u16(), error_text),
-            );
+            return SendOutcome::Failure {
+                retries: attempt as usize,
+                error: GeneratorError::HttpError(status.as_u16(), error_text),
+            };
         }
 
-        SendReport::failure(
-            max_retries as usize,
-            format!("request retries exhausted after {} attempts", max_retries + 1),
-        )
+        unreachable!("all loop paths return explicitly")
     }
 }
 

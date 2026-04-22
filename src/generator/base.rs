@@ -1,7 +1,7 @@
 use crate::config::BatchResult;
 use crate::error::Result;
 use crate::message::OTLPLogMessage;
-use crate::transport::SendReport;
+use crate::transport::SendOutcome;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
@@ -12,7 +12,7 @@ pub trait LogGenerator: Send + Sync {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<SendReport>;
+    ) -> Result<SendOutcome>;
     async fn send_messages_batch(
         &self,
         count: usize,

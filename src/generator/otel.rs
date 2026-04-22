@@ -2,7 +2,7 @@ use crate::config::{BatchResult, OtelConfig};
 use crate::error::Result;
 use crate::generator::base::LogGenerator;
 use crate::message::{MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator};
-use crate::transport::{GrpcTransport, HttpTransport, Transport};
+use crate::transport::{GrpcTransport, HttpTransport, SendOutcome, Transport};
 use async_trait::async_trait;
 use rand::Rng;
 use std::future::Future;
@@ -474,18 +474,15 @@ impl OtelLogGenerator {
             let send_report = self.send_message(&message, shutdown_rx).await?;
             let response_time = send_started.elapsed();
 
-            let sent_payload_bytes = if send_report.success {
-                result.add_success();
-                payload_size_bytes
-            } else {
-                result.add_failure();
-                0
+            let sent_payload_bytes = match &send_report {
+                SendOutcome::Success { .. } => { result.add_success(); payload_size_bytes }
+                SendOutcome::Failure { .. } => { result.add_failure(); 0 }
             };
 
             if let Some(progress) = &progress {
                 let processed = progress.record(
-                    send_report.success,
-                    send_report.retries,
+                    send_report.is_success(),
+                    send_report.retries(),
                     sent_payload_bytes,
                     response_time,
                 );
@@ -530,7 +527,7 @@ impl LogGenerator for OtelLogGenerator {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> Result<crate::transport::SendReport> {
+    ) -> Result<SendOutcome> {
         if self.config.print_logs {
             println!("Sending message:");
             println!("  Tenant ID: {}", message.tenant_id);
@@ -554,12 +551,15 @@ impl LogGenerator for OtelLogGenerator {
         }
 
         let report = self.transport.send(message, shutdown_rx).await;
-        if report.success {
-            if self.config.print_logs {
-                println!("✓ Message sent successfully\n");
+        match &report {
+            SendOutcome::Success { .. } => {
+                if self.config.print_logs {
+                    println!("✓ Message sent successfully\n");
+                }
             }
-        } else if let Some(error) = &report.error {
-            eprintln!("✗ Failed to send message: {}", error);
+            SendOutcome::Failure { error, .. } => {
+                eprintln!("✗ Failed to send message: {}", error);
+            }
         }
 
         Ok(report)
@@ -621,8 +621,7 @@ fn build_tenant_value_pool(tenant_id: &str, suffix: &str, count: usize) -> Arc<[
 mod tests {
     use super::*;
     use crate::error::GeneratorError;
-    use crate::transport::SendReport;
-    use crate::transport::Transport;
+    use crate::transport::{SendOutcome, Transport};
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -700,8 +699,8 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> SendReport {
-            SendReport::success(0)
+        ) -> SendOutcome {
+            SendOutcome::Success { retries: 0 }
         }
     }
 
@@ -711,7 +710,7 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> SendReport {
+        ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -731,7 +730,7 @@ mod tests {
 
             tokio::time::sleep(self.send_delay).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
-            SendReport::success(0)
+            SendOutcome::Success { retries: 0 }
         }
     }
 
@@ -741,20 +740,20 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             shutdown_rx: &watch::Receiver<bool>,
-        ) -> SendReport {
+        ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
 
             let mut shutdown_rx = shutdown_rx.clone();
             tokio::select! {
                 _ = tokio::time::sleep(self.retry_wait) => {
                     self.started.fetch_add(1, Ordering::SeqCst);
-                    SendReport::failure(1, "retry started after backoff")
+                    SendOutcome::Failure { retries: 1, error: GeneratorError::ConnectionError("retry started after backoff".to_string()) }
                 }
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
-                        SendReport::failure(0, "retry cancelled by shutdown")
+                        SendOutcome::Failure { retries: 0, error: GeneratorError::Interrupted }
                     } else {
-                        SendReport::failure(0, "retry wait ended unexpectedly")
+                        SendOutcome::Failure { retries: 0, error: GeneratorError::ConnectionError("retry wait ended unexpectedly".to_string()) }
                     }
                 }
             }
@@ -767,13 +766,13 @@ mod tests {
             &self,
             _message: &OTLPLogMessage,
             _shutdown_rx: &watch::Receiver<bool>,
-        ) -> SendReport {
+        ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
             self.timestamps
                 .lock()
                 .expect("timestamps mutex poisoned")
                 .push(std::time::Instant::now());
-            SendReport::success(0)
+            SendOutcome::Success { retries: 0 }
         }
     }
 

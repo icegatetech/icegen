@@ -47,6 +47,9 @@ pub enum GeneratorError {
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
 
+    #[error("Request interrupted by shutdown")]
+    Interrupted,
+
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 

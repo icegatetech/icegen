@@ -3,7 +3,7 @@ use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
 use crate::pb::opentelemetry::proto::collector::logs::v1::logs_service_client::LogsServiceClient;
 use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
-use crate::transport::{SendReport, Transport};
+use crate::transport::{SendOutcome, Transport};
 use async_trait::async_trait;
 use prost::Message;
 use std::time::Duration;
@@ -85,12 +85,12 @@ impl Transport for GrpcTransport {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendReport {
+    ) -> SendOutcome {
         let max_retries = self.retry_config.max_retries;
         let mut shutdown_rx = shutdown_rx.clone();
         let (proto_request, tenant) = match Self::prepare_export_parts(message) {
             Ok(parts) => parts,
-            Err(e) => return SendReport::failure(0, e.to_string()),
+            Err(e) => return SendOutcome::Failure { retries: 0, error: e },
         };
 
         for attempt in 0..=max_retries {
@@ -101,14 +101,14 @@ impl Transport for GrpcTransport {
                     if attempt > 0 {
                         eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
                     }
-                    return SendReport::success(attempt as usize);
+                    return SendOutcome::Success { retries: attempt as usize };
                 }
                 Err(status) if is_retryable_grpc_code(status.code()) => {
                     if attempt == max_retries {
-                        return SendReport::failure(
-                            attempt as usize,
-                            format!("grpc retryable error exhausted: {}", status),
-                        );
+                        return SendOutcome::Failure {
+                            retries: attempt as usize,
+                            error: GeneratorError::GrpcError(status),
+                        };
                     }
 
                     let label = match status.code() {
@@ -131,37 +131,34 @@ impl Transport for GrpcTransport {
                     );
 
                     if *shutdown_rx.borrow() {
-                        return SendReport::failure(
-                            attempt as usize,
-                            format!("grpc request interrupted by shutdown: {}", status),
-                        );
+                        return SendOutcome::Failure {
+                            retries: attempt as usize,
+                            error: GeneratorError::Interrupted,
+                        };
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_millis(delay)) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_ok() && *shutdown_rx.borrow() {
-                                return SendReport::failure(
-                                    attempt as usize,
-                                    format!("grpc request interrupted during retry wait: {}", status),
-                                );
+                                return SendOutcome::Failure {
+                                    retries: attempt as usize,
+                                    error: GeneratorError::Interrupted,
+                                };
                             }
                         }
                     }
                     continue;
                 }
                 Err(status) => {
-                    return SendReport::failure(
-                        attempt as usize,
-                        format!("grpc error: {}", status),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::GrpcError(status),
+                    };
                 }
             }
         }
 
-        SendReport::failure(
-            max_retries as usize,
-            format!("grpc retries exhausted after {} attempts", max_retries + 1),
-        )
+        unreachable!("all loop paths return explicitly")
     }
 }
 
