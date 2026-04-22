@@ -198,7 +198,9 @@ fn test_public_generation_methods_return_non_empty_tenant_id() {
         .unwrap();
     assert!(!aggregated.tenant_id.is_empty());
 
-    let invalid = generator.generate_invalid_message("tenant1".to_string()).unwrap();
+    let invalid = generator
+        .generate_invalid_message("tenant1".to_string())
+        .unwrap();
     assert!(!invalid.tenant_id.is_empty());
 
     let protobuf = generator

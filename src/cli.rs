@@ -94,11 +94,7 @@ pub struct OtelArgs {
     pub tenant_count: usize,
 
     /// Number of cloud.account.id values generated per tenant
-    #[arg(
-        long,
-        env = "CLOUD_ACCOUNT_COUNT_PER_TENANT",
-        default_value = "4"
-    )]
+    #[arg(long, env = "CLOUD_ACCOUNT_COUNT_PER_TENANT", default_value = "4")]
     pub cloud_account_count_per_tenant: usize,
 
     /// Number of service.name values generated per tenant
