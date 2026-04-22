@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 pub struct OTLPLogMessageGenerator {
     source: String,
     label_cardinality: LabelCardinalityConfig,
+    timestamp_jitter_ns: i64,
 }
 
 impl OTLPLogMessageGenerator {
@@ -18,13 +19,19 @@ impl OTLPLogMessageGenerator {
         Self {
             source,
             label_cardinality: LabelCardinalityConfig::default(),
+            timestamp_jitter_ns: 1_000_000_000,
         }
     }
 
-    pub fn new_with_cardinality(source: String, label_cardinality: LabelCardinalityConfig) -> Self {
+    pub fn new_with_cardinality(
+        source: String,
+        label_cardinality: LabelCardinalityConfig,
+        timestamp_jitter_ns: i64,
+    ) -> Self {
         Self {
             source,
             label_cardinality,
+            timestamp_jitter_ns,
         }
     }
 
@@ -222,22 +229,18 @@ impl OTLPLogMessageGenerator {
         bodies.choose(&mut rng).unwrap().clone()
     }
 
-    /// Returns a per-record timestamp jittered uniformly across the past
-    /// `TIMESTAMP_JITTER_NS` window. Without jitter, every record produced in
-    /// the same batch (or burst) shares the same wall-clock nanosecond, which
-    /// makes downstream data appear clustered into specific seconds. Spreading
-    /// each record across the previous second produces a near-uniform
-    /// distribution over time.
-    fn jittered_timestamp_ns() -> i64 {
-        const TIMESTAMP_JITTER_NS: i64 = 1_000_000_000; // 1 second
-        let mut rng = rand::thread_rng();
+    fn jittered_timestamp_ns(&self) -> i64 {
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        now - rng.gen_range(0..TIMESTAMP_JITTER_NS)
+        if self.timestamp_jitter_ns <= 0 {
+            return now;
+        }
+        let mut rng = rand::thread_rng();
+        now - rng.gen_range(0..self.timestamp_jitter_ns)
     }
 
     fn generate_single_log_record(&self, service_name: &str) -> Value {
         let mut rng = rand::thread_rng();
-        let timestamp_ns = Self::jittered_timestamp_ns();
+        let timestamp_ns = self.jittered_timestamp_ns();
 
         let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
         let body = Self::generate_log_body(&severity_text, service_name);
@@ -489,7 +492,7 @@ impl OTLPLogMessageGenerator {
         // Generate log records
         let log_records: Vec<LogRecord> = (0..num_records)
             .map(|_| {
-                let timestamp_ns = Self::jittered_timestamp_ns().max(0) as u64;
+                let timestamp_ns = self.jittered_timestamp_ns().max(0) as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
                 let body = Self::generate_log_body(&severity_text, &service_name);
                 let trace_id = FakeDataGenerator::generate_trace_id();

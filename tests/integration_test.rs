@@ -245,6 +245,7 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
             default_limit: None,
             limits,
         },
+        1_000_000_000,
     );
 
     let mut pod_values = HashSet::new();
@@ -338,6 +339,7 @@ fn test_cardinality_disabled_keeps_original_values() {
             default_limit: None,
             limits,
         },
+        1_000_000_000,
     );
 
     let message = generator

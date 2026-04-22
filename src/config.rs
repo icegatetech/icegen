@@ -119,6 +119,7 @@ pub struct OtelConfig {
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
+    pub record_timestamp_jitter_ms: u64,
 }
 
 impl OtelConfig {
@@ -198,6 +199,12 @@ impl OtelConfig {
         }
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
+
+        if self.record_timestamp_jitter_ms > 3_600_000 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -363,6 +370,7 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
+            record_timestamp_jitter_ms: 1_000,
         }
     }
 

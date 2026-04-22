@@ -117,6 +117,10 @@ pub struct OtelArgs {
     /// Per-key cardinality limits as CSV map, e.g. key1=32,key2=64
     #[arg(long, env = "OTEL_LABEL_CARDINALITY_LIMITS", default_value = "")]
     pub label_cardinality_limits: String,
+
+    /// Jitter window for log record timestamps in milliseconds (0 to disable, max 3600000)
+    #[arg(long, env = "RECORD_TIMESTAMP_JITTER_MS", default_value = "1000")]
+    pub record_timestamp_jitter_ms: u64,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -148,6 +152,7 @@ impl From<OtelArgs> for OtelConfig {
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
+            record_timestamp_jitter_ms: args.record_timestamp_jitter_ms,
         }
     }
 }
