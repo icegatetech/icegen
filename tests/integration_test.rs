@@ -246,8 +246,8 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
             limits,
         },
         TimestampJitterConfig {
-            batch_jitter_ns: 1_000_000_000,
-            intra_batch_jitter_ns: 5_000_000,
+            accross_batch_timestamp_jitter_ns: 1_000_000_000,
+            intra_batch_timestamp_jitter_ns: 5_000_000,
             intra_batch_overlap_probability: 0.05,
         },
     );
@@ -344,8 +344,8 @@ fn test_cardinality_disabled_keeps_original_values() {
             limits,
         },
         TimestampJitterConfig {
-            batch_jitter_ns: 1_000_000_000,
-            intra_batch_jitter_ns: 5_000_000,
+            accross_batch_timestamp_jitter_ns: 1_000_000_000,
+            intra_batch_timestamp_jitter_ns: 5_000_000,
             intra_batch_overlap_probability: 0.05,
         },
     );

@@ -22,8 +22,8 @@ impl OTLPLogMessageGenerator {
             source,
             label_cardinality: LabelCardinalityConfig::default(),
             jitter: TimestampJitterConfig {
-                batch_jitter_ns: 1_000_000_000,
-                intra_batch_jitter_ns: 5_000_000,
+                accross_batch_timestamp_jitter_ns: 1_000_000_000,
+                intra_batch_timestamp_jitter_ns: 5_000_000,
                 intra_batch_overlap_probability: 0.05,
             },
         }
@@ -237,7 +237,6 @@ impl OTLPLogMessageGenerator {
     }
 
     fn batch_timestamps_ns(&self, num_records: usize) -> Vec<i64> {
-        // TODO(crit): optimise
         if num_records == 0 {
             return vec![];
         }
@@ -245,33 +244,32 @@ impl OTLPLogMessageGenerator {
         let mut rng = rand::thread_rng();
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        let batch_offset_ns = if self.jitter.batch_jitter_ns > 0 {
-            rng.gen_range(0..self.jitter.batch_jitter_ns)
+        let batch_offset_ns = if self.jitter.accross_batch_timestamp_jitter_ns > 0 {
+            rng.gen_range(0..self.jitter.accross_batch_timestamp_jitter_ns)
         } else {
             0
         };
 
-        let intra = self.jitter.intra_batch_jitter_ns;
-
-        let steps: Vec<i64> = (0..num_records)
-            .map(|_| if intra > 0 { rng.gen_range(0..intra) } else { 0 })
-            .collect();
-
-        let total_span_ns: i64 = steps.iter().sum();
-        let base_ns = now - batch_offset_ns - total_span_ns;
-
-        let mut result = Vec::with_capacity(num_records);
-        let mut prev_ns = base_ns;
+        let intra = self.jitter.intra_batch_timestamp_jitter_ns;
         let overlap_prob = self.jitter.intra_batch_overlap_probability;
 
-        for (i, &step) in steps.iter().enumerate() {
+        let mut result: Vec<i64> = Vec::with_capacity(num_records);
+        let mut total_span_ns: i64 = 0;
+        for _ in 0..num_records {
+            let step = if intra > 0 { rng.gen_range(0..intra) } else { 0 };
+            total_span_ns += step;
+            result.push(step);
+        }
+
+        let mut prev_ns = now - batch_offset_ns - total_span_ns;
+        for i in 0..num_records {
+            let step = result[i];
             let candidate = prev_ns + step;
-            let ts = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
+            result[i] = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
                 prev_ns - rng.gen_range(0..intra)
             } else {
                 candidate
             };
-            result.push(ts);
             prev_ns = candidate;
         }
 
@@ -695,8 +693,8 @@ mod tests {
             "test".to_string(),
             LabelCardinalityConfig::default(),
             TimestampJitterConfig {
-                batch_jitter_ns,
-                intra_batch_jitter_ns,
+                accross_batch_timestamp_jitter_ns: batch_jitter_ns,
+                intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
                 intra_batch_overlap_probability,
             },
         )

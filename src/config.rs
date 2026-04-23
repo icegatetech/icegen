@@ -98,8 +98,8 @@ impl Default for RetryConfig {
 
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampJitterConfig {
-    pub batch_jitter_ns: i64,
-    pub intra_batch_jitter_ns: i64,
+    pub accross_batch_timestamp_jitter_ns: i64,
+    pub intra_batch_timestamp_jitter_ns: i64,
     pub intra_batch_overlap_probability: f32,
 }
 
@@ -126,8 +126,8 @@ pub struct OtelConfig {
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
-    pub record_timestamp_jitter_ms: u64,
-    pub record_intra_batch_jitter_ms: u64,
+    pub record_accross_batch_timestamp_jitter_ms: u64,
+    pub record_intra_batch_timestamp_jitter_ms: u64,
     pub record_intra_batch_overlap_probability: f32,
 }
 
@@ -191,13 +191,13 @@ impl OtelConfig {
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
 
-        if self.record_timestamp_jitter_ms > 3_600_000 {
+        if self.record_accross_batch_timestamp_jitter_ms > 3_600_000 {
             return Err(GeneratorError::InvalidConfiguration(
-                "record_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
+                "record_accross_batch_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
             ));
         }
 
-        if self.record_intra_batch_jitter_ms > 60_000 {
+        if self.record_intra_batch_timestamp_jitter_ms > 60_000 {
             return Err(GeneratorError::InvalidConfiguration(
                 "record_intra_batch_jitter_ms must be <= 60000 (1 minute)".to_string(),
             ));
@@ -216,8 +216,8 @@ impl OtelConfig {
 
     pub fn timestamp_jitter_config(&self) -> TimestampJitterConfig {
         TimestampJitterConfig {
-            batch_jitter_ns: self.record_timestamp_jitter_ms as i64 * 1_000_000,
-            intra_batch_jitter_ns: self.record_intra_batch_jitter_ms as i64 * 1_000_000,
+            accross_batch_timestamp_jitter_ns: self.record_accross_batch_timestamp_jitter_ms as i64 * 1_000_000,
+            intra_batch_timestamp_jitter_ns: self.record_intra_batch_timestamp_jitter_ms as i64 * 1_000_000,
             intra_batch_overlap_probability: self.record_intra_batch_overlap_probability,
         }
     }
@@ -383,8 +383,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_timestamp_jitter_ms: 1_000,
-            record_intra_batch_jitter_ms: 5,
+            record_accross_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ms: 5,
             record_intra_batch_overlap_probability: 0.05,
         }
     }
@@ -481,13 +481,13 @@ mod tests {
     #[test]
     fn test_intra_batch_jitter_validation() {
         let mut cfg = base_config();
-        cfg.record_intra_batch_jitter_ms = 60_001;
+        cfg.record_intra_batch_timestamp_jitter_ms = 60_001;
         assert!(cfg.validate().is_err());
 
-        cfg.record_intra_batch_jitter_ms = 60_000;
+        cfg.record_intra_batch_timestamp_jitter_ms = 60_000;
         assert!(cfg.validate().is_ok());
 
-        cfg.record_intra_batch_jitter_ms = 0;
+        cfg.record_intra_batch_timestamp_jitter_ms = 0;
         assert!(cfg.validate().is_ok());
     }
 

@@ -821,8 +821,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_timestamp_jitter_ms: 1_000,
-            record_intra_batch_jitter_ms: 5,
+            record_accross_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ms: 5,
             record_intra_batch_overlap_probability: 0.05,
         }
     }
@@ -898,8 +898,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_timestamp_jitter_ms: 1_000,
-            record_intra_batch_jitter_ms: 5,
+            record_accross_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ms: 5,
             record_intra_batch_overlap_probability: 0.05,
         };
 
