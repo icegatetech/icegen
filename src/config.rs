@@ -96,10 +96,37 @@ impl Default for RetryConfig {
     }
 }
 
+/// Timestamp jitter configuration used by [`crate::message::OTLPLogMessageGenerator`].
+///
+/// All fields in this struct use nanoseconds because generated OTLP payloads store
+/// timestamps in `timeUnixNano` / `observedTimeUnixNano`. CLI and [`OtelConfig`]
+/// accept jitter settings in milliseconds and convert them to this internal form via
+/// [`OtelConfig::timestamp_jitter_config`].
+///
+/// Validation of user-provided ranges happens in [`OtelConfig::validate`]:
+/// `record_across_batch_timestamp_jitter_ms` must be in `0..=3_600_000`,
+/// `record_intra_batch_timestamp_jitter_ns` must be in `0..=60_000_000_000`, and
+/// `record_intra_batch_overlap_probability` must be in `0.0..=1.0`.
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampJitterConfig {
-    pub accross_batch_timestamp_jitter_ns: i64,
+    /// Maximum backward shift, in nanoseconds, applied to the whole generated batch.
+    ///
+    /// Each batch is anchored at `now - offset`, where `offset` is sampled uniformly from
+    /// `0..across_batch_timestamp_jitter_ns`. This keeps generated timestamps out of the future
+    /// while allowing batches to look slightly delayed as a group.
+    pub across_batch_timestamp_jitter_ns: i64,
+    /// Maximum local spacing step, in nanoseconds, between neighbouring records in one batch.
+    ///
+    /// When this value is `0`, records inside one batch collapse to the same timestamp before any
+    /// overlap logic is applied. When it is positive, each record advances the monotonic base plan
+    /// by a random step from `0..intra_batch_timestamp_jitter_ns`.
     pub intra_batch_timestamp_jitter_ns: i64,
+    /// Probability of forcing a local timestamp overlap between neighbouring records.
+    ///
+    /// `0.0` preserves the monotonic base plan, so aggregated timestamps do not decrease.
+    /// Values above `0.0` occasionally move the emitted timestamp of a record backwards relative
+    /// to its predecessor while still keeping the whole batch anchored by
+    /// [`Self::across_batch_timestamp_jitter_ns`].
     pub intra_batch_overlap_probability: f32,
 }
 
@@ -127,8 +154,8 @@ pub struct OtelConfig {
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
-    pub record_accross_batch_timestamp_jitter_ms: u64,
-    pub record_intra_batch_timestamp_jitter_ms: u64,
+    pub record_across_batch_timestamp_jitter_ms: u64,
+    pub record_intra_batch_timestamp_jitter_ns: u64,
     pub record_intra_batch_overlap_probability: f32,
 }
 
@@ -200,15 +227,15 @@ impl OtelConfig {
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
 
-        if self.record_accross_batch_timestamp_jitter_ms > 3_600_000 {
+        if self.record_across_batch_timestamp_jitter_ms > 3_600_000 {
             return Err(GeneratorError::InvalidConfiguration(
-                "record_accross_batch_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
+                "record_across_batch_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
             ));
         }
 
-        if self.record_intra_batch_timestamp_jitter_ms > 60_000 {
+        if self.record_intra_batch_timestamp_jitter_ns > 60_000_000_000 {
             return Err(GeneratorError::InvalidConfiguration(
-                "record_intra_batch_jitter_ms must be <= 60000 (1 minute)".to_string(),
+                "record_intra_batch_jitter_ns must be <= 60000000000 (1 minute)".to_string(),
             ));
         }
 
@@ -223,10 +250,16 @@ impl OtelConfig {
         Ok(())
     }
 
+    /// Convert CLI-facing jitter settings into generator-facing nanoseconds.
+    ///
+    /// This method does not perform validation on its own and expects [`Self::validate`] to be
+    /// called first. The returned config is consumed by
+    /// [`crate::message::OTLPLogMessageGenerator::new_with_cardinality`].
     pub fn timestamp_jitter_config(&self) -> TimestampJitterConfig {
         TimestampJitterConfig {
-            accross_batch_timestamp_jitter_ns: self.record_accross_batch_timestamp_jitter_ms as i64 * 1_000_000,
-            intra_batch_timestamp_jitter_ns: self.record_intra_batch_timestamp_jitter_ms as i64 * 1_000_000,
+            across_batch_timestamp_jitter_ns: self.record_across_batch_timestamp_jitter_ms as i64
+                * 1_000_000,
+            intra_batch_timestamp_jitter_ns: self.record_intra_batch_timestamp_jitter_ns as i64,
             intra_batch_overlap_probability: self.record_intra_batch_overlap_probability,
         }
     }
@@ -393,8 +426,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_accross_batch_timestamp_jitter_ms: 1_000,
-            record_intra_batch_timestamp_jitter_ms: 5,
+            record_across_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
         }
     }
@@ -499,13 +532,13 @@ mod tests {
     #[test]
     fn test_intra_batch_jitter_validation() {
         let mut cfg = base_config();
-        cfg.record_intra_batch_timestamp_jitter_ms = 60_001;
+        cfg.record_intra_batch_timestamp_jitter_ns = 60_000_000_001;
         assert!(cfg.validate().is_err());
 
-        cfg.record_intra_batch_timestamp_jitter_ms = 60_000;
+        cfg.record_intra_batch_timestamp_jitter_ns = 60_000_000_000;
         assert!(cfg.validate().is_ok());
 
-        cfg.record_intra_batch_timestamp_jitter_ms = 0;
+        cfg.record_intra_batch_timestamp_jitter_ns = 0;
         assert!(cfg.validate().is_ok());
     }
 

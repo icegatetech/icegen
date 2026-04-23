@@ -503,8 +503,14 @@ impl OtelLogGenerator {
             let response_time = send_started.elapsed();
 
             let sent_payload_bytes = match &send_report {
-                SendOutcome::Success { .. } => { result.add_success(); payload_size_bytes }
-                SendOutcome::Failure { .. } => { result.add_failure(); 0 }
+                SendOutcome::Success { .. } => {
+                    result.add_success();
+                    payload_size_bytes
+                }
+                SendOutcome::Failure { .. } => {
+                    result.add_failure();
+                    0
+                }
             };
 
             if let Some(progress) = &progress {
@@ -558,7 +564,10 @@ impl LogGenerator for OtelLogGenerator {
     ) -> Result<SendOutcome> {
         if self.config.print_logs {
             println!("Sending message:");
-            println!("  Tenant ID: {}", message.tenant_id.as_deref().unwrap_or("(none)"));
+            println!(
+                "  Tenant ID: {}",
+                message.tenant_id.as_deref().unwrap_or("(none)")
+            );
             println!("  Project ID: {}", message.project_id);
             println!("  Source: {}", message.source);
             println!("  Type: {:?}", message.message_type);
@@ -819,8 +828,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_accross_batch_timestamp_jitter_ms: 1_000,
-            record_intra_batch_timestamp_jitter_ms: 5,
+            record_across_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
         }
     }
@@ -897,8 +906,8 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
-            record_accross_batch_timestamp_jitter_ms: 1_000,
-            record_intra_batch_timestamp_jitter_ms: 5,
+            record_across_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
         };
 
@@ -1288,10 +1297,16 @@ mod tests {
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(resource_attribute(&message, "service.name").is_none());
-        let MessagePayload::Json(json) = &message.message else { panic!("expected JSON") };
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("expected JSON")
+        };
         let scope = json
-            .get("resourceLogs").and_then(|v| v.as_array()).and_then(|a| a.first())
-            .and_then(|rl| rl.get("scopeLogs")).and_then(|v| v.as_array()).and_then(|a| a.first())
+            .get("resourceLogs")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|rl| rl.get("scopeLogs"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
             .and_then(|sl| sl.get("scope"))
             .expect("scope must be present");
         let scope_name = scope.get("name").and_then(|n| n.as_str());
@@ -1299,13 +1314,20 @@ mod tests {
         let scope_attrs = scope.get("attributes").and_then(|a| a.as_array());
         let attr_keys: Vec<&str> = scope_attrs
             .map(|attrs| {
-                attrs.iter()
+                attrs
+                    .iter()
                     .filter_map(|a| a.get("key").and_then(|k| k.as_str()))
                     .collect()
             })
             .unwrap_or_default();
-        assert!(!attr_keys.contains(&"library.name"), "library.name must be absent when service_count_per_tenant=0");
-        assert!(attr_keys.contains(&"library.version"), "library.version must be present");
+        assert!(
+            !attr_keys.contains(&"library.name"),
+            "library.name must be absent when service_count_per_tenant=0"
+        );
+        assert!(
+            attr_keys.contains(&"library.version"),
+            "library.version must be present"
+        );
     }
 
     #[test]

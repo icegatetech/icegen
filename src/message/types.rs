@@ -41,7 +41,6 @@ impl OTLPLogMessage {
     }
 
     pub fn payload_size_bytes(&self) -> usize {
-        // Protobuf size will be about 20-40% smaller for a typical log message with long string fields.
         // Protobuf is usually 10-30% smaller than JSON for the same data. The main savings are the lack of keys ("severity_text": → field tag 1 byte) and more compact numbers (varint).
         match &self.message {
             MessagePayload::Json(json) => serde_json::to_vec(json).map(|v| v.len()).unwrap_or(0),

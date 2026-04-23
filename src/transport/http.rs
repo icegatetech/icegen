@@ -139,9 +139,14 @@ impl Transport for HttpTransport {
 
             if status.is_success() {
                 if attempt > 0 {
-                    eprintln!("  \u{2713} Retry[http]: request succeeded after {} retries", attempt);
+                    eprintln!(
+                        "  \u{2713} Retry[http]: request succeeded after {} retries",
+                        attempt
+                    );
                 }
-                return SendOutcome::Success { retries: attempt as usize };
+                return SendOutcome::Success {
+                    retries: attempt as usize,
+                };
             }
 
             if status.as_u16() == 429 {

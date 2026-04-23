@@ -10,8 +10,13 @@ use tokio::sync::watch;
 
 #[derive(Debug)]
 pub enum SendOutcome {
-    Success { retries: usize },
-    Failure { retries: usize, error: GeneratorError },
+    Success {
+        retries: usize,
+    },
+    Failure {
+        retries: usize,
+        error: GeneratorError,
+    },
 }
 
 impl SendOutcome {

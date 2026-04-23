@@ -97,7 +97,12 @@ impl Transport for GrpcTransport {
         let mut shutdown_rx = shutdown_rx.clone();
         let (proto_request, tenant) = match Self::prepare_export_parts(message) {
             Ok(parts) => parts,
-            Err(e) => return SendOutcome::Failure { retries: 0, error: e },
+            Err(e) => {
+                return SendOutcome::Failure {
+                    retries: 0,
+                    error: e,
+                }
+            }
         };
 
         for attempt in 0..=max_retries {
@@ -108,7 +113,9 @@ impl Transport for GrpcTransport {
                     if attempt > 0 {
                         eprintln!("  \u{2713} Request succeeded after {} retries", attempt);
                     }
-                    return SendOutcome::Success { retries: attempt as usize };
+                    return SendOutcome::Success {
+                        retries: attempt as usize,
+                    };
                 }
                 Err(status) if is_retryable_grpc_code(status.code()) => {
                     if attempt == max_retries {

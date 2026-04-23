@@ -127,13 +127,21 @@ pub struct OtelArgs {
 
     /// Per-batch jitter for log record timestamps in milliseconds; whole request shifts back by
     /// rand(0, value). Applied once per batch, not per record. (0 to disable, max 3600000)
-    #[arg(long, env = "RECORD_ACCROSS_BATCH_TIMESTAMP_JITTER_MS", default_value = "1000")]
-    pub record_accross_batch_timestamp_jitter_ms: u64,
+    #[arg(
+        long,
+        env = "RECORD_ACCROSS_BATCH_TIMESTAMP_JITTER_MS",
+        default_value = "1000"
+    )]
+    pub record_across_batch_timestamp_jitter_ms: u64,
 
-    /// Intra-batch jitter in milliseconds: forward step between adjacent records and size of
-    /// rare backward nudge. (0 to disable, max 60000)
-    #[arg(long, env = "RECORD_INTRA_BATCH_TIMESTAMP_JITTER_MS", default_value = "5")]
-    pub record_intra_batch_timestamp_jitter_ms: u64,
+    /// Intra-batch jitter in nanoseconds: forward step between adjacent records and size of
+    /// rare backward nudge. (0 to disable, max 60000000000)
+    #[arg(
+        long,
+        env = "RECORD_INTRA_BATCH_TIMESTAMP_JITTER_NS",
+        default_value = "5"
+    )]
+    pub record_intra_batch_timestamp_jitter_ns: u64,
 
     /// Probability [0.0, 1.0] that a record (i > 0) steps backward instead of forward
     #[arg(
@@ -174,8 +182,8 @@ impl From<OtelArgs> for OtelConfig {
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
-            record_accross_batch_timestamp_jitter_ms: args.record_accross_batch_timestamp_jitter_ms,
-            record_intra_batch_timestamp_jitter_ms: args.record_intra_batch_timestamp_jitter_ms,
+            record_across_batch_timestamp_jitter_ms: args.record_across_batch_timestamp_jitter_ms,
+            record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
             record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
         }
     }
@@ -281,7 +289,7 @@ mod tests {
             "otel",
             "--endpoint",
             "http://localhost:4318/v1/logs",
-            "--record-intra-batch-timestamp-jitter-ms",
+            "--record-intra-batch-timestamp-jitter-ns",
             "10",
             "--record-intra-batch-overlap-probability",
             "0.2",
@@ -289,7 +297,7 @@ mod tests {
 
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
-        assert_eq!(config.record_intra_batch_timestamp_jitter_ms, 10);
+        assert_eq!(config.record_intra_batch_timestamp_jitter_ns, 10);
         assert!((config.record_intra_batch_overlap_probability - 0.2).abs() < 1e-6);
     }
 

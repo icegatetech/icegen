@@ -22,13 +22,23 @@ impl OTLPLogMessageGenerator {
             source,
             label_cardinality: LabelCardinalityConfig::default(),
             jitter: TimestampJitterConfig {
-                accross_batch_timestamp_jitter_ns: 1_000_000_000,
+                across_batch_timestamp_jitter_ns: 1_000_000_000,
                 intra_batch_timestamp_jitter_ns: 5_000_000,
                 intra_batch_overlap_probability: 0.05,
             },
         }
     }
 
+    /// Create a generator with explicit cardinality and timestamp jitter settings.
+    ///
+    /// `jitter.across_batch_timestamp_jitter_ns` shifts the whole batch backwards in time,
+    /// while `jitter.intra_batch_timestamp_jitter_ns` controls spacing between neighbouring
+    /// records inside that batch. `jitter.intra_batch_overlap_probability` controls how often
+    /// the emitted timestamp for a record is moved backwards relative to the previous record.
+    ///
+    /// The generator expects jitter values in nanoseconds. When configuration comes from
+    /// [`crate::config::OtelConfig`], use [`crate::config::OtelConfig::timestamp_jitter_config`]
+    /// so CLI millisecond values are converted consistently.
     pub fn new_with_cardinality(
         source: String,
         label_cardinality: LabelCardinalityConfig,
@@ -187,7 +197,10 @@ impl OTLPLogMessageGenerator {
                     "Cache hit for key {}",
                     &FakeDataGenerator::generate_uuid()[..8]
                 ),
-                format!("Health check passed for service {}", service_name.unwrap_or(DEFAULT_SERVICE_NAME)),
+                format!(
+                    "Health check passed for service {}",
+                    service_name.unwrap_or(DEFAULT_SERVICE_NAME)
+                ),
             ],
             "WARN" => vec![
                 format!("High memory usage detected: {}%", rng.gen_range(70..96)),
@@ -244,8 +257,8 @@ impl OTLPLogMessageGenerator {
         let mut rng = rand::thread_rng();
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        let batch_offset_ns = if self.jitter.accross_batch_timestamp_jitter_ns > 0 {
-            rng.gen_range(0..self.jitter.accross_batch_timestamp_jitter_ns)
+        let batch_offset_ns = if self.jitter.across_batch_timestamp_jitter_ns > 0 {
+            rng.gen_range(0..self.jitter.across_batch_timestamp_jitter_ns)
         } else {
             0
         };
@@ -256,7 +269,11 @@ impl OTLPLogMessageGenerator {
         let mut result: Vec<i64> = Vec::with_capacity(num_records);
         let mut total_span_ns: i64 = 0;
         for _ in 0..num_records {
-            let step = if intra > 0 { rng.gen_range(0..intra) } else { 0 };
+            let step = if intra > 0 {
+                rng.gen_range(0..intra)
+            } else {
+                0
+            };
             total_span_ns += step;
             result.push(step);
         }
@@ -352,6 +369,11 @@ impl OTLPLogMessageGenerator {
         )
     }
 
+    /// Generate a single-record OTLP JSON payload.
+    ///
+    /// The record timestamp is generated with the configured batch-level jitter and is never set
+    /// in the future. Because the payload contains one record, intra-batch spacing and overlap
+    /// settings have no observable effect here.
     pub fn generate_valid_message(
         &self,
         tenant_id: Option<String>,
@@ -390,6 +412,13 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
+    /// Generate a multi-record OTLP JSON payload.
+    ///
+    /// The whole batch is shifted backwards by `across_batch_timestamp_jitter_ns`, then record
+    /// timestamps are planned using `intra_batch_timestamp_jitter_ns`. With
+    /// `intra_batch_overlap_probability == 0.0`, emitted timestamps do not decrease. With
+    /// `intra_batch_timestamp_jitter_ns == 0`, all records in the batch collapse to the same
+    /// timestamp.
     pub fn generate_aggregated_message(
         &self,
         tenant_id: Option<String>,
@@ -506,6 +535,11 @@ impl OTLPLogMessageGenerator {
         }
     }
 
+    /// Generate a protobuf OTLP payload with `num_records` log records.
+    ///
+    /// Timestamp planning matches [`Self::generate_aggregated_message`], but the final payload is
+    /// serialized as protobuf and negative intermediate values are clamped to `0` before writing
+    /// them into unsigned OTLP fields.
     pub fn generate_protobuf_message(
         &self,
         tenant_id: Option<String>,
@@ -574,11 +608,8 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         // Resource attributes
-        let resource_attributes_pairs = self.generate_resource_attributes_pairs(
-            &project_id,
-            cloud_account_id.as_deref(),
-            svc,
-        );
+        let resource_attributes_pairs =
+            self.generate_resource_attributes_pairs(&project_id, cloud_account_id.as_deref(), svc);
         let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -682,7 +713,9 @@ fn num_digits(mut number: usize) -> usize {
 mod tests {
     use super::*;
     use crate::config::TimestampJitterConfig;
+    use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use chrono::Utc;
+    use prost::Message;
 
     fn gen_with_jitter(
         batch_jitter_ns: i64,
@@ -693,68 +726,136 @@ mod tests {
             "test".to_string(),
             LabelCardinalityConfig::default(),
             TimestampJitterConfig {
-                accross_batch_timestamp_jitter_ns: batch_jitter_ns,
+                across_batch_timestamp_jitter_ns: batch_jitter_ns,
                 intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
                 intra_batch_overlap_probability,
             },
         )
     }
 
+    fn json_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+        let MessagePayload::Json(json) = message.message else {
+            panic!("Expected JSON payload");
+        };
+
+        json["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                record["timeUnixNano"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn protobuf_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+        let MessagePayload::Protobuf(bytes) = message.message else {
+            panic!("Expected protobuf payload");
+        };
+
+        ExportLogsServiceRequest::decode(bytes.as_slice())
+            .unwrap()
+            .resource_logs
+            .into_iter()
+            .flat_map(|resource_logs| resource_logs.scope_logs.into_iter())
+            .flat_map(|scope_logs| scope_logs.log_records.into_iter())
+            .map(|record| i64::try_from(record.time_unix_nano).unwrap())
+            .collect()
+    }
+
     #[test]
-    fn batch_timestamps_are_monotonic_when_overlap_disabled() {
+    fn generate_valid_message_keeps_single_timestamp_within_batch_window() {
+        let batch_jitter_ns = 2_000_000_000_i64;
+        let gen = gen_with_jitter(batch_jitter_ns, 5_000_000, 0.25);
+        let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamps = json_timestamps(
+            gen.generate_valid_message(None, None, Some("svc".to_string()))
+                .unwrap(),
+        );
+        let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        assert_eq!(timestamps.len(), 1);
+        let ts = timestamps[0];
+        assert!(
+            ts <= now_after,
+            "timestamp in future: {} > {}",
+            ts,
+            now_after
+        );
+        assert!(
+            ts >= now_before - batch_jitter_ns,
+            "timestamp too old: {} < {}",
+            ts,
+            now_before - batch_jitter_ns
+        );
+    }
+
+    #[test]
+    fn generate_aggregated_message_is_non_decreasing_when_overlap_disabled() {
         let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
-        let ts = gen.batch_timestamps_ns(50);
+        let ts = json_timestamps(
+            gen.generate_aggregated_message(None, None, None, 50)
+                .unwrap(),
+        );
         for i in 1..ts.len() {
-            assert!(ts[i - 1] <= ts[i], "non-monotonic at i={}: {} > {}", i, ts[i - 1], ts[i]);
+            assert!(
+                ts[i - 1] <= ts[i],
+                "non-monotonic at i={}: {} > {}",
+                i,
+                ts[i - 1],
+                ts[i]
+            );
         }
     }
 
     #[test]
-    fn batch_timestamps_produce_overlaps_when_probability_one() {
-        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 1.0);
-        let ts = gen.batch_timestamps_ns(50);
-        let has_overlap = (1..ts.len()).any(|i| ts[i] < ts[i - 1]);
-        assert!(has_overlap, "expected at least one backward nudge with prob=1.0");
-    }
-
-    #[test]
-    fn batch_timestamps_collapse_when_intra_jitter_zero() {
+    fn generate_aggregated_message_collapses_timestamps_when_intra_jitter_zero() {
         let gen = gen_with_jitter(0, 0, 0.0);
-        let ts = gen.batch_timestamps_ns(10);
-        assert!(ts.windows(2).all(|w| w[0] == w[1]), "all timestamps should be equal when intra_jitter=0 and batch_jitter=0");
+        let ts = json_timestamps(
+            gen.generate_aggregated_message(None, None, None, 10)
+                .unwrap(),
+        );
+        assert!(
+            ts.windows(2).all(|w| w[0] == w[1]),
+            "all timestamps should be equal when intra_jitter=0 and batch_jitter=0"
+        );
     }
 
     #[test]
-    fn batch_timestamps_stay_within_jitter_window() {
+    fn generate_protobuf_message_keeps_timestamps_within_batch_window() {
         let batch_jitter_ns = 1_000_000_000_i64;
         let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
-        for _ in 0..20 {
-            let ts = gen.batch_timestamps_ns(5);
-            let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-            for &t in &ts {
-                assert!(t <= now_after, "timestamp in future: {} > {}", t, now_after);
-                assert!(
-                    t >= now_after - batch_jitter_ns - 5_000_000,
-                    "timestamp too old: {} < {}",
-                    t,
-                    now_after - batch_jitter_ns
-                );
-            }
+        let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 5).unwrap());
+        let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        for &t in &ts {
+            assert!(t <= now_after, "timestamp in future: {} > {}", t, now_after);
+            assert!(
+                t >= now_before - batch_jitter_ns,
+                "timestamp too old: {} < {}",
+                t,
+                now_before - batch_jitter_ns
+            );
         }
     }
 
     #[test]
-    fn single_record_uses_full_batch_jitter_window() {
-        let batch_jitter_ns = 2_000_000_000_i64;
-        let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
-        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let samples: Vec<i64> = (0..200).map(|_| gen.batch_timestamps_ns(1)[0]).collect();
-        let min_ts = *samples.iter().min().unwrap();
-        assert!(
-            min_ts < now - batch_jitter_ns / 2,
-            "expected min sample to cover lower half of window, got min={} threshold={}",
-            min_ts,
-            now - batch_jitter_ns / 2
-        );
+    fn generate_protobuf_message_is_non_decreasing_when_overlap_disabled() {
+        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 50).unwrap());
+        for i in 1..ts.len() {
+            assert!(
+                ts[i - 1] <= ts[i],
+                "non-monotonic at i={}: {} > {}",
+                i,
+                ts[i - 1],
+                ts[i]
+            );
+        }
     }
 }
