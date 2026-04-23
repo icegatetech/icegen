@@ -1,5 +1,6 @@
 pub mod grpc;
 pub mod http;
+pub mod noop;
 pub mod protobuf;
 
 use crate::error::GeneratorError;
@@ -36,3 +37,4 @@ pub trait Transport: Send + Sync {
 
 pub use grpc::GrpcTransport;
 pub use http::HttpTransport;
+pub use noop::NoopTransport;

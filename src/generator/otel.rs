@@ -2,7 +2,7 @@ use crate::config::{BatchResult, OtelConfig};
 use crate::error::Result;
 use crate::generator::base::LogGenerator;
 use crate::message::{MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator};
-use crate::transport::{GrpcTransport, HttpTransport, SendOutcome, Transport};
+use crate::transport::{GrpcTransport, HttpTransport, NoopTransport, SendOutcome, Transport};
 use async_trait::async_trait;
 use rand::Rng;
 use std::future::Future;
@@ -262,9 +262,13 @@ impl OtelLogGenerator {
         config.validate()?;
 
         println!("Initializing OTEL Log Generator...");
-        println!("  Endpoint: {}", config.ingest_endpoint);
-        println!("  Transport: {}", config.transport);
-        println!("  Use Protobuf: {}", config.use_protobuf);
+        if config.dry_run {
+            println!("  Dry-run: no network transport, stdout only");
+        } else {
+            println!("  Endpoint: {}", config.ingest_endpoint);
+            println!("  Transport: {}", config.transport);
+            println!("  Use Protobuf: {}", config.use_protobuf);
+        }
         println!("  Records per message: {}", config.records_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
         println!("  Concurrency: {}", config.concurrency);
@@ -310,6 +314,10 @@ impl OtelLogGenerator {
             config.label_cardinality_enabled
         );
 
+        if config.dry_run {
+            return Self::with_transport(config, Arc::new(NoopTransport));
+        }
+
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
             "http" => {
                 let http_transport = HttpTransport::new(
@@ -346,8 +354,6 @@ impl OtelLogGenerator {
         config: OtelConfig,
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
-        config.validate()?;
-
         let cardinality_config = config.label_cardinality_config()?;
         let message_generator = OTLPLogMessageGenerator::new_with_cardinality(
             "rust-generator".to_string(),
@@ -576,7 +582,11 @@ impl LogGenerator for OtelLogGenerator {
         match &report {
             SendOutcome::Success { .. } => {
                 if self.config.print_logs {
-                    println!("✓ Message sent successfully\n");
+                    if self.config.dry_run {
+                        println!("✓ Message generated (dry-run)\n");
+                    } else {
+                        println!("✓ Message sent successfully\n");
+                    }
                 }
             }
             SendOutcome::Failure { error, .. } => {
@@ -643,12 +653,10 @@ fn build_tenant_value_pool(tenant_id: &str, suffix: &str, count: usize) -> Arc<[
 mod tests {
     use super::*;
     use crate::error::GeneratorError;
-    use crate::transport::{SendOutcome, Transport};
+    use crate::transport::{NoopTransport, SendOutcome, Transport};
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-
-    struct NoopTransport;
 
     struct CountingTransport {
         started: AtomicUsize,
@@ -712,17 +720,6 @@ mod tests {
                 .lock()
                 .expect("timestamps mutex poisoned")
                 .clone()
-        }
-    }
-
-    #[async_trait]
-    impl Transport for NoopTransport {
-        async fn send(
-            &self,
-            _message: &OTLPLogMessage,
-            _shutdown_rx: &watch::Receiver<bool>,
-        ) -> SendOutcome {
-            SendOutcome::Success { retries: 0 }
         }
     }
 
@@ -807,6 +804,7 @@ mod tests {
             invalid_record_percent: 0.0,
             records_per_message: 1,
             print_logs: false,
+            dry_run: false,
             count,
             message_interval_ms,
             concurrency,
@@ -884,6 +882,7 @@ mod tests {
             invalid_record_percent: 0.0,
             records_per_message: 1,
             print_logs: false,
+            dry_run: false,
             count: 1,
             message_interval_ms: 0,
             concurrency: 1,
@@ -1316,6 +1315,19 @@ mod tests {
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(resource_attribute(&message, "cloud.account.id").is_none());
+    }
+
+    #[tokio::test]
+    async fn dry_run_initializes_without_endpoint() {
+        let mut config = test_config(1, 0, 1);
+        config.dry_run = true;
+        config.ingest_endpoint = String::new();
+
+        let generator = OtelLogGenerator::new(config).await.unwrap();
+        let result = generator.send_messages_batch(1, 0).await.unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.success, 1);
+        assert_eq!(result.failed, 0);
     }
 
     #[test]

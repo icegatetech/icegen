@@ -25,9 +25,9 @@ pub enum GeneratorType {
 
 #[derive(Args)]
 pub struct OtelArgs {
-    /// OTEL logs ingest endpoint
+    /// OTEL logs ingest endpoint (not required with --dry-run)
     #[arg(long, env = "OTEL_LOGS_ENDPOINT")]
-    pub endpoint: String,
+    pub endpoint: Option<String>,
 
     /// Health check endpoint (optional)
     #[arg(long, env = "OTEL_HEALTHCHECK_ENDPOINT")]
@@ -68,6 +68,10 @@ pub struct OtelArgs {
     /// Print detailed logs for each message
     #[arg(long, env = "PRINT_LOGS", default_value = "false", value_parser = parse_bool)]
     pub print_logs: bool,
+
+    /// Generate messages and print to stdout only; do not open any network transport
+    #[arg(long, env = "DRY_RUN", default_value = "false", value_parser = parse_bool)]
+    pub dry_run: bool,
 
     /// Run in continuous mode
     #[arg(long, env = "CONTINUOUS_MODE", default_value = "false", value_parser = parse_bool)]
@@ -145,13 +149,14 @@ impl From<OtelArgs> for OtelConfig {
         let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
 
         Self {
-            ingest_endpoint: args.endpoint,
+            ingest_endpoint: args.endpoint.unwrap_or_default(),
             healthcheck_endpoint: args.healthcheck_endpoint,
             use_protobuf: args.use_protobuf,
             transport: args.transport,
             invalid_record_percent: args.invalid_record_percent,
             records_per_message: args.records_per_message,
-            print_logs: args.print_logs,
+            print_logs: args.print_logs || args.dry_run,
+            dry_run: args.dry_run,
             count: args.count,
             message_interval_ms: args
                 .message_interval_ms
@@ -286,6 +291,18 @@ mod tests {
         let config: OtelConfig = args.into();
         assert_eq!(config.record_intra_batch_timestamp_jitter_ms, 10);
         assert!((config.record_intra_batch_overlap_probability - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cli_accepts_dry_run_without_endpoint() {
+        let cli = Cli::parse_from(["otel-log-generator", "otel", "--dry-run"]);
+        let GeneratorType::Otel(args) = cli.generator;
+        assert!(args.dry_run);
+        assert!(args.endpoint.is_none());
+        let config: OtelConfig = args.into();
+        assert!(config.dry_run);
+        assert!(config.ingest_endpoint.is_empty());
+        assert!(config.print_logs);
     }
 
     #[test]

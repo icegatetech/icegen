@@ -112,6 +112,7 @@ pub struct OtelConfig {
     pub invalid_record_percent: f32,
     pub records_per_message: usize,
     pub print_logs: bool,
+    pub dry_run: bool,
     pub count: usize,
     pub message_interval_ms: u64,
     pub concurrency: usize,
@@ -151,11 +152,19 @@ impl OtelConfig {
             ));
         }
 
-        if self.transport != "http" && self.transport != "grpc" {
-            return Err(GeneratorError::InvalidTransport(format!(
-                "Invalid transport '{}', must be 'http' or 'grpc'",
-                self.transport
-            )));
+        if !self.dry_run {
+            if self.ingest_endpoint.trim().is_empty() {
+                return Err(GeneratorError::InvalidConfiguration(
+                    "ingest_endpoint must not be empty (unless --dry-run)".to_string(),
+                ));
+            }
+
+            if self.transport != "http" && self.transport != "grpc" {
+                return Err(GeneratorError::InvalidTransport(format!(
+                    "Invalid transport '{}', must be 'http' or 'grpc'",
+                    self.transport
+                )));
+            }
         }
 
         if self.retry_max_retries > MAX_RETRIES_UPPER_BOUND {
@@ -369,6 +378,7 @@ mod tests {
             invalid_record_percent: 0.0,
             records_per_message: 1,
             print_logs: false,
+            dry_run: false,
             count: 1,
             message_interval_ms: 0,
             concurrency: 1,
@@ -387,6 +397,14 @@ mod tests {
             record_intra_batch_timestamp_jitter_ms: 5,
             record_intra_batch_overlap_probability: 0.05,
         }
+    }
+
+    #[test]
+    fn validate_allows_missing_endpoint_with_dry_run() {
+        let mut cfg = base_config();
+        cfg.ingest_endpoint = String::new();
+        cfg.dry_run = true;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
