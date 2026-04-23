@@ -1,4 +1,4 @@
-use crate::config::LabelCardinalityConfig;
+use crate::config::{LabelCardinalityConfig, TimestampJitterConfig};
 use crate::error::{GeneratorError, Result};
 use crate::message::fake_data::FakeDataGenerator;
 use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
@@ -13,7 +13,7 @@ const DEFAULT_SERVICE_NAME: &str = "generator";
 pub struct OTLPLogMessageGenerator {
     source: String,
     label_cardinality: LabelCardinalityConfig,
-    timestamp_jitter_ns: i64,
+    jitter: TimestampJitterConfig,
 }
 
 impl OTLPLogMessageGenerator {
@@ -21,19 +21,23 @@ impl OTLPLogMessageGenerator {
         Self {
             source,
             label_cardinality: LabelCardinalityConfig::default(),
-            timestamp_jitter_ns: 1_000_000_000,
+            jitter: TimestampJitterConfig {
+                batch_jitter_ns: 1_000_000_000,
+                intra_batch_jitter_ns: 5_000_000,
+                intra_batch_overlap_probability: 0.05,
+            },
         }
     }
 
     pub fn new_with_cardinality(
         source: String,
         label_cardinality: LabelCardinalityConfig,
-        timestamp_jitter_ns: i64,
+        jitter: TimestampJitterConfig,
     ) -> Self {
         Self {
             source,
             label_cardinality,
-            timestamp_jitter_ns,
+            jitter,
         }
     }
 
@@ -232,18 +236,50 @@ impl OTLPLogMessageGenerator {
         bodies.choose(&mut rng).unwrap().clone()
     }
 
-    fn jittered_timestamp_ns(&self) -> i64 {
-        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        if self.timestamp_jitter_ns <= 0 {
-            return now;
+    fn batch_timestamps_ns(&self, num_records: usize) -> Vec<i64> {
+        // TODO(crit): optimise
+        if num_records == 0 {
+            return vec![];
         }
+
         let mut rng = rand::thread_rng();
-        now - rng.gen_range(0..self.timestamp_jitter_ns)
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        let batch_offset_ns = if self.jitter.batch_jitter_ns > 0 {
+            rng.gen_range(0..self.jitter.batch_jitter_ns)
+        } else {
+            0
+        };
+
+        let intra = self.jitter.intra_batch_jitter_ns;
+
+        let steps: Vec<i64> = (0..num_records)
+            .map(|_| if intra > 0 { rng.gen_range(0..intra) } else { 0 })
+            .collect();
+
+        let total_span_ns: i64 = steps.iter().sum();
+        let base_ns = now - batch_offset_ns - total_span_ns;
+
+        let mut result = Vec::with_capacity(num_records);
+        let mut prev_ns = base_ns;
+        let overlap_prob = self.jitter.intra_batch_overlap_probability;
+
+        for (i, &step) in steps.iter().enumerate() {
+            let candidate = prev_ns + step;
+            let ts = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
+                prev_ns - rng.gen_range(0..intra)
+            } else {
+                candidate
+            };
+            result.push(ts);
+            prev_ns = candidate;
+        }
+
+        result
     }
 
-    fn generate_single_log_record(&self, service_name: Option<&str>) -> Value {
+    fn generate_single_log_record(&self, service_name: Option<&str>, timestamp_ns: i64) -> Value {
         let mut rng = rand::thread_rng();
-        let timestamp_ns = self.jittered_timestamp_ns();
 
         let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
         let body = Self::generate_log_body(&severity_text, service_name);
@@ -335,7 +371,8 @@ impl OTLPLogMessageGenerator {
     ) -> Result<OTLPLogMessage> {
         let project_id = FakeDataGenerator::generate_project_id();
 
-        let log_record = self.generate_single_log_record(service_name.as_deref());
+        let ts = self.batch_timestamps_ns(1)[0];
+        let log_record = self.generate_single_log_record(service_name.as_deref(), ts);
         let resource_log = self.wrap_log_records_in_otlp(
             &project_id,
             cloud_account_id.as_deref(),
@@ -374,8 +411,10 @@ impl OTLPLogMessageGenerator {
 
         let project_id = FakeDataGenerator::generate_project_id();
 
-        let log_records: Vec<Value> = (0..num_records)
-            .map(|_| self.generate_single_log_record(service_name.as_deref()))
+        let ts_list = self.batch_timestamps_ns(num_records);
+        let log_records: Vec<Value> = ts_list
+            .into_iter()
+            .map(|ts| self.generate_single_log_record(service_name.as_deref(), ts))
             .collect();
 
         let resource_log = self.wrap_log_records_in_otlp(
@@ -494,10 +533,13 @@ impl OTLPLogMessageGenerator {
         let project_id = FakeDataGenerator::generate_project_id();
         let svc = service_name.as_deref();
 
+        let ts_list = self.batch_timestamps_ns(num_records);
+
         // Generate log records
-        let log_records: Vec<LogRecord> = (0..num_records)
-            .map(|_| {
-                let timestamp_ns = self.jittered_timestamp_ns().max(0) as u64;
+        let log_records: Vec<LogRecord> = ts_list
+            .iter()
+            .map(|&ts_i64| {
+                let timestamp_ns = ts_i64.max(0) as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
                 let body = Self::generate_log_body(&severity_text, svc);
                 let trace_id = FakeDataGenerator::generate_trace_id();
@@ -636,4 +678,85 @@ fn num_digits(mut number: usize) -> usize {
         digits += 1;
     }
     digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TimestampJitterConfig;
+    use chrono::Utc;
+
+    fn gen_with_jitter(
+        batch_jitter_ns: i64,
+        intra_batch_jitter_ns: i64,
+        intra_batch_overlap_probability: f32,
+    ) -> OTLPLogMessageGenerator {
+        OTLPLogMessageGenerator::new_with_cardinality(
+            "test".to_string(),
+            LabelCardinalityConfig::default(),
+            TimestampJitterConfig {
+                batch_jitter_ns,
+                intra_batch_jitter_ns,
+                intra_batch_overlap_probability,
+            },
+        )
+    }
+
+    #[test]
+    fn batch_timestamps_are_monotonic_when_overlap_disabled() {
+        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let ts = gen.batch_timestamps_ns(50);
+        for i in 1..ts.len() {
+            assert!(ts[i - 1] <= ts[i], "non-monotonic at i={}: {} > {}", i, ts[i - 1], ts[i]);
+        }
+    }
+
+    #[test]
+    fn batch_timestamps_produce_overlaps_when_probability_one() {
+        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 1.0);
+        let ts = gen.batch_timestamps_ns(50);
+        let has_overlap = (1..ts.len()).any(|i| ts[i] < ts[i - 1]);
+        assert!(has_overlap, "expected at least one backward nudge with prob=1.0");
+    }
+
+    #[test]
+    fn batch_timestamps_collapse_when_intra_jitter_zero() {
+        let gen = gen_with_jitter(0, 0, 0.0);
+        let ts = gen.batch_timestamps_ns(10);
+        assert!(ts.windows(2).all(|w| w[0] == w[1]), "all timestamps should be equal when intra_jitter=0 and batch_jitter=0");
+    }
+
+    #[test]
+    fn batch_timestamps_stay_within_jitter_window() {
+        let batch_jitter_ns = 1_000_000_000_i64;
+        let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
+        for _ in 0..20 {
+            let ts = gen.batch_timestamps_ns(5);
+            let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            for &t in &ts {
+                assert!(t <= now_after, "timestamp in future: {} > {}", t, now_after);
+                assert!(
+                    t >= now_after - batch_jitter_ns - 5_000_000,
+                    "timestamp too old: {} < {}",
+                    t,
+                    now_after - batch_jitter_ns
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_record_uses_full_batch_jitter_window() {
+        let batch_jitter_ns = 2_000_000_000_i64;
+        let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let samples: Vec<i64> = (0..200).map(|_| gen.batch_timestamps_ns(1)[0]).collect();
+        let min_ts = *samples.iter().min().unwrap();
+        assert!(
+            min_ts < now - batch_jitter_ns / 2,
+            "expected min sample to cover lower half of window, got min={} threshold={}",
+            min_ts,
+            now - batch_jitter_ns / 2
+        );
+    }
 }

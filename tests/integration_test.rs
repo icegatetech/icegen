@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use otel_log_generator::config::LabelCardinalityConfig;
 use otel_log_generator::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
 use otel_log_generator::pb::opentelemetry::proto::common::v1::any_value;
-use otel_log_generator::{MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType};
+use otel_log_generator::{MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType, TimestampJitterConfig};
 use prost::Message;
 
 #[test]
@@ -245,7 +245,11 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
             default_limit: None,
             limits,
         },
-        1_000_000_000,
+        TimestampJitterConfig {
+            batch_jitter_ns: 1_000_000_000,
+            intra_batch_jitter_ns: 5_000_000,
+            intra_batch_overlap_probability: 0.05,
+        },
     );
 
     let mut pod_values = HashSet::new();
@@ -339,7 +343,11 @@ fn test_cardinality_disabled_keeps_original_values() {
             default_limit: None,
             limits,
         },
-        1_000_000_000,
+        TimestampJitterConfig {
+            batch_jitter_ns: 1_000_000_000,
+            intra_batch_jitter_ns: 5_000_000,
+            intra_batch_overlap_probability: 0.05,
+        },
     );
 
     let message = generator

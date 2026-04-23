@@ -96,6 +96,13 @@ impl Default for RetryConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TimestampJitterConfig {
+    pub batch_jitter_ns: i64,
+    pub intra_batch_jitter_ns: i64,
+    pub intra_batch_overlap_probability: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     pub ingest_endpoint: String,
@@ -120,6 +127,8 @@ pub struct OtelConfig {
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
     pub record_timestamp_jitter_ms: u64,
+    pub record_intra_batch_jitter_ms: u64,
+    pub record_intra_batch_overlap_probability: f32,
 }
 
 impl OtelConfig {
@@ -188,7 +197,29 @@ impl OtelConfig {
             ));
         }
 
+        if self.record_intra_batch_jitter_ms > 60_000 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_intra_batch_jitter_ms must be <= 60000 (1 minute)".to_string(),
+            ));
+        }
+
+        if self.record_intra_batch_overlap_probability < 0.0
+            || self.record_intra_batch_overlap_probability > 1.0
+        {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_intra_batch_overlap_probability must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    pub fn timestamp_jitter_config(&self) -> TimestampJitterConfig {
+        TimestampJitterConfig {
+            batch_jitter_ns: self.record_timestamp_jitter_ms as i64 * 1_000_000,
+            intra_batch_jitter_ns: self.record_intra_batch_jitter_ms as i64 * 1_000_000,
+            intra_batch_overlap_probability: self.record_intra_batch_overlap_probability,
+        }
     }
 
     pub fn retry_config(&self) -> Result<RetryConfig> {
@@ -353,6 +384,8 @@ mod tests {
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
             record_timestamp_jitter_ms: 1_000,
+            record_intra_batch_jitter_ms: 5,
+            record_intra_batch_overlap_probability: 0.05,
         }
     }
 
@@ -442,6 +475,35 @@ mod tests {
         let mut cfg = base_config();
         cfg.tenant_count = 3;
         cfg.tenant_id = "tenant with spaces".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_intra_batch_jitter_validation() {
+        let mut cfg = base_config();
+        cfg.record_intra_batch_jitter_ms = 60_001;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_jitter_ms = 60_000;
+        assert!(cfg.validate().is_ok());
+
+        cfg.record_intra_batch_jitter_ms = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_overlap_probability_validation() {
+        let mut cfg = base_config();
+        cfg.record_intra_batch_overlap_probability = -0.1;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_overlap_probability = 1.1;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_overlap_probability = 0.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.record_intra_batch_overlap_probability = 1.0;
         assert!(cfg.validate().is_ok());
     }
 }

@@ -352,7 +352,7 @@ impl OtelLogGenerator {
         let message_generator = OTLPLogMessageGenerator::new_with_cardinality(
             "rust-generator".to_string(),
             cardinality_config,
-            config.record_timestamp_jitter_ms as i64 * 1_000_000,
+            config.timestamp_jitter_config(),
         );
         let tenant_profiles = Self::build_tenant_profiles(&config);
         println!("✓ Generator initialized successfully\n");
@@ -822,6 +822,8 @@ mod tests {
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
             record_timestamp_jitter_ms: 1_000,
+            record_intra_batch_jitter_ms: 5,
+            record_intra_batch_overlap_probability: 0.05,
         }
     }
 
@@ -897,6 +899,8 @@ mod tests {
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
             record_timestamp_jitter_ms: 1_000,
+            record_intra_batch_jitter_ms: 5,
+            record_intra_batch_overlap_probability: 0.05,
         };
 
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
