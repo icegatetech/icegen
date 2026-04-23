@@ -179,9 +179,9 @@ Boolean environment variables accept the following values:
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
 | `--continuous` | `CONTINUOUS_MODE` | false | Run in continuous mode |
 | `--tenant-id` | `TENANT_ID` | `default` | Single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
-| `--tenant-count` | `TENANT_COUNT` | 1 | Multi-tenant mode size. When `> 1`, each message picks a random tenant from `tenant1..tenantN` and keeps it for retries |
-| `--cloud-account-count-per-tenant` | `CLOUD_ACCOUNT_COUNT_PER_TENANT` | 4 | Size of the tenant-local `cloud.account.id` pool. Values are generated as `tenantX-acc-YY` |
-| `--service-count-per-tenant` | `SERVICE_COUNT_PER_TENANT` | 6 | Size of the tenant-local `service.name` pool. Values are generated as `tenantX-svc-YY` |
+| `--tenant-count` | `TENANT_COUNT` | 1 | Multi-tenant mode size. When `> 1`, each message picks a random tenant from `tenant1..tenantN` and keeps it for retries. Set to `0` to omit the `X-Scope-OrgID` header/metadata entirely; `TENANT_ID` is ignored. |
+| `--cloud-account-count-per-tenant` | `CLOUD_ACCOUNT_COUNT_PER_TENANT` | 4 | Size of the tenant-local `cloud.account.id` pool. Values are generated as `tenantX-acc-YY`. Set to `0` to omit `cloud.account.id` from resource attributes. |
+| `--service-count-per-tenant` | `SERVICE_COUNT_PER_TENANT` | 6 | Size of the tenant-local `service.name` pool. Values are generated as `tenantX-svc-YY`. Set to `0` to omit `service.name` from resource attributes; `scope.name` falls back to the default `io.trihub.generator`. |
 | `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
 | `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
 | `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |
@@ -191,13 +191,16 @@ Boolean environment variables accept the following values:
 Tenant routing is part of the runtime contract, not an internal detail.
 
 - `TENANT_ID` / `--tenant-id` enables single-tenant mode. Every message uses that tenant.
-- `TENANT_COUNT` / `--tenant-count` enables random multi-tenant mode when the value is greater than `1`.
-- `CLOUD_ACCOUNT_COUNT_PER_TENANT` / `--cloud-account-count-per-tenant` controls how many stable `cloud.account.id` values are generated per tenant. Default is `4`.
-- `SERVICE_COUNT_PER_TENANT` / `--service-count-per-tenant` controls how many stable `service.name` values are generated per tenant. Default is `6`.
+- `TENANT_COUNT` / `--tenant-count` controls tenant propagation mode:
+  - `0` — tenantless mode: no `X-Scope-OrgID` header or `x-scope-orgid` metadata is emitted; `TENANT_ID` is ignored. Pool value prefixes become `notenant-acc-YY` and `notenant-svc-YY`.
+  - `1` — single-tenant mode: the value from `TENANT_ID` is propagated.
+  - `> 1` — multi-tenant mode: a random tenant from `tenant1..tenantN` is selected per message; `TENANT_ID` is ignored.
+- `CLOUD_ACCOUNT_COUNT_PER_TENANT` / `--cloud-account-count-per-tenant` controls how many stable `cloud.account.id` values are generated per tenant. Default is `4`. Set to `0` to omit `cloud.account.id` entirely.
+- `SERVICE_COUNT_PER_TENANT` / `--service-count-per-tenant` controls how many stable `service.name` values are generated per tenant. Default is `6`. Set to `0` to omit `service.name` entirely.
 - In multi-tenant mode, the generator ignores the configured `TENANT_ID` value for routing and uses a pool `tenant1..tenantN`.
 - The tenant is selected once per message, attached immediately to the generated message, and reused on retry.
 - After the tenant is selected, `service.name` and `cloud.account.id` are selected only from that tenant's local pools.
-- The generated resource attributes are readable and stable: `tenant3-acc-02`, `tenant3-svc-05`, and similar values.
+- The generated resource attributes are readable and stable: `tenant3-acc-02`, `tenant3-svc-05`, and similar values. In tenantless mode the prefix is `notenant-`, e.g. `notenant-acc-02`.
 - HTTP sends the tenant through the `X-Scope-OrgID` header.
 - gRPC sends the tenant through the `x-scope-orgid` metadata key.
 

@@ -47,27 +47,39 @@ impl HttpTransport {
 
     fn build_request(&self, message: &OTLPLogMessage) -> reqwest::RequestBuilder {
         match &message.message {
-            MessagePayload::Json(json_value) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .json(json_value),
-            MessagePayload::Protobuf(bytes) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/x-protobuf")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .body(bytes.clone()),
-            MessagePayload::MalformedJson(malformed_string) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .body(malformed_string.clone()),
+            MessagePayload::Json(json_value) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.json(json_value)
+            }
+            MessagePayload::Protobuf(bytes) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/x-protobuf")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.body(bytes.clone())
+            }
+            MessagePayload::MalformedJson(malformed_string) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.body(malformed_string.clone())
+            }
         }
     }
 }
@@ -204,7 +216,7 @@ mod tests {
     fn message(tenant_id: &str) -> OTLPLogMessage {
         OTLPLogMessage::new(
             MessagePayload::Json(json!({"resourceLogs": []})),
-            tenant_id.to_string(),
+            Some(tenant_id.to_string()),
             "project1".to_string(),
             "source1".to_string(),
             crate::message::OTLPLogMessageType::Valid,
@@ -247,5 +259,25 @@ mod tests {
 
         assert_eq!(first.headers().get("X-Scope-OrgID").unwrap(), "tenant1");
         assert_eq!(second.headers().get("X-Scope-OrgID").unwrap(), "tenant3");
+    }
+
+    #[test]
+    fn http_omits_scope_header_when_tenant_id_none() {
+        let transport = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+        )
+        .unwrap();
+
+        let msg = OTLPLogMessage::new(
+            MessagePayload::Json(json!({"resourceLogs": []})),
+            None,
+            "project1".to_string(),
+            "source1".to_string(),
+            crate::message::OTLPLogMessageType::Valid,
+        );
+        let request = transport.build_request(&msg).build().unwrap();
+        assert!(request.headers().get("X-Scope-OrgID").is_none());
     }
 }

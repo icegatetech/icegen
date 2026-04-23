@@ -7,6 +7,8 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::{json, Value};
 
+const DEFAULT_SERVICE_NAME: &str = "generator";
+
 #[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
     source: String,
@@ -52,51 +54,52 @@ impl OTLPLogMessageGenerator {
     fn generate_resource_attributes_pairs(
         &self,
         project_id: &str,
-        cloud_account_id: &str,
-        service_name: &str,
+        cloud_account_id: Option<&str>,
+        service_name: Option<&str>,
     ) -> Vec<(String, String)> {
-        let attributes = vec![
-            ("project_id".to_string(), project_id.to_string()),
-            ("cloud.account.id".to_string(), cloud_account_id.to_string()),
-            ("service.name".to_string(), service_name.to_string()),
-            (
-                "service.version".to_string(),
-                FakeDataGenerator::generate_service_version(),
-            ),
-            (
-                "deployment.environment".to_string(),
-                FakeDataGenerator::generate_deployment_environment(),
-            ),
-            (
-                "host.name".to_string(),
-                FakeDataGenerator::generate_host_name(),
-            ),
-            (
-                "k8s.pod.name".to_string(),
-                FakeDataGenerator::generate_k8s_pod_name(),
-            ),
-            (
-                "k8s.namespace.name".to_string(),
-                FakeDataGenerator::generate_k8s_namespace(),
-            ),
-            ("generator.source".to_string(), self.source.clone()),
-        ];
+        let mut attributes = vec![("project_id".to_string(), project_id.to_string())];
+        if let Some(acc) = cloud_account_id {
+            attributes.push(("cloud.account.id".to_string(), acc.to_string()));
+        }
+        if let Some(svc) = service_name {
+            attributes.push(("service.name".to_string(), svc.to_string()));
+        }
+        attributes.push((
+            "service.version".to_string(),
+            FakeDataGenerator::generate_service_version(),
+        ));
+        attributes.push((
+            "deployment.environment".to_string(),
+            FakeDataGenerator::generate_deployment_environment(),
+        ));
+        attributes.push((
+            "host.name".to_string(),
+            FakeDataGenerator::generate_host_name(),
+        ));
+        attributes.push((
+            "k8s.pod.name".to_string(),
+            FakeDataGenerator::generate_k8s_pod_name(),
+        ));
+        attributes.push((
+            "k8s.namespace.name".to_string(),
+            FakeDataGenerator::generate_k8s_namespace(),
+        ));
+        attributes.push(("generator.source".to_string(), self.source.clone()));
 
         self.normalize_attribute_pairs(attributes)
     }
 
-    fn generate_scope_attributes_pairs(&self, service_name: &str) -> Vec<(String, String)> {
+    fn generate_scope_attributes_pairs(&self, service_name: Option<&str>) -> Vec<(String, String)> {
         let mut rng = rand::thread_rng();
-        vec![
-            (
-                "library.name".to_string(),
-                format!("trihub-{}", service_name),
-            ),
-            (
-                "library.version".to_string(),
-                format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-            ),
-        ]
+        let mut attrs = Vec::new();
+        if let Some(svc) = service_name {
+            attrs.push(("library.name".to_string(), format!("trihub-{}", svc)));
+        }
+        attrs.push((
+            "library.version".to_string(),
+            format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
+        ));
+        attrs
     }
 
     fn generate_log_attributes_pairs(
@@ -159,7 +162,7 @@ impl OTLPLogMessageGenerator {
         format!("bucket_{index:0width$}")
     }
 
-    fn generate_log_body(severity_text: &str, service_name: &str) -> String {
+    fn generate_log_body(severity_text: &str, service_name: Option<&str>) -> String {
         let mut rng = rand::thread_rng();
 
         let bodies = match severity_text {
@@ -180,7 +183,7 @@ impl OTLPLogMessageGenerator {
                     "Cache hit for key {}",
                     &FakeDataGenerator::generate_uuid()[..8]
                 ),
-                format!("Health check passed for service {}", service_name),
+                format!("Health check passed for service {}", service_name.unwrap_or(DEFAULT_SERVICE_NAME)),
             ],
             "WARN" => vec![
                 format!("High memory usage detected: {}%", rng.gen_range(70..96)),
@@ -238,7 +241,7 @@ impl OTLPLogMessageGenerator {
         now - rng.gen_range(0..self.timestamp_jitter_ns)
     }
 
-    fn generate_single_log_record(&self, service_name: &str) -> Value {
+    fn generate_single_log_record(&self, service_name: Option<&str>) -> Value {
         let mut rng = rand::thread_rng();
         let timestamp_ns = self.jittered_timestamp_ns();
 
@@ -269,8 +272,8 @@ impl OTLPLogMessageGenerator {
     fn wrap_log_records_in_otlp(
         &self,
         project_id: &str,
-        cloud_account_id: &str,
-        service_name: &str,
+        cloud_account_id: Option<&str>,
+        service_name: Option<&str>,
         log_records: Vec<Value>,
     ) -> Value {
         let mut rng = rand::thread_rng();
@@ -278,6 +281,7 @@ impl OTLPLogMessageGenerator {
         let resource_attributes =
             self.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
         let scope_attributes = self.generate_scope_attributes_pairs(service_name);
+        let scope_name_src = service_name.unwrap_or(DEFAULT_SERVICE_NAME);
 
         json!({
             "resource": {
@@ -286,7 +290,7 @@ impl OTLPLogMessageGenerator {
             },
             "scopeLogs": [{
                 "scope": {
-                    "name": format!("io.trihub.{}", service_name.replace('-', ".")),
+                    "name": format!("io.trihub.{}", scope_name_src.replace('-', ".")),
                     "version": format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
                     "attributes": Self::attributes_pairs_to_dict_list(&scope_attributes),
                     "droppedAttributesCount": rng.gen_range(0..3)
@@ -301,7 +305,7 @@ impl OTLPLogMessageGenerator {
     fn build_message(
         &self,
         message: MessagePayload,
-        tenant_id: String,
+        tenant_id: Option<String>,
         project_id: String,
         message_type: OTLPLogMessageType,
     ) -> OTLPLogMessage {
@@ -316,26 +320,26 @@ impl OTLPLogMessageGenerator {
 
     pub fn generate_valid_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
     ) -> Result<OTLPLogMessage> {
         self.build_valid_message(tenant_id, cloud_account_id, service_name)
     }
 
     fn build_valid_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
     ) -> Result<OTLPLogMessage> {
         let project_id = FakeDataGenerator::generate_project_id();
 
-        let log_record = self.generate_single_log_record(&service_name);
+        let log_record = self.generate_single_log_record(service_name.as_deref());
         let resource_log = self.wrap_log_records_in_otlp(
             &project_id,
-            &cloud_account_id,
-            &service_name,
+            cloud_account_id.as_deref(),
+            service_name.as_deref(),
             vec![log_record],
         );
 
@@ -353,9 +357,9 @@ impl OTLPLogMessageGenerator {
 
     pub fn generate_aggregated_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         if num_records == 1 {
@@ -371,13 +375,13 @@ impl OTLPLogMessageGenerator {
         let project_id = FakeDataGenerator::generate_project_id();
 
         let log_records: Vec<Value> = (0..num_records)
-            .map(|_| self.generate_single_log_record(&service_name))
+            .map(|_| self.generate_single_log_record(service_name.as_deref()))
             .collect();
 
         let resource_log = self.wrap_log_records_in_otlp(
             &project_id,
-            &cloud_account_id,
-            &service_name,
+            cloud_account_id.as_deref(),
+            service_name.as_deref(),
             log_records,
         );
 
@@ -393,7 +397,7 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
-    pub fn generate_invalid_message(&self, tenant_id: String) -> Result<OTLPLogMessage> {
+    pub fn generate_invalid_message(&self, tenant_id: Option<String>) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
 
@@ -467,9 +471,9 @@ impl OTLPLogMessageGenerator {
 
     pub fn generate_protobuf_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
@@ -488,13 +492,14 @@ impl OTLPLogMessageGenerator {
 
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
+        let svc = service_name.as_deref();
 
         // Generate log records
         let log_records: Vec<LogRecord> = (0..num_records)
             .map(|_| {
                 let timestamp_ns = self.jittered_timestamp_ns().max(0) as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
-                let body = Self::generate_log_body(&severity_text, &service_name);
+                let body = Self::generate_log_body(&severity_text, svc);
                 let trace_id = FakeDataGenerator::generate_trace_id();
                 let span_id = FakeDataGenerator::generate_span_id();
                 let request_id = FakeDataGenerator::generate_uuid();
@@ -529,8 +534,11 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         // Resource attributes
-        let resource_attributes_pairs =
-            self.generate_resource_attributes_pairs(&project_id, &cloud_account_id, &service_name);
+        let resource_attributes_pairs = self.generate_resource_attributes_pairs(
+            &project_id,
+            cloud_account_id.as_deref(),
+            svc,
+        );
         let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -542,7 +550,7 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         // Scope attributes
-        let scope_attributes_pairs = self.generate_scope_attributes_pairs(&service_name);
+        let scope_attributes_pairs = self.generate_scope_attributes_pairs(svc);
         let scope_attributes: Vec<KeyValue> = scope_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -558,8 +566,9 @@ impl OTLPLogMessageGenerator {
             dropped_attributes_count: rng.gen_range(0..4),
         };
 
+        let scope_name_src = svc.unwrap_or(DEFAULT_SERVICE_NAME);
         let scope = InstrumentationScope {
-            name: format!("io.trihub.{}", service_name.replace('-', ".")),
+            name: format!("io.trihub.{}", scope_name_src.replace('-', ".")),
             version: format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
             attributes: scope_attributes,
             dropped_attributes_count: rng.gen_range(0..3),

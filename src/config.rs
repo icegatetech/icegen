@@ -168,24 +168,6 @@ impl OtelConfig {
             ));
         }
 
-        if self.tenant_count < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "tenant_count must be >= 1".to_string(),
-            ));
-        }
-
-        if self.cloud_account_count_per_tenant < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "cloud_account_count_per_tenant must be >= 1".to_string(),
-            ));
-        }
-
-        if self.service_count_per_tenant < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "service_count_per_tenant must be >= 1".to_string(),
-            ));
-        }
-
         if self.tenant_count == 1 {
             validate_tenant_id(&self.tenant_id)?;
         }
@@ -420,21 +402,29 @@ mod tests {
     fn test_tenant_count_validation() {
         let mut cfg = base_config();
         cfg.tenant_count = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_cloud_account_count_per_tenant_validation() {
         let mut cfg = base_config();
         cfg.cloud_account_count_per_tenant = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_service_count_per_tenant_validation() {
         let mut cfg = base_config();
         cfg.service_count_per_tenant = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_tenant_count_ignores_invalid_tenant_id() {
+        let mut cfg = base_config();
+        cfg.tenant_count = 0;
+        cfg.tenant_id = "invalid tenant id!".to_string();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

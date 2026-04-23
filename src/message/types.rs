@@ -17,7 +17,7 @@ pub enum MessagePayload {
 #[derive(Debug, Clone)]
 pub struct OTLPLogMessage {
     pub message: MessagePayload,
-    pub tenant_id: String,
+    pub tenant_id: Option<String>,
     pub project_id: String,
     pub source: String,
     pub message_type: OTLPLogMessageType,
@@ -26,7 +26,7 @@ pub struct OTLPLogMessage {
 impl OTLPLogMessage {
     pub fn new(
         message: MessagePayload,
-        tenant_id: String,
+        tenant_id: Option<String>,
         project_id: String,
         source: String,
         message_type: OTLPLogMessageType,

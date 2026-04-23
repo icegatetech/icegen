@@ -47,7 +47,7 @@ impl GrpcTransport {
         message: &OTLPLogMessage,
     ) -> Result<(
         ExportLogsServiceRequest,
-        tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+        Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     )> {
         let proto_request = match &message.message {
             MessagePayload::Protobuf(bytes) => ExportLogsServiceRequest::decode(&bytes[..])?,
@@ -58,23 +58,30 @@ impl GrpcTransport {
             }
         };
 
-        let tenant =
-            tonic::metadata::MetadataValue::try_from(message.tenant_id.as_str()).map_err(|_| {
-                GeneratorError::InvalidConfiguration(format!(
-                    "invalid tenant_id for gRPC metadata: {}",
-                    message.tenant_id
-                ))
-            })?;
+        let tenant = message
+            .tenant_id
+            .as_deref()
+            .map(|tid| {
+                tonic::metadata::MetadataValue::try_from(tid).map_err(|_| {
+                    GeneratorError::InvalidConfiguration(format!(
+                        "invalid tenant_id for gRPC metadata: {}",
+                        tid
+                    ))
+                })
+            })
+            .transpose()?;
 
         Ok((proto_request, tenant))
     }
 
     fn build_export_request(
         proto_request: ExportLogsServiceRequest,
-        tenant: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+        tenant: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     ) -> tonic::Request<ExportLogsServiceRequest> {
         let mut request = tonic::Request::new(proto_request);
-        request.metadata_mut().insert("x-scope-orgid", tenant);
+        if let Some(tenant) = tenant {
+            request.metadata_mut().insert("x-scope-orgid", tenant);
+        }
         request
     }
 }
@@ -179,7 +186,7 @@ mod tests {
     use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use prost::Message;
 
-    fn protobuf_message(tenant_id: &str) -> OTLPLogMessage {
+    fn protobuf_message(tenant_id: Option<&str>) -> OTLPLogMessage {
         let request = ExportLogsServiceRequest {
             resource_logs: Vec::new(),
         };
@@ -188,7 +195,7 @@ mod tests {
 
         OTLPLogMessage::new(
             MessagePayload::Protobuf(buf),
-            tenant_id.to_string(),
+            tenant_id.map(ToString::to_string),
             "project1".to_string(),
             "source1".to_string(),
             OTLPLogMessageType::Valid,
@@ -198,16 +205,24 @@ mod tests {
     #[test]
     fn grpc_metadata_uses_message_tenant_id() {
         let (proto_request, tenant) =
-            GrpcTransport::prepare_export_parts(&protobuf_message("tenant2")).unwrap();
+            GrpcTransport::prepare_export_parts(&protobuf_message(Some("tenant2"))).unwrap();
         let request = GrpcTransport::build_export_request(proto_request, tenant);
         assert_eq!(request.metadata().get("x-scope-orgid").unwrap(), "tenant2");
+    }
+
+    #[test]
+    fn grpc_omits_scope_metadata_when_tenant_id_none() {
+        let (proto_request, tenant) =
+            GrpcTransport::prepare_export_parts(&protobuf_message(None)).unwrap();
+        let request = GrpcTransport::build_export_request(proto_request, tenant);
+        assert!(request.metadata().get("x-scope-orgid").is_none());
     }
 
     #[test]
     fn grpc_rejects_non_protobuf_payload() {
         let message = OTLPLogMessage::new(
             MessagePayload::Json(serde_json::json!({"resourceLogs": []})),
-            "tenant2".to_string(),
+            Some("tenant2".to_string()),
             "project1".to_string(),
             "source1".to_string(),
             OTLPLogMessageType::Valid,
@@ -220,7 +235,7 @@ mod tests {
 
     #[test]
     fn grpc_prepared_parts_can_build_multiple_requests_without_redecode() {
-        let message = protobuf_message("tenant2");
+        let message = protobuf_message(Some("tenant2"));
         let (proto_request, tenant) = GrpcTransport::prepare_export_parts(&message).unwrap();
 
         let request1 = GrpcTransport::build_export_request(proto_request.clone(), tenant.clone());

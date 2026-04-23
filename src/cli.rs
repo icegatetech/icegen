@@ -89,15 +89,18 @@ pub struct OtelArgs {
     #[arg(long, env = "TENANT_ID")]
     pub tenant_id: Option<String>,
 
-    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID
+    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID.
+    /// Set to 0 to omit the X-Scope-OrgID header/metadata entirely; TENANT_ID is ignored.
     #[arg(long, env = "TENANT_COUNT", default_value = "1")]
     pub tenant_count: usize,
 
-    /// Number of cloud.account.id values generated per tenant
+    /// Number of cloud.account.id values generated per tenant.
+    /// Set to 0 to omit cloud.account.id from resource attributes.
     #[arg(long, env = "CLOUD_ACCOUNT_COUNT_PER_TENANT", default_value = "4")]
     pub cloud_account_count_per_tenant: usize,
 
-    /// Number of service.name values generated per tenant
+    /// Number of service.name values generated per tenant.
+    /// Set to 0 to omit service.name from resource attributes; scope.name uses default 'generator'.
     #[arg(long, env = "SERVICE_COUNT_PER_TENANT", default_value = "6")]
     pub service_count_per_tenant: usize,
 
