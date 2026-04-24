@@ -1,24 +1,62 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use otel_log_generator::config::LabelCardinalityConfig;
 use otel_log_generator::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
 use otel_log_generator::pb::opentelemetry::proto::common::v1::any_value;
 use otel_log_generator::{
-    MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType, TimestampJitterConfig,
+    JsonEncoder, MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType, ProtobufEncoder,
+    ServiceShard, TimestampJitterConfig,
 };
 use prost::Message;
 
-#[test]
-fn test_generate_valid_message() {
-    let generator = OTLPLogMessageGenerator::new(
+fn single_shard(service_name: Option<&str>, num_records: usize) -> Vec<ServiceShard> {
+    vec![ServiceShard {
+        service_name: service_name.map(ToString::to_string),
+        num_records,
+    }]
+}
+
+fn make_json_generator() -> OTLPLogMessageGenerator {
+    OTLPLogMessageGenerator::new(
         "test-source".to_string(),
         LabelCardinalityConfig::default(),
         TimestampJitterConfig::default(),
-    );
-    let result = generator.generate_valid_message(
+        Arc::new(JsonEncoder),
+    )
+}
+
+fn make_protobuf_generator() -> OTLPLogMessageGenerator {
+    OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+        Arc::new(ProtobufEncoder),
+    )
+}
+
+fn make_json_generator_with_cardinality(
+    cardinality: LabelCardinalityConfig,
+) -> OTLPLogMessageGenerator {
+    OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        cardinality,
+        TimestampJitterConfig {
+            across_batch_timestamp_jitter_ns: 1_000_000_000,
+            intra_batch_timestamp_jitter_ns: 5_000_000,
+            intra_batch_overlap_probability: 0.05,
+        },
+        Arc::new(JsonEncoder),
+    )
+}
+
+#[test]
+fn test_generate_valid_message() {
+    let generator = make_json_generator();
+    let result = generator.generate_message(
         Some("tenant1".to_string()),
         Some("tenant1-acc-01".to_string()),
-        Some("tenant1-svc-01".to_string()),
+        single_shard(Some("tenant1-svc-01"), 1),
     );
 
     assert!(result.is_ok());
@@ -37,16 +75,11 @@ fn test_generate_valid_message() {
 
 #[test]
 fn test_generate_aggregated_message() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
-    let result = generator.generate_aggregated_message(
+    let generator = make_json_generator();
+    let result = generator.generate_message(
         Some("tenant3".to_string()),
         Some("tenant3-acc-02".to_string()),
-        Some("tenant3-svc-05".to_string()),
-        5,
+        single_shard(Some("tenant3-svc-05"), 5),
     );
 
     assert!(result.is_ok());
@@ -72,16 +105,12 @@ fn test_generate_aggregated_message() {
 
 #[test]
 fn test_json_payload_contains_tenant_aware_resource_attributes() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+    let generator = make_json_generator();
     let message = generator
-        .generate_valid_message(
+        .generate_message(
             Some("tenant3".to_string()),
             Some("tenant3-acc-02".to_string()),
-            Some("tenant3-svc-05".to_string()),
+            single_shard(Some("tenant3-svc-05"), 1),
         )
         .unwrap();
 
@@ -109,11 +138,7 @@ fn test_json_payload_contains_tenant_aware_resource_attributes() {
 
 #[test]
 fn test_generate_invalid_message() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+    let generator = make_json_generator();
     let result = generator.generate_invalid_message(Some("tenant1".to_string()));
 
     assert!(result.is_ok());
@@ -129,16 +154,11 @@ fn test_generate_invalid_message() {
 
 #[test]
 fn test_generate_protobuf_message() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
-    let result = generator.generate_protobuf_message(
+    let generator = make_protobuf_generator();
+    let result = generator.generate_message(
         Some("tenant2".to_string()),
         Some("tenant2-acc-04".to_string()),
-        Some("tenant2-svc-06".to_string()),
-        3,
+        single_shard(Some("tenant2-svc-06"), 3),
     );
 
     assert!(result.is_ok());
@@ -156,17 +176,12 @@ fn test_generate_protobuf_message() {
 
 #[test]
 fn test_protobuf_payload_contains_tenant_aware_resource_attributes() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+    let generator = make_protobuf_generator();
     let message = generator
-        .generate_protobuf_message(
+        .generate_message(
             Some("tenant2".to_string()),
             Some("tenant2-acc-04".to_string()),
-            Some("tenant2-svc-06".to_string()),
-            2,
+            single_shard(Some("tenant2-svc-06"), 2),
         )
         .unwrap();
 
@@ -202,43 +217,38 @@ fn test_protobuf_payload_contains_tenant_aware_resource_attributes() {
 }
 
 #[test]
-fn test_public_generation_methods_return_some_tenant_id() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+fn test_generate_message_preserves_tenant_id_across_encoders() {
+    let json_gen = make_json_generator();
+    let protobuf_gen = make_protobuf_generator();
 
-    let valid = generator
-        .generate_valid_message(
+    let valid = json_gen
+        .generate_message(
             Some("tenant1".to_string()),
             Some("tenant1-acc-01".to_string()),
-            Some("tenant1-svc-01".to_string()),
+            single_shard(Some("tenant1-svc-01"), 1),
         )
         .unwrap();
     assert!(valid.tenant_id.is_some());
 
-    let aggregated = generator
-        .generate_aggregated_message(
+    let aggregated = json_gen
+        .generate_message(
             Some("tenant1".to_string()),
             Some("tenant1-acc-01".to_string()),
-            Some("tenant1-svc-01".to_string()),
-            2,
+            single_shard(Some("tenant1-svc-01"), 2),
         )
         .unwrap();
     assert!(aggregated.tenant_id.is_some());
 
-    let invalid = generator
+    let invalid = json_gen
         .generate_invalid_message(Some("tenant1".to_string()))
         .unwrap();
     assert!(invalid.tenant_id.is_some());
 
-    let protobuf = generator
-        .generate_protobuf_message(
+    let protobuf = protobuf_gen
+        .generate_message(
             Some("tenant1".to_string()),
             Some("tenant1-acc-01".to_string()),
-            Some("tenant1-svc-01".to_string()),
-            2,
+            single_shard(Some("tenant1-svc-01"), 2),
         )
         .unwrap();
     assert!(protobuf.tenant_id.is_some());
@@ -249,8 +259,11 @@ fn test_trace_id_format() {
     use otel_log_generator::message::FakeDataGenerator;
 
     let trace_id = FakeDataGenerator::generate_trace_id();
-    assert_eq!(trace_id.len(), 32);
-    assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit()));
+    // 16 raw bytes; hex-encoded form is 32 lowercase hex characters
+    assert_eq!(trace_id.len(), 16);
+    let encoded = hex::encode(trace_id);
+    assert_eq!(encoded.len(), 32);
+    assert!(encoded.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
@@ -258,8 +271,11 @@ fn test_span_id_format() {
     use otel_log_generator::message::FakeDataGenerator;
 
     let span_id = FakeDataGenerator::generate_span_id();
-    assert_eq!(span_id.len(), 16);
-    assert!(span_id.chars().all(|c| c.is_ascii_hexdigit()));
+    // 8 raw bytes; hex-encoded form is 16 lowercase hex characters
+    assert_eq!(span_id.len(), 8);
+    let encoded = hex::encode(span_id);
+    assert_eq!(encoded.len(), 16);
+    assert!(encoded.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 #[test]
@@ -268,30 +284,21 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
     limits.insert("k8s.pod.name".to_string(), 3);
     limits.insert("request.id".to_string(), 5);
 
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig {
-            enabled: true,
-            default_limit: None,
-            limits,
-        },
-        TimestampJitterConfig {
-            across_batch_timestamp_jitter_ns: 1_000_000_000,
-            intra_batch_timestamp_jitter_ns: 5_000_000,
-            intra_batch_overlap_probability: 0.05,
-        },
-    );
+    let generator = make_json_generator_with_cardinality(LabelCardinalityConfig {
+        enabled: true,
+        default_limit: None,
+        limits,
+    });
 
     let mut pod_values = HashSet::new();
     let mut request_values = HashSet::new();
 
     for _ in 0..150 {
         let message = generator
-            .generate_aggregated_message(
+            .generate_message(
                 Some("tenant1".to_string()),
                 Some("tenant1-acc-01".to_string()),
-                Some("tenant1-svc-01".to_string()),
-                6,
+                single_shard(Some("tenant1-svc-01"), 6),
             )
             .unwrap();
         let MessagePayload::Json(json) = message.message else {
@@ -366,25 +373,17 @@ fn test_cardinality_disabled_keeps_original_values() {
     let mut limits = HashMap::new();
     limits.insert("request.id".to_string(), 1);
 
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig {
-            enabled: false,
-            default_limit: None,
-            limits,
-        },
-        TimestampJitterConfig {
-            across_batch_timestamp_jitter_ns: 1_000_000_000,
-            intra_batch_timestamp_jitter_ns: 5_000_000,
-            intra_batch_overlap_probability: 0.05,
-        },
-    );
+    let generator = make_json_generator_with_cardinality(LabelCardinalityConfig {
+        enabled: false,
+        default_limit: None,
+        limits,
+    });
 
     let message = generator
-        .generate_valid_message(
+        .generate_message(
             Some("tenant1".to_string()),
             Some("tenant1-acc-01".to_string()),
-            Some("tenant1-svc-01".to_string()),
+            single_shard(Some("tenant1-svc-01"), 1),
         )
         .unwrap();
     let MessagePayload::Json(json) = message.message else {
@@ -426,13 +425,9 @@ fn test_cardinality_disabled_keeps_original_values() {
 
 #[test]
 fn test_protobuf_omits_service_name_and_cloud_account_when_none() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+    let generator = make_protobuf_generator();
     let message = generator
-        .generate_protobuf_message(None, None, None, 2)
+        .generate_message(None, None, single_shard(None, 2))
         .unwrap();
 
     let MessagePayload::Protobuf(bytes) = message.message else {
@@ -457,13 +452,9 @@ fn test_protobuf_omits_service_name_and_cloud_account_when_none() {
 
 #[test]
 fn test_protobuf_scope_name_and_attrs_when_service_omitted() {
-    let generator = OTLPLogMessageGenerator::new(
-        "test-source".to_string(),
-        LabelCardinalityConfig::default(),
-        TimestampJitterConfig::default(),
-    );
+    let generator = make_protobuf_generator();
     let message = generator
-        .generate_protobuf_message(None, None, None, 2)
+        .generate_message(None, None, single_shard(None, 2))
         .unwrap();
 
     let MessagePayload::Protobuf(bytes) = message.message else {
@@ -484,4 +475,37 @@ fn test_protobuf_scope_name_and_attrs_when_service_omitted() {
         scope_attr_keys.contains(&"library.version"),
         "library.version must be present"
     );
+}
+
+#[test]
+fn test_multi_shard_request_has_correct_resource_logs_count() {
+    let generator = make_json_generator();
+    let shards = vec![
+        ServiceShard {
+            service_name: Some("svc-a".to_string()),
+            num_records: 3,
+        },
+        ServiceShard {
+            service_name: Some("svc-b".to_string()),
+            num_records: 3,
+        },
+        ServiceShard {
+            service_name: Some("svc-c".to_string()),
+            num_records: 3,
+        },
+    ];
+    let message = generator
+        .generate_message(Some("tenant1".to_string()), None, shards)
+        .unwrap();
+
+    let MessagePayload::Json(json) = message.message else {
+        panic!("Expected JSON payload");
+    };
+    let resource_logs = json["resourceLogs"].as_array().unwrap();
+    assert_eq!(resource_logs.len(), 3);
+    let counts: Vec<usize> = resource_logs
+        .iter()
+        .map(|rl| rl["scopeLogs"][0]["logRecords"].as_array().unwrap().len())
+        .collect();
+    assert_eq!(counts, vec![3, 3, 3]);
 }

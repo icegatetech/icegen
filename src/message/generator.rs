@@ -1,56 +1,55 @@
 use crate::config::{LabelCardinalityConfig, TimestampJitterConfig};
 use crate::error::{GeneratorError, Result};
+use crate::message::encoder::OtlpEncoder;
 use crate::message::fake_data::FakeDataGenerator;
+use crate::message::plan::{PlannedRecord, PlannedRequest, PlannedShard};
 use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::Rng;
-use serde_json::{json, Value};
+use serde_json::json;
+use std::sync::Arc;
 
 const DEFAULT_SERVICE_NAME: &str = "icegen";
+
+/// One shard of a multi-service OTLP request, mapping to a single `ResourceLogs` entry.
+#[derive(Debug, Clone)]
+pub struct ServiceShard {
+    pub service_name: Option<String>,
+    pub num_records: usize,
+}
 
 #[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
     source: String,
     label_cardinality: LabelCardinalityConfig,
     jitter: TimestampJitterConfig,
+    encoder: Arc<dyn OtlpEncoder>,
 }
 
 impl OTLPLogMessageGenerator {
-    /// Create a generator with explicit cardinality and timestamp jitter settings.
+    /// Create a generator with explicit cardinality, timestamp jitter settings, and encoder.
     ///
     /// `jitter.across_batch_timestamp_jitter_ns` shifts the whole batch backwards in time,
     /// while `jitter.intra_batch_timestamp_jitter_ns` controls spacing between neighbouring
     /// records inside that batch. `jitter.intra_batch_overlap_probability` controls how often
     /// the emitted timestamp for a record is moved backwards relative to the previous record.
     ///
-    /// The generator expects jitter values in nanoseconds. When configuration comes from
-    /// [`crate::config::OtelConfig`], use [`crate::config::OtelConfig::timestamp_jitter_config`]
-    /// so CLI millisecond values are converted consistently.
+    /// The `encoder` is chosen once at construction time and determines the wire format of every
+    /// [`Self::generate_message`] call. Use [`crate::message::JsonEncoder`] for HTTP JSON
+    /// transport and [`crate::message::ProtobufEncoder`] for HTTP Protobuf or gRPC transport.
     pub fn new(
         source: String,
         label_cardinality: LabelCardinalityConfig,
         jitter: TimestampJitterConfig,
+        encoder: Arc<dyn OtlpEncoder>,
     ) -> Self {
         Self {
             source,
             label_cardinality,
             jitter,
+            encoder,
         }
-    }
-
-    fn attributes_pairs_to_dict_list(pairs: &[(String, String)]) -> Vec<Value> {
-        pairs
-            .iter()
-            .map(|(key, value)| {
-                json!({
-                    "key": key,
-                    "value": {
-                        "stringValue": value
-                    }
-                })
-            })
-            .collect()
     }
 
     fn generate_resource_attributes_pairs(
@@ -80,7 +79,7 @@ impl OTLPLogMessageGenerator {
         ));
         attributes.push((
             "k8s.pod.name".to_string(),
-            FakeDataGenerator::generate_k8s_pod_name(),
+            FakeDataGenerator::generate_k8s_pod_name(service_name.unwrap_or(DEFAULT_SERVICE_NAME)),
         ));
         attributes.push((
             "k8s.namespace.name".to_string(),
@@ -237,19 +236,25 @@ impl OTLPLogMessageGenerator {
         bodies.choose(&mut rng).unwrap().clone()
     }
 
-    fn batch_timestamps_ns(&self, num_records: usize) -> Vec<i64> {
+    fn sample_batch_offset_ns(&self) -> i64 {
+        if self.jitter.across_batch_timestamp_jitter_ns > 0 {
+            rand::thread_rng().gen_range(0..self.jitter.across_batch_timestamp_jitter_ns)
+        } else {
+            0
+        }
+    }
+
+    fn plan_timestamps_with_offset(
+        &self,
+        request_now_ns: i64,
+        batch_offset_ns: i64,
+        num_records: usize,
+    ) -> Vec<i64> {
         if num_records == 0 {
             return vec![];
         }
 
         let mut rng = rand::thread_rng();
-        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-
-        let batch_offset_ns = if self.jitter.across_batch_timestamp_jitter_ns > 0 {
-            rng.gen_range(0..self.jitter.across_batch_timestamp_jitter_ns)
-        } else {
-            0
-        };
 
         let intra = self.jitter.intra_batch_timestamp_jitter_ns;
         let overlap_prob = self.jitter.intra_batch_overlap_probability;
@@ -266,11 +271,11 @@ impl OTLPLogMessageGenerator {
             result.push(step);
         }
 
-        let mut prev_ns = now - batch_offset_ns - total_span_ns;
-        for i in 0..num_records {
-            let step = result[i];
+        let mut prev_ns = request_now_ns - batch_offset_ns - total_span_ns;
+        for (i, step_slot) in result.iter_mut().enumerate() {
+            let step = *step_slot;
             let candidate = prev_ns + step;
-            result[i] = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
+            *step_slot = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
                 prev_ns - rng.gen_range(0..intra)
             } else {
                 candidate
@@ -279,66 +284,6 @@ impl OTLPLogMessageGenerator {
         }
 
         result
-    }
-
-    fn generate_single_log_record(&self, service_name: Option<&str>, timestamp_ns: i64) -> Value {
-        let mut rng = rand::thread_rng();
-
-        let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
-        let body = Self::generate_log_body(&severity_text, service_name);
-        let trace_id = FakeDataGenerator::generate_trace_id();
-        let span_id = FakeDataGenerator::generate_span_id();
-        let request_id = FakeDataGenerator::generate_uuid();
-        let thread_id = FakeDataGenerator::generate_thread_id();
-
-        let log_attributes = self.generate_log_attributes_pairs(&request_id, &thread_id);
-
-        json!({
-            "timeUnixNano": timestamp_ns.to_string(),
-            "observedTimeUnixNano": timestamp_ns.to_string(),
-            "severityNumber": severity_number,
-            "severityText": severity_text,
-            "body": {
-                "stringValue": body
-            },
-            "attributes": Self::attributes_pairs_to_dict_list(&log_attributes),
-            "traceId": trace_id,
-            "spanId": span_id,
-            "flags": rng.gen_range(0..256),
-        })
-    }
-
-    fn wrap_log_records_in_otlp(
-        &self,
-        project_id: &str,
-        cloud_account_id: Option<&str>,
-        service_name: Option<&str>,
-        log_records: Vec<Value>,
-    ) -> Value {
-        let mut rng = rand::thread_rng();
-
-        let resource_attributes =
-            self.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
-        let scope_attributes = self.generate_scope_attributes_pairs(service_name);
-        let scope_name_src = service_name.unwrap_or(DEFAULT_SERVICE_NAME);
-
-        json!({
-            "resource": {
-                "attributes": Self::attributes_pairs_to_dict_list(&resource_attributes),
-                "droppedAttributesCount": rng.gen_range(0..4)
-            },
-            "scopeLogs": [{
-                "scope": {
-                    "name": format!("io.trihub.{}", scope_name_src.replace('-', ".")),
-                    "version": format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-                    "attributes": Self::attributes_pairs_to_dict_list(&scope_attributes),
-                    "droppedAttributesCount": rng.gen_range(0..3)
-                },
-                "logRecords": log_records,
-                "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
-            }],
-            "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
-        })
     }
 
     fn build_message(
@@ -357,100 +302,135 @@ impl OTLPLogMessageGenerator {
         )
     }
 
-    /// Generate a single-record OTLP JSON payload.
+    /// Build a format-neutral plan for a set of shards, shared across all encoders.
     ///
-    /// The record timestamp is generated with the configured batch-level jitter and is never set
-    /// in the future. Because the payload contains one record, intra-batch spacing and overlap
-    /// settings have no observable effect here.
-    pub fn generate_valid_message(
-        &self,
-        tenant_id: Option<String>,
-        cloud_account_id: Option<String>,
-        service_name: Option<String>,
-    ) -> Result<OTLPLogMessage> {
-        self.build_valid_message(tenant_id, cloud_account_id, service_name)
-    }
-
-    fn build_valid_message(
-        &self,
-        tenant_id: Option<String>,
-        cloud_account_id: Option<String>,
-        service_name: Option<String>,
-    ) -> Result<OTLPLogMessage> {
-        let project_id = FakeDataGenerator::generate_project_id();
-
-        let ts = self.batch_timestamps_ns(1)[0];
-        let log_record = self.generate_single_log_record(service_name.as_deref(), ts);
-        let resource_log = self.wrap_log_records_in_otlp(
-            &project_id,
-            cloud_account_id.as_deref(),
-            service_name.as_deref(),
-            vec![log_record],
-        );
-
-        let otlp_message = json!({
-            "resourceLogs": [resource_log]
-        });
-
-        Ok(self.build_message(
-            MessagePayload::Json(otlp_message),
-            tenant_id,
-            project_id,
-            OTLPLogMessageType::Valid,
-        ))
-    }
-
-    /// Generate a multi-record OTLP JSON payload.
+    /// # Errors
     ///
-    /// The whole batch is shifted backwards by `across_batch_timestamp_jitter_ns`, then record
-    /// timestamps are planned using `intra_batch_timestamp_jitter_ns`. With
-    /// `intra_batch_overlap_probability == 0.0`, emitted timestamps do not decrease. With
-    /// `intra_batch_timestamp_jitter_ns == 0`, all records in the batch collapse to the same
-    /// timestamp.
-    pub fn generate_aggregated_message(
+    /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty or any shard has
+    /// `num_records == 0`.
+    #[allow(clippy::result_large_err)]
+    fn plan_shards(
         &self,
-        tenant_id: Option<String>,
-        cloud_account_id: Option<String>,
-        service_name: Option<String>,
-        num_records: usize,
-    ) -> Result<OTLPLogMessage> {
-        if num_records == 1 {
-            return self.build_valid_message(tenant_id, cloud_account_id, service_name);
-        }
-
-        if num_records < 1 {
+        cloud_account_id: Option<&str>,
+        shards: &[ServiceShard],
+    ) -> Result<PlannedRequest> {
+        if shards.is_empty() {
             return Err(GeneratorError::InvalidConfiguration(
-                "num_records must be >= 1".to_string(),
+                "shards must not be empty".to_string(),
             ));
         }
+        if let Some(i) = shards.iter().position(|s| s.num_records == 0) {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "shard at index {i} has num_records=0; every shard must have num_records >= 1"
+            )));
+        }
 
         let project_id = FakeDataGenerator::generate_project_id();
+        let batch_offset_ns = self.sample_batch_offset_ns();
+        // Anchor every shard in this request to the same `now` so the documented
+        // "all shards share one batch window" invariant holds; otherwise each shard
+        // would re-sample `Utc::now()` and drift forward by the time spent planning
+        // the previous shards.
+        let request_now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        let ts_list = self.batch_timestamps_ns(num_records);
-        let log_records: Vec<Value> = ts_list
-            .into_iter()
-            .map(|ts| self.generate_single_log_record(service_name.as_deref(), ts))
+        let planned_shards: Vec<PlannedShard> = shards
+            .iter()
+            .map(|shard| {
+                let mut rng = rand::thread_rng();
+                let svc = shard.service_name.as_deref();
+                let ts_list = self.plan_timestamps_with_offset(
+                    request_now_ns,
+                    batch_offset_ns,
+                    shard.num_records,
+                );
+                let resource_attrs =
+                    self.generate_resource_attributes_pairs(&project_id, cloud_account_id, svc);
+                let scope_attrs = self.generate_scope_attributes_pairs(svc);
+                let scope_name_src = svc.unwrap_or(DEFAULT_SERVICE_NAME);
+                let scope_name = format!("io.trihub.{}", scope_name_src.replace('-', "."));
+                let scope_version = format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10));
+                let resource_dropped_attributes_count = rng.gen_range(0..4);
+                let scope_dropped_attributes_count = rng.gen_range(0..3);
+
+                let records: Vec<PlannedRecord> = ts_list
+                    .into_iter()
+                    .map(|timestamp_ns| {
+                        let mut rng = rand::thread_rng();
+                        let (sev_num, sev_text) = FakeDataGenerator::generate_severity();
+                        let body = Self::generate_log_body(&sev_text, svc);
+                        let trace_id = FakeDataGenerator::generate_trace_id();
+                        let span_id = FakeDataGenerator::generate_span_id();
+                        let request_id = FakeDataGenerator::generate_uuid();
+                        let thread_id = FakeDataGenerator::generate_thread_id();
+                        let attributes =
+                            self.generate_log_attributes_pairs(&request_id, &thread_id);
+                        PlannedRecord {
+                            timestamp_ns,
+                            severity_number: sev_num as i32,
+                            severity_text: sev_text,
+                            body,
+                            trace_id,
+                            span_id,
+                            flags: rng.gen_range(0..256),
+                            attributes,
+                        }
+                    })
+                    .collect();
+
+                PlannedShard {
+                    resource_attrs,
+                    resource_dropped_attributes_count,
+                    scope_name,
+                    scope_version,
+                    scope_attrs,
+                    scope_dropped_attributes_count,
+                    records,
+                }
+            })
             .collect();
 
-        let resource_log = self.wrap_log_records_in_otlp(
-            &project_id,
-            cloud_account_id.as_deref(),
-            service_name.as_deref(),
-            log_records,
-        );
-
-        let otlp_message = json!({
-            "resourceLogs": [resource_log]
-        });
-
-        Ok(self.build_message(
-            MessagePayload::Json(otlp_message),
-            tenant_id,
+        Ok(PlannedRequest {
             project_id,
+            shards: planned_shards,
+            message_type: OTLPLogMessageType::Valid,
+        })
+    }
+
+    /// Generate a multi-shard OTLP payload with one `ResourceLogs` entry per shard.
+    ///
+    /// The wire format is determined by the encoder provided at construction. All shards share
+    /// a single anchor time (`Utc::now()` sampled once per request) and a single
+    /// `across_batch_timestamp_jitter_ns` offset, so they fall inside one batch window regardless
+    /// of how long planning takes. Each shard's timestamps are then planned independently using
+    /// `intra_batch_timestamp_jitter_ns`; between shards, monotonicity is not guaranteed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty.
+    /// Returns [`GeneratorError::ProtobufEncodeError`] if the configured encoder fails to
+    /// serialize (only possible with [`crate::message::ProtobufEncoder`]).
+    #[allow(clippy::result_large_err)]
+    pub fn generate_message(
+        &self,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        shards: Vec<ServiceShard>,
+    ) -> Result<OTLPLogMessage> {
+        let planned = self.plan_shards(cloud_account_id.as_deref(), &shards)?;
+        let payload = self.encoder.encode(&planned)?;
+        Ok(self.build_message(
+            payload,
+            tenant_id,
+            planned.project_id,
             OTLPLogMessageType::Valid,
         ))
     }
 
+    // TODO: align with OtlpEncoder abstraction. Currently hardcoded to emit JSON/malformed-JSON
+    // regardless of the configured encoder. A protobuf-mode invalid-message variant (malformed
+    // protobuf, truncated message, invalid field tags) should live as a separate encoder-specific
+    // "invalid" path once we decide the contract with the receiver tests.
+    #[allow(clippy::result_large_err)]
     pub fn generate_invalid_message(&self, tenant_id: Option<String>) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
@@ -522,143 +502,6 @@ impl OTLPLogMessageGenerator {
             }
         }
     }
-
-    /// Generate a protobuf OTLP payload with `num_records` log records.
-    ///
-    /// Timestamp planning matches [`Self::generate_aggregated_message`], but the final payload is
-    /// serialized as protobuf and negative intermediate values are clamped to `0` before writing
-    /// them into unsigned OTLP fields.
-    pub fn generate_protobuf_message(
-        &self,
-        tenant_id: Option<String>,
-        cloud_account_id: Option<String>,
-        service_name: Option<String>,
-        num_records: usize,
-    ) -> Result<OTLPLogMessage> {
-        use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
-        use crate::pb::opentelemetry::proto::common::v1::{
-            any_value, AnyValue, InstrumentationScope, KeyValue,
-        };
-        use crate::pb::opentelemetry::proto::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-        use crate::pb::opentelemetry::proto::resource::v1::Resource;
-        use prost::Message;
-
-        if num_records < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "num_records must be >= 1".to_string(),
-            ));
-        }
-
-        let mut rng = rand::thread_rng();
-        let project_id = FakeDataGenerator::generate_project_id();
-        let svc = service_name.as_deref();
-
-        let ts_list = self.batch_timestamps_ns(num_records);
-
-        // Generate log records
-        let log_records: Vec<LogRecord> = ts_list
-            .iter()
-            .map(|&ts_i64| {
-                let timestamp_ns = ts_i64.max(0) as u64;
-                let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
-                let body = Self::generate_log_body(&severity_text, svc);
-                let trace_id = FakeDataGenerator::generate_trace_id();
-                let span_id = FakeDataGenerator::generate_span_id();
-                let request_id = FakeDataGenerator::generate_uuid();
-                let thread_id = FakeDataGenerator::generate_thread_id();
-
-                let log_attributes = self.generate_log_attributes_pairs(&request_id, &thread_id);
-                let attributes: Vec<KeyValue> = log_attributes
-                    .iter()
-                    .map(|(key, value)| KeyValue {
-                        key: key.clone(),
-                        value: Some(AnyValue {
-                            value: Some(any_value::Value::StringValue(value.clone())),
-                        }),
-                    })
-                    .collect();
-
-                LogRecord {
-                    time_unix_nano: timestamp_ns,
-                    observed_time_unix_nano: timestamp_ns,
-                    severity_number: severity_number as i32,
-                    severity_text,
-                    body: Some(AnyValue {
-                        value: Some(any_value::Value::StringValue(body)),
-                    }),
-                    attributes,
-                    trace_id: hex::decode(&trace_id).unwrap_or_default(),
-                    span_id: hex::decode(&span_id).unwrap_or_default(),
-                    flags: rng.gen_range(0..256),
-                    dropped_attributes_count: 0,
-                }
-            })
-            .collect();
-
-        // Resource attributes
-        let resource_attributes_pairs =
-            self.generate_resource_attributes_pairs(&project_id, cloud_account_id.as_deref(), svc);
-        let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
-            .iter()
-            .map(|(key, value)| KeyValue {
-                key: key.clone(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue(value.clone())),
-                }),
-            })
-            .collect();
-
-        // Scope attributes
-        let scope_attributes_pairs = self.generate_scope_attributes_pairs(svc);
-        let scope_attributes: Vec<KeyValue> = scope_attributes_pairs
-            .iter()
-            .map(|(key, value)| KeyValue {
-                key: key.clone(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue(value.clone())),
-                }),
-            })
-            .collect();
-
-        let resource = Resource {
-            attributes: resource_attributes,
-            dropped_attributes_count: rng.gen_range(0..4),
-        };
-
-        let scope_name_src = svc.unwrap_or(DEFAULT_SERVICE_NAME);
-        let scope = InstrumentationScope {
-            name: format!("io.trihub.{}", scope_name_src.replace('-', ".")),
-            version: format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-            attributes: scope_attributes,
-            dropped_attributes_count: rng.gen_range(0..3),
-        };
-
-        let scope_logs = ScopeLogs {
-            scope: Some(scope),
-            log_records,
-            schema_url: "https://opentelemetry.io/schemas/1.21.0".to_string(),
-        };
-
-        let resource_logs = ResourceLogs {
-            resource: Some(resource),
-            scope_logs: vec![scope_logs],
-            schema_url: "https://opentelemetry.io/schemas/1.21.0".to_string(),
-        };
-
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![resource_logs],
-        };
-
-        let mut buf = Vec::new();
-        request.encode(&mut buf)?;
-
-        Ok(self.build_message(
-            MessagePayload::Protobuf(buf),
-            tenant_id,
-            project_id,
-            OTLPLogMessageType::Valid,
-        ))
-    }
 }
 
 fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
@@ -701,11 +544,26 @@ fn num_digits(mut number: usize) -> usize {
 mod tests {
     use super::*;
     use crate::config::TimestampJitterConfig;
+    use crate::message::encoder::{JsonEncoder, ProtobufEncoder};
     use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+    use crate::pb::opentelemetry::proto::common::v1::{any_value, KeyValue};
     use chrono::Utc;
     use prost::Message;
+    use std::sync::Arc;
 
-    fn gen_with_jitter(
+    fn pb_attr_str<'a>(attrs: &'a [KeyValue], key: &str) -> Option<&'a str> {
+        attrs.iter().find_map(|kv| {
+            if kv.key != key {
+                return None;
+            }
+            match kv.value.as_ref()?.value.as_ref()? {
+                any_value::Value::StringValue(v) => Some(v.as_str()),
+                _ => None,
+            }
+        })
+    }
+
+    fn gen_json_with_jitter(
         batch_jitter_ns: i64,
         intra_batch_jitter_ns: i64,
         intra_batch_overlap_probability: f32,
@@ -718,7 +576,32 @@ mod tests {
                 intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
                 intra_batch_overlap_probability,
             },
+            Arc::new(JsonEncoder),
         )
+    }
+
+    fn gen_protobuf_with_jitter(
+        batch_jitter_ns: i64,
+        intra_batch_jitter_ns: i64,
+        intra_batch_overlap_probability: f32,
+    ) -> OTLPLogMessageGenerator {
+        OTLPLogMessageGenerator::new(
+            "test".to_string(),
+            LabelCardinalityConfig::default(),
+            TimestampJitterConfig {
+                across_batch_timestamp_jitter_ns: batch_jitter_ns,
+                intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
+                intra_batch_overlap_probability,
+            },
+            Arc::new(ProtobufEncoder),
+        )
+    }
+
+    fn single_shard(service_name: Option<&str>, num_records: usize) -> Vec<ServiceShard> {
+        vec![ServiceShard {
+            service_name: service_name.map(ToString::to_string),
+            num_records,
+        }]
     }
 
     fn json_timestamps(message: OTLPLogMessage) -> Vec<i64> {
@@ -727,6 +610,25 @@ mod tests {
         };
 
         json["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                record["timeUnixNano"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn json_timestamps_for_shard(message: &OTLPLogMessage, shard_index: usize) -> Vec<i64> {
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("Expected JSON payload");
+        };
+
+        json["resourceLogs"][shard_index]["scopeLogs"][0]["logRecords"]
             .as_array()
             .unwrap()
             .iter()
@@ -756,12 +658,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_valid_message_keeps_single_timestamp_within_batch_window() {
+    fn generate_message_keeps_single_timestamp_within_batch_window() {
         let batch_jitter_ns = 2_000_000_000_i64;
-        let gen = gen_with_jitter(batch_jitter_ns, 5_000_000, 0.25);
+        let gen = gen_json_with_jitter(batch_jitter_ns, 5_000_000, 0.25);
         let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let timestamps = json_timestamps(
-            gen.generate_valid_message(None, None, Some("svc".to_string()))
+            gen.generate_message(None, None, single_shard(Some("svc"), 1))
                 .unwrap(),
         );
         let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -783,10 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_aggregated_message_is_non_decreasing_when_overlap_disabled() {
-        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
+    fn generate_message_json_is_non_decreasing_when_overlap_disabled() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.0);
         let ts = json_timestamps(
-            gen.generate_aggregated_message(None, None, None, 50)
+            gen.generate_message(None, None, single_shard(None, 50))
                 .unwrap(),
         );
         for i in 1..ts.len() {
@@ -801,10 +703,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_aggregated_message_collapses_timestamps_when_intra_jitter_zero() {
-        let gen = gen_with_jitter(0, 0, 0.0);
+    fn generate_message_json_collapses_timestamps_when_intra_jitter_zero() {
+        let gen = gen_json_with_jitter(0, 0, 0.0);
         let ts = json_timestamps(
-            gen.generate_aggregated_message(None, None, None, 10)
+            gen.generate_message(None, None, single_shard(None, 10))
                 .unwrap(),
         );
         assert!(
@@ -814,11 +716,14 @@ mod tests {
     }
 
     #[test]
-    fn generate_protobuf_message_keeps_timestamps_within_batch_window() {
+    fn generate_message_protobuf_keeps_timestamps_within_batch_window() {
         let batch_jitter_ns = 1_000_000_000_i64;
-        let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
+        let gen = gen_protobuf_with_jitter(batch_jitter_ns, 0, 0.0);
         let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 5).unwrap());
+        let ts = protobuf_timestamps(
+            gen.generate_message(None, None, single_shard(None, 5))
+                .unwrap(),
+        );
         let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
         for &t in &ts {
@@ -833,9 +738,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_protobuf_message_is_non_decreasing_when_overlap_disabled() {
-        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
-        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 50).unwrap());
+    fn generate_message_protobuf_is_non_decreasing_when_overlap_disabled() {
+        let gen = gen_protobuf_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let ts = protobuf_timestamps(
+            gen.generate_message(None, None, single_shard(None, 50))
+                .unwrap(),
+        );
         for i in 1..ts.len() {
             assert!(
                 ts[i - 1] <= ts[i],
@@ -845,5 +753,334 @@ mod tests {
                 ts[i]
             );
         }
+    }
+
+    #[test]
+    fn generate_message_json_with_multiple_shards_produces_one_resource_logs_per_shard() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 2,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 3,
+            },
+            ServiceShard {
+                service_name: Some("svc-c".to_string()),
+                num_records: 4,
+            },
+        ];
+        let message = gen.generate_message(None, None, shards).unwrap();
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("Expected JSON");
+        };
+
+        let resource_logs = json["resourceLogs"].as_array().unwrap();
+        assert_eq!(resource_logs.len(), 3, "one ResourceLogs per shard");
+
+        let counts: Vec<usize> = resource_logs
+            .iter()
+            .map(|rl| rl["scopeLogs"][0]["logRecords"].as_array().unwrap().len())
+            .collect();
+        assert_eq!(counts, vec![2, 3, 4]);
+        assert_eq!(counts.iter().sum::<usize>(), 9);
+
+        let service_names: Vec<&str> = resource_logs
+            .iter()
+            .map(|rl| {
+                rl["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|a| {
+                        (a["key"].as_str() == Some("service.name"))
+                            .then(|| a["value"]["stringValue"].as_str().unwrap())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(service_names, vec!["svc-a", "svc-b", "svc-c"]);
+    }
+
+    #[test]
+    fn generate_message_json_shares_project_id_and_cloud_account_across_shards() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 1,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 1,
+            },
+            ServiceShard {
+                service_name: Some("svc-c".to_string()),
+                num_records: 1,
+            },
+        ];
+        let message = gen
+            .generate_message(
+                Some("tenant1".to_string()),
+                Some("tenant1-acc-01".to_string()),
+                shards,
+            )
+            .unwrap();
+
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("Expected JSON");
+        };
+
+        let resource_logs = json["resourceLogs"].as_array().unwrap();
+        let project_ids: Vec<&str> = resource_logs
+            .iter()
+            .map(|rl| {
+                rl["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|a| {
+                        (a["key"].as_str() == Some("project_id"))
+                            .then(|| a["value"]["stringValue"].as_str().unwrap())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(project_ids[0], project_ids[1]);
+        assert_eq!(project_ids[1], project_ids[2]);
+        assert_eq!(project_ids[0], message.project_id);
+
+        let cloud_account_ids: Vec<&str> = resource_logs
+            .iter()
+            .map(|rl| {
+                rl["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|a| {
+                        (a["key"].as_str() == Some("cloud.account.id"))
+                            .then(|| a["value"]["stringValue"].as_str().unwrap())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert!(cloud_account_ids.iter().all(|&id| id == "tenant1-acc-01"));
+    }
+
+    #[test]
+    fn generate_message_protobuf_shares_project_id_and_cloud_account_across_shards() {
+        let gen = gen_protobuf_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 1,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 1,
+            },
+            ServiceShard {
+                service_name: Some("svc-c".to_string()),
+                num_records: 1,
+            },
+        ];
+        let message = gen
+            .generate_message(
+                Some("tenant1".to_string()),
+                Some("tenant1-acc-01".to_string()),
+                shards,
+            )
+            .unwrap();
+
+        let MessagePayload::Protobuf(bytes) = &message.message else {
+            panic!("Expected protobuf payload");
+        };
+        let decoded = ExportLogsServiceRequest::decode(bytes.as_slice()).unwrap();
+
+        let project_ids: Vec<&str> = decoded
+            .resource_logs
+            .iter()
+            .map(|rl| {
+                pb_attr_str(&rl.resource.as_ref().unwrap().attributes, "project_id")
+                    .expect("project_id missing")
+            })
+            .collect();
+        assert_eq!(project_ids[0], project_ids[1]);
+        assert_eq!(project_ids[1], project_ids[2]);
+        assert_eq!(project_ids[0], message.project_id);
+
+        let cloud_account_ids: Vec<&str> = decoded
+            .resource_logs
+            .iter()
+            .map(|rl| {
+                pb_attr_str(
+                    &rl.resource.as_ref().unwrap().attributes,
+                    "cloud.account.id",
+                )
+                .expect("cloud.account.id missing")
+            })
+            .collect();
+        assert!(cloud_account_ids.iter().all(|&id| id == "tenant1-acc-01"));
+    }
+
+    #[test]
+    fn generate_message_json_is_non_decreasing_within_each_shard() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 10,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 10,
+            },
+        ];
+        let message = gen.generate_message(None, None, shards).unwrap();
+
+        for shard_idx in 0..2 {
+            let ts = json_timestamps_for_shard(&message, shard_idx);
+            for i in 1..ts.len() {
+                assert!(
+                    ts[i - 1] <= ts[i],
+                    "shard {shard_idx}: non-monotonic at i={i}: {} > {}",
+                    ts[i - 1],
+                    ts[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_message_json_keeps_all_timestamps_within_single_batch_window() {
+        let batch_jitter_ns = 2_000_000_000_i64;
+        let gen = gen_json_with_jitter(batch_jitter_ns, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 5,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 5,
+            },
+        ];
+        let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let message = gen.generate_message(None, None, shards).unwrap();
+        let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        for shard_idx in 0..2 {
+            let ts = json_timestamps_for_shard(&message, shard_idx);
+            for &t in &ts {
+                assert!(t <= now_after, "shard {shard_idx}: timestamp in future");
+                assert!(
+                    t >= now_before - batch_jitter_ns,
+                    "shard {shard_idx}: timestamp too old"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_message_protobuf_shards_produce_correct_resource_logs_count() {
+        let gen = gen_protobuf_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let shards = vec![
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 3,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 4,
+            },
+        ];
+        let message = gen.generate_message(None, None, shards).unwrap();
+
+        let MessagePayload::Protobuf(bytes) = &message.message else {
+            panic!("Expected protobuf");
+        };
+        let decoded = ExportLogsServiceRequest::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.resource_logs.len(), 2);
+        assert_eq!(decoded.resource_logs[0].scope_logs[0].log_records.len(), 3);
+        assert_eq!(decoded.resource_logs[1].scope_logs[0].log_records.len(), 4);
+        assert_eq!(
+            pb_attr_str(
+                &decoded.resource_logs[0]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .attributes,
+                "service.name"
+            ),
+            Some("svc-a"),
+        );
+        assert_eq!(
+            pb_attr_str(
+                &decoded.resource_logs[1]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .attributes,
+                "service.name"
+            ),
+            Some("svc-b"),
+        );
+    }
+
+    #[test]
+    fn generate_message_returns_error_for_empty_shards_json() {
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let result = gen.generate_message(None, None, vec![]);
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
+            "expected InvalidConfiguration for empty shards"
+        );
+    }
+
+    #[test]
+    fn generate_message_returns_error_for_zero_num_records_shard() {
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let shards = vec![ServiceShard { service_name: None, num_records: 0 }];
+        let result = gen.generate_message(None, None, shards);
+        assert!(
+            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            "expected InvalidConfiguration for shard with num_records=0"
+        );
+    }
+
+    #[test]
+    fn generate_message_returns_error_when_second_shard_has_zero_records() {
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let shards = vec![
+            ServiceShard { service_name: Some("svc-a".to_string()), num_records: 2 },
+            ServiceShard { service_name: Some("svc-b".to_string()), num_records: 0 },
+        ];
+        let result = gen.generate_message(None, None, shards);
+        assert!(
+            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            "expected InvalidConfiguration when any shard has num_records=0"
+        );
+    }
+
+    #[test]
+    fn generate_message_returns_error_when_first_shard_has_zero_records() {
+        // Guards against a future short-circuit refactor that only validates trailing shards;
+        // the position-agnostic check in plan_shards must catch zero-records at index 0.
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let shards = vec![
+            ServiceShard { service_name: Some("svc-a".to_string()), num_records: 0 },
+            ServiceShard { service_name: Some("svc-b".to_string()), num_records: 2 },
+            ServiceShard { service_name: Some("svc-c".to_string()), num_records: 3 },
+        ];
+        let result = gen.generate_message(None, None, shards);
+        assert!(
+            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            "expected InvalidConfiguration when first shard has num_records=0"
+        );
     }
 }

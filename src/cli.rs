@@ -150,6 +150,12 @@ pub struct OtelArgs {
         default_value = "0.05"
     )]
     pub record_intra_batch_overlap_probability: f32,
+
+    /// Number of ResourceLogs groups (distinct service.name pods) packed into one request,
+    /// simulating OTEL Collector batching across services/pods.
+    /// RECORDS_PER_MESSAGE is divided evenly across groups (clamped to <= RECORDS_PER_MESSAGE).
+    #[arg(long, env = "SERVICES_PER_MESSAGE", default_value = "1")]
+    pub services_per_message: usize,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -185,6 +191,7 @@ impl From<OtelArgs> for OtelConfig {
             record_across_batch_timestamp_jitter_ms: args.record_across_batch_timestamp_jitter_ms,
             record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
             record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
+            services_per_message: args.services_per_message,
         }
     }
 }
@@ -311,6 +318,67 @@ mod tests {
         assert!(config.dry_run);
         assert!(config.ingest_endpoint.is_empty());
         assert!(config.print_logs);
+    }
+
+    #[test]
+    fn cli_services_per_message_default_env_and_flag_precedence() {
+        // Three contracts in one test to avoid a process-wide env race with parallel tests:
+        //   1. No flag, no env -> default_value = "1".
+        //   2. Env SERVICES_PER_MESSAGE=2 is read via clap's `env = "..."` binding.
+        //   3. --services-per-message flag overrides the env value.
+        // Keeping the env mutation inside a single test means no other test in this binary can
+        // observe SERVICES_PER_MESSAGE in the wrong state.
+        std::env::remove_var("SERVICES_PER_MESSAGE");
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.services_per_message, 1, "default when no flag and no env");
+
+        std::env::set_var("SERVICES_PER_MESSAGE", "2");
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.services_per_message, 2, "env binding must be honoured");
+
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--services-per-message",
+            "5",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.services_per_message, 5, "flag must beat env");
+
+        std::env::remove_var("SERVICES_PER_MESSAGE");
+    }
+
+    #[test]
+    fn cli_reads_services_per_message() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--services-per-message",
+            "3",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.services_per_message, 3);
     }
 
     #[test]

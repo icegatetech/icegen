@@ -48,6 +48,7 @@ pub struct RetryConfig {
 
 impl RetryConfig {
     /// Create a new RetryConfig, validating that `max_retries` does not exceed the safe upper bound.
+    #[allow(clippy::result_large_err)]
     pub fn new(max_retries: u32, base_delay_ms: u64, max_delay_ms: u64) -> Result<Self> {
         if max_retries > MAX_RETRIES_UPPER_BOUND {
             return Err(GeneratorError::InvalidConfiguration(format!(
@@ -167,9 +168,11 @@ pub struct OtelConfig {
     pub record_across_batch_timestamp_jitter_ms: u64,
     pub record_intra_batch_timestamp_jitter_ns: u64,
     pub record_intra_batch_overlap_probability: f32,
+    pub services_per_message: usize,
 }
 
 impl OtelConfig {
+    #[allow(clippy::result_large_err)]
     pub fn validate(&self) -> Result<()> {
         if self.invalid_record_percent < 0.0 || self.invalid_record_percent > 100.0 {
             return Err(GeneratorError::InvalidConfiguration(
@@ -245,13 +248,24 @@ impl OtelConfig {
 
         if self.record_intra_batch_timestamp_jitter_ns > 60_000_000_000 {
             return Err(GeneratorError::InvalidConfiguration(
-                "record_intra_batch_timestamp_jitter_ns must be <= 60000000000 (1 minute)".to_string(),
+                "record_intra_batch_timestamp_jitter_ns must be <= 60000000000 (1 minute)"
+                    .to_string(),
             ));
         }
 
         if !(0.0f32..=1.0f32).contains(&self.record_intra_batch_overlap_probability) {
             return Err(GeneratorError::InvalidConfiguration(
                 "record_intra_batch_overlap_probability must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+
+        // When services_per_message > service_count_per_tenant, service names are picked with
+        // replacement from the pool, producing duplicate names across shards. This is intentional:
+        // it simulates multiple pods running the same service. No error is raised; select_service_shards
+        // normalises the count to min(requested, records_per_message) >= 1.
+        if self.services_per_message < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "services_per_message must be >= 1".to_string(),
             ));
         }
 
@@ -272,6 +286,7 @@ impl OtelConfig {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn retry_config(&self) -> Result<RetryConfig> {
         RetryConfig::new(
             self.retry_max_retries,
@@ -280,6 +295,7 @@ impl OtelConfig {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn label_cardinality_config(&self) -> Result<LabelCardinalityConfig> {
         let mut limits = default_cardinality_limits();
         let custom_limits = parse_cardinality_limits(&self.label_cardinality_limits)?;
@@ -300,6 +316,7 @@ fn default_cardinality_limits() -> HashMap<String, usize> {
         .collect()
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_tenant_id(tenant_id: &str) -> Result<()> {
     if tenant_id.is_empty() {
         return Err(GeneratorError::InvalidConfiguration(
@@ -319,6 +336,7 @@ fn validate_tenant_id(tenant_id: &str) -> Result<()> {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_cardinality_limits(raw: &str) -> Result<HashMap<String, usize>> {
     let mut parsed = HashMap::new();
     let trimmed = raw.trim();
@@ -437,6 +455,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
+            services_per_message: 1,
         }
     }
 
@@ -563,6 +582,36 @@ mod tests {
         assert!(cfg.validate().is_ok());
 
         cfg.record_intra_batch_overlap_probability = 1.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_services_per_message_validation() {
+        let mut cfg = base_config();
+        cfg.services_per_message = 0;
+        assert!(cfg.validate().is_err());
+
+        cfg.services_per_message = 1;
+        assert!(cfg.validate().is_ok());
+
+        cfg.services_per_message = 10;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_services_per_message_has_no_upper_bound() {
+        // No upper bound is intentional: select_service_shards clamps to records_per_message at
+        // runtime, and large values simulate "every record is its own pod". This test pins down
+        // the missing upper-bound contract so a future regression that adds one fails loudly.
+        let mut cfg = base_config();
+        cfg.services_per_message = usize::MAX;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_services_per_message_accepts_typical_value() {
+        let mut cfg = base_config();
+        cfg.services_per_message = 4;
         assert!(cfg.validate().is_ok());
     }
 }

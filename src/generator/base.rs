@@ -7,6 +7,7 @@ use tokio::sync::watch;
 
 #[async_trait]
 pub trait LogGenerator: Send + Sync {
+    #[allow(clippy::result_large_err)]
     fn generate_message(&self) -> Result<OTLPLogMessage>;
     async fn send_message(
         &self,

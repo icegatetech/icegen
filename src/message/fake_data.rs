@@ -35,18 +35,12 @@ impl FakeDataGenerator {
     const DEPLOYMENT_ENVIRONMENTS: &'static [&'static str] =
         &["production", "staging", "development"];
 
-    pub fn generate_trace_id() -> String {
-        let mut rng = rand::thread_rng();
-        (0..32)
-            .map(|_| format!("{:x}", rng.gen_range(0..16)))
-            .collect()
+    pub fn generate_trace_id() -> [u8; 16] {
+        rand::thread_rng().gen::<[u8; 16]>()
     }
 
-    pub fn generate_span_id() -> String {
-        let mut rng = rand::thread_rng();
-        (0..16)
-            .map(|_| format!("{:x}", rng.gen_range(0..16)))
-            .collect()
+    pub fn generate_span_id() -> [u8; 8] {
+        rand::thread_rng().gen::<[u8; 8]>()
     }
 
     pub fn generate_project_id() -> String {
@@ -122,8 +116,13 @@ impl FakeDataGenerator {
         namespaces.choose(&mut rng).unwrap().to_string()
     }
 
-    pub fn generate_k8s_pod_name() -> String {
-        let service = Self::generate_service_name();
+    /// Generate a Kubernetes pod name in the conventional
+    /// `<service>-<replicaset-hash>-<pod-hash>` form.
+    ///
+    /// `service` must be the shard's `service.name` so that the resulting pod identity is
+    /// consistent with the rest of the shard's resource attributes (a pod always belongs to a
+    /// specific service/deployment).
+    pub fn generate_k8s_pod_name(service: &str) -> String {
         let mut rng = rand::thread_rng();
         format!(
             "{}-{}-{}",

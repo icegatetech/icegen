@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+// TODO: box large variants (GrpcError, TransportError, RequestError) to bring GeneratorError
+// under the 128-byte clippy threshold and allow per-function allows to be removed.
 #[derive(Error, Debug)]
 pub enum GeneratorError {
     #[error("HTTP error {0}: {1}")]

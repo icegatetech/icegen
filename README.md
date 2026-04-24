@@ -175,7 +175,8 @@ Boolean environment variables accept the following values:
 | `--message-interval-ms` | `MESSAGE_INTERVAL_MS` | 0 | Minimum interval between started messages in batch mode; per-worker interval in continuous mode (ms) |
 | `--concurrency` | `CONCURRENCY` | 1 | Number of concurrent workers inside one process |
 | `--invalid-record-percent` | `INVALID_RECORD_PERCENT` | 0.0 | % of invalid records (0-100) |
-| `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message |
+| `--records-per-message` | `RECORDS_PER_MESSAGE` | 1 | Records per message (total across all shards) |
+| `--services-per-message` | `SERVICES_PER_MESSAGE` | 1 | Number of `ResourceLogs` groups packed into one request, simulating OTEL Collector batching across services/pods. Must be `>= 1`. Clamped to `min(value, RECORDS_PER_MESSAGE)`. Service names are sampled at random from the tenant pool; when this value exceeds `SERVICE_COUNT_PER_TENANT`, duplicate names appear across shards (intentional — models multiple pods of the same service). To get a single shard without a service name, set `SERVICE_COUNT_PER_TENANT=0` instead. |
 | `--print-logs` | `PRINT_LOGS` | false | Print detailed message logs |
 | `--continuous` | `CONTINUOUS_MODE` | false | Run in continuous mode |
 | `--tenant-id` | `TENANT_ID` | `default` | Single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
@@ -349,6 +350,30 @@ With this setup:
 - OTLP resource attributes always include both `cloud.account.id` and `service.name`
 
 That makes it easy to inspect Icegate output and verify that rows are grouped and sorted only within the current tenant.
+
+### Multi-service payload (realistic OTEL Collector batching)
+
+Real OTEL Collectors send a single `ExportLogsServiceRequest` that contains logs from multiple pods — each represented as a separate `ResourceLogs` entry with its own `service.name`, `host.name`, and `k8s.pod.name`. Use `--services-per-message` to reproduce this:
+
+```bash
+otel-log-generator otel \
+  --endpoint http://localhost:4318/v1/logs \
+  --tenant-count 4 \
+  --cloud-account-count-per-tenant 4 \
+  --service-count-per-tenant 6 \
+  --services-per-message 3 \
+  --records-per-message 30 \
+  --count 1000 \
+  --concurrency 10
+```
+
+With this setup each HTTP request contains exactly 3 `ResourceLogs` groups. `RECORDS_PER_MESSAGE` (30) is divided evenly across the 3 groups (10 records each; the remainder, if any, is distributed one-by-one to the first shards). Timestamps within each group are monotonically non-decreasing (when `overlap_probability=0`). Across groups monotonicity is not guaranteed — they simulate independent service streams anchored to the same batch window (`now - rand(0, across_batch_jitter)..now`).
+
+Key invariants:
+- One request → one tenant (`X-Scope-OrgID`) → one `project_id` → one `cloud.account.id`
+- Each `ResourceLogs` maps to one shard with its own `service.name`, `host.name`, `k8s.pod.name`
+- `SERVICES_PER_MESSAGE` is clamped to `min(value, RECORDS_PER_MESSAGE)` so you never get more shards than records
+- When `SERVICE_COUNT_PER_TENANT=0`, all shards fall back to a single shard without a `service.name`
 
 ## Development
 

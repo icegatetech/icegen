@@ -17,10 +17,10 @@ High-performance OpenTelemetry log generator implementation with comprehensive O
 ### ✅ Phase 2: Message Generation (Complete)
 - [x] FakeDataGenerator with realistic test data
 - [x] OTLPLogMessageGenerator implementation
-- [x] Valid message generation (JSON)
-- [x] Invalid message generation (5 types)
-- [x] Aggregated message generation
-- [x] Protobuf message generation
+- [x] `OtlpEncoder` trait + `JsonEncoder` + `ProtobufEncoder`
+- [x] Format-neutral plan types (`PlannedRequest`, `PlannedShard`, `PlannedRecord`)
+- [x] Unified `generate_message` API (encoder chosen at construction)
+- [~] Invalid message generation (5 types, JSON only — protobuf-mode invalid path not yet implemented; see TODO in `generate_invalid_message`)
 - [x] Unit tests for message generation
 
 ### ✅ Phase 3: Transport Layer (Complete)
@@ -106,6 +106,8 @@ otel-log-generator/
 │   │   └── otel.rs              # OtelLogGenerator implementation
 │   ├── message/
 │   │   ├── types.rs             # OTLPLogMessage, MessageType
+│   │   ├── plan.rs              # PlannedRequest/Shard/Record (format-neutral)
+│   │   ├── encoder.rs           # OtlpEncoder trait, JsonEncoder, ProtobufEncoder
 │   │   ├── generator.rs         # Message generation logic
 │   │   └── fake_data.rs         # Fake data utilities
 │   ├── transport/
@@ -296,6 +298,62 @@ Potential improvements (not in scope for initial release):
 - [ ] Custom log body templates
 - [ ] TLS/mTLS support
 - [ ] Authentication headers
+
+## Multi-Service Payload (Shard Model)
+
+Real OTEL Collectors batch logs from multiple pods into a single `ExportLogsServiceRequest`, with each pod represented as a separate `ResourceLogs` entry. `SERVICES_PER_MESSAGE` / `--services-per-message` (default `1`) controls how many such groups are packed into one request.
+
+### Shard invariants
+
+| Invariant | Details |
+|-----------|---------|
+| Tenant scope | One request always carries one tenant (`X-Scope-OrgID`) → one `project_id` → one `cloud.account.id` |
+| Record distribution | `RECORDS_PER_MESSAGE` is divided across shards: `base = records / k`, the first `records % k` shards get `base + 1` |
+| Shard count clamp | `k = min(services_per_message, records_per_message)` — never more shards than records |
+| Intra-shard monotonicity | Timestamps within one shard are non-decreasing when `overlap_probability = 0` |
+| Batch window | All shard timestamps share the same `now - rand(0, across_batch_jitter)` anchor |
+| Inter-shard ordering | Not guaranteed — shards simulate independent service streams |
+| Service pool fallback | When `SERVICE_COUNT_PER_TENANT = 0`, all shards collapse to a single shard with no `service.name` |
+
+### Implementation
+
+- `ServiceShard { service_name, num_records }` — unit of shard data, produced by `TenantProfile::select_service_shards()`
+- `OTLPLogMessageGenerator::plan_shards()` — builds a format-neutral `PlannedRequest` that shares one `project_id` and one `batch_offset_ns` across all shards
+- `sample_batch_offset_ns()` — samples the per-request time shift once; `plan_timestamps_with_offset()` applies it per-shard
+- Public API: `generate_message(tenant_id, cloud_account_id, shards)` — delegates planning to `plan_shards`, then encoding to the configured `OtlpEncoder`
+
+## Encoder Abstraction
+
+`OtlpEncoder` (`src/message/encoder.rs`) separates wire-format serialization from message planning. The generator builds a format-neutral `PlannedRequest` → the encoder turns it into bytes.
+
+### Types
+
+| Type | Location | Purpose |
+|------|----------|---------|
+| `PlannedRecord` | `message/plan.rs` | One log record: timestamps, severity, body, raw `[u8; 16]` trace_id, `[u8; 8]` span_id |
+| `PlannedShard` | `message/plan.rs` | One `ResourceLogs` entry: resource/scope attrs, records |
+| `PlannedRequest` | `message/plan.rs` | Full request: project_id + shards |
+| `OtlpEncoder` | `message/encoder.rs` | `fn encode(&self, &PlannedRequest) -> Result<MessagePayload>` |
+| `JsonEncoder` | `message/encoder.rs` | Produces `MessagePayload::Json`; hex-encodes trace/span IDs |
+| `ProtobufEncoder` | `message/encoder.rs` | Produces `MessagePayload::Protobuf`; takes trace/span ID bytes directly |
+
+### Encoder selection
+
+`OtelLogGenerator::with_transport` picks the encoder once at construction:
+
+```rust
+let encoder: Arc<dyn OtlpEncoder> = if config.transport == "grpc" || config.use_protobuf {
+    Arc::new(ProtobufEncoder)
+} else {
+    Arc::new(JsonEncoder)
+};
+```
+
+### trace_id / span_id representation
+
+`FakeDataGenerator::generate_trace_id()` returns `[u8; 16]` and `generate_span_id()` returns `[u8; 8]`.
+- `JsonEncoder` calls `hex::encode(bytes)` to produce the 32/16-char hex string written into JSON.
+- `ProtobufEncoder` calls `.to_vec()` — no hex round-trip, no silent decode error.
 
 ## Conclusion
 

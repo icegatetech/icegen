@@ -43,6 +43,7 @@ impl GrpcTransport {
         })
     }
 
+    #[allow(clippy::result_large_err)]
     fn prepare_export_parts(
         message: &OTLPLogMessage,
     ) -> Result<(
