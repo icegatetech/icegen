@@ -438,7 +438,7 @@ fn test_protobuf_scope_name_and_attrs_when_service_omitted() {
         .scope
         .as_ref()
         .unwrap();
-    assert_eq!(scope.name, "io.trihub.generator");
+    assert_eq!(scope.name, "io.trihub.icegen");
     let scope_attr_keys: Vec<&str> = scope.attributes.iter().map(|kv| kv.key.as_str()).collect();
     assert!(
         !scope_attr_keys.contains(&"library.name"),

@@ -235,13 +235,11 @@ impl OtelConfig {
 
         if self.record_intra_batch_timestamp_jitter_ns > 60_000_000_000 {
             return Err(GeneratorError::InvalidConfiguration(
-                "record_intra_batch_jitter_ns must be <= 60000000000 (1 minute)".to_string(),
+                "record_intra_batch_timestamp_jitter_ns must be <= 60000000000 (1 minute)".to_string(),
             ));
         }
 
-        if self.record_intra_batch_overlap_probability < 0.0
-            || self.record_intra_batch_overlap_probability > 1.0
-        {
+        if !(0.0f32..=1.0f32).contains(&self.record_intra_batch_overlap_probability) {
             return Err(GeneratorError::InvalidConfiguration(
                 "record_intra_batch_overlap_probability must be between 0.0 and 1.0".to_string(),
             ));

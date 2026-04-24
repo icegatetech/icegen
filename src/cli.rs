@@ -104,7 +104,7 @@ pub struct OtelArgs {
     pub cloud_account_count_per_tenant: usize,
 
     /// Number of service.name values generated per tenant.
-    /// Set to 0 to omit service.name from resource attributes; scope.name uses default 'generator'.
+    /// Set to 0 to omit service.name from resource attributes; scope.name uses default 'io.trihub.icegen'.
     #[arg(long, env = "SERVICE_COUNT_PER_TENANT", default_value = "6")]
     pub service_count_per_tenant: usize,
 
@@ -129,7 +129,7 @@ pub struct OtelArgs {
     /// rand(0, value). Applied once per batch, not per record. (0 to disable, max 3600000)
     #[arg(
         long,
-        env = "RECORD_ACCROSS_BATCH_TIMESTAMP_JITTER_MS",
+        env = "RECORD_ACROSS_BATCH_TIMESTAMP_JITTER_MS",
         default_value = "1000"
     )]
     pub record_across_batch_timestamp_jitter_ms: u64,

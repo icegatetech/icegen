@@ -1310,7 +1310,7 @@ mod tests {
             .and_then(|sl| sl.get("scope"))
             .expect("scope must be present");
         let scope_name = scope.get("name").and_then(|n| n.as_str());
-        assert_eq!(scope_name, Some("io.trihub.generator"));
+        assert_eq!(scope_name, Some("io.trihub.icegen"));
         let scope_attrs = scope.get("attributes").and_then(|a| a.as_array());
         let attr_keys: Vec<&str> = scope_attrs
             .map(|attrs| {

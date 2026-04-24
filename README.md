@@ -181,7 +181,7 @@ Boolean environment variables accept the following values:
 | `--tenant-id` | `TENANT_ID` | `default` | Single-tenant setting: fixed tenant propagated as `X-Scope-OrgID` over HTTP and `x-scope-orgid` metadata over gRPC |
 | `--tenant-count` | `TENANT_COUNT` | 1 | Multi-tenant mode size. When `> 1`, each message picks a random tenant from `tenant1..tenantN` and keeps it for retries. Set to `0` to omit the `X-Scope-OrgID` header/metadata entirely; `TENANT_ID` is ignored. |
 | `--cloud-account-count-per-tenant` | `CLOUD_ACCOUNT_COUNT_PER_TENANT` | 4 | Size of the tenant-local `cloud.account.id` pool. Values are generated as `tenantX-acc-YY`. Set to `0` to omit `cloud.account.id` from resource attributes. |
-| `--service-count-per-tenant` | `SERVICE_COUNT_PER_TENANT` | 6 | Size of the tenant-local `service.name` pool. Values are generated as `tenantX-svc-YY`. Set to `0` to omit `service.name` from resource attributes; `scope.name` falls back to the default `io.trihub.generator`. |
+| `--service-count-per-tenant` | `SERVICE_COUNT_PER_TENANT` | 6 | Size of the tenant-local `service.name` pool. Values are generated as `tenantX-svc-YY`. Set to `0` to omit `service.name` from resource attributes; `scope.name` falls back to the default `io.trihub.icegen`. |
 | `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
 | `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
 | `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |

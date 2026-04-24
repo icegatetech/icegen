@@ -151,6 +151,19 @@ impl Transport for HttpTransport {
 
             if status.as_u16() == 429 {
                 if attempt == max_retries {
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let body = response.text().await.unwrap_or_default();
+                    eprintln!(
+                        "  \u{26a0} Retry[http]: 429 Too Many Requests, attempt {}/{}, retry-after: {:?}, body: {}",
+                        attempt + 1,
+                        max_retries + 1,
+                        retry_after,
+                        body
+                    );
                     return SendOutcome::Failure {
                         retries: attempt as usize,
                         error: GeneratorError::RateLimitExceeded(attempt),
