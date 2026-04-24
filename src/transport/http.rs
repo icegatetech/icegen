@@ -1,7 +1,7 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
 use crate::message::{MessagePayload, OTLPLogMessage};
-use crate::transport::{SendReport, Transport};
+use crate::transport::{SendOutcome, Transport};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::time::Duration;
@@ -47,27 +47,39 @@ impl HttpTransport {
 
     fn build_request(&self, message: &OTLPLogMessage) -> reqwest::RequestBuilder {
         match &message.message {
-            MessagePayload::Json(json_value) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .json(json_value),
-            MessagePayload::Protobuf(bytes) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/x-protobuf")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .body(bytes.clone()),
-            MessagePayload::MalformedJson(malformed_string) => self
-                .client
-                .post(&self.endpoint)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "trihub-log-generator/1.0")
-                .header("X-Scope-OrgID", &message.tenant_id)
-                .body(malformed_string.clone()),
+            MessagePayload::Json(json_value) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.json(json_value)
+            }
+            MessagePayload::Protobuf(bytes) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/x-protobuf")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.body(bytes.clone())
+            }
+            MessagePayload::MalformedJson(malformed_string) => {
+                let mut req = self
+                    .client
+                    .post(&self.endpoint)
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", "trihub-log-generator/1.0");
+                if let Some(tid) = &message.tenant_id {
+                    req = req.header("X-Scope-OrgID", tid);
+                }
+                req.body(malformed_string.clone())
+            }
         }
     }
 }
@@ -78,7 +90,7 @@ impl Transport for HttpTransport {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendReport {
+    ) -> SendOutcome {
         let max_retries = self.retry_config.max_retries;
         let mut shutdown_rx = shutdown_rx.clone();
 
@@ -97,29 +109,29 @@ impl Transport for HttpTransport {
                         e
                     );
                     if *shutdown_rx.borrow() {
-                        return SendReport::failure(
-                            attempt as usize,
-                            format!("request interrupted by shutdown: {e}"),
-                        );
+                        return SendOutcome::Failure {
+                            retries: attempt as usize,
+                            error: GeneratorError::Interrupted,
+                        };
                     }
                     tokio::select! {
                         _ = sleep(Duration::from_millis(delay)) => {}
                         changed = shutdown_rx.changed() => {
                             if changed.is_ok() && *shutdown_rx.borrow() {
-                                return SendReport::failure(
-                                    attempt as usize,
-                                    format!("request interrupted during retry wait: {e}"),
-                                );
+                                return SendOutcome::Failure {
+                                    retries: attempt as usize,
+                                    error: GeneratorError::Interrupted,
+                                };
                             }
                         }
                     }
                     continue;
                 }
                 Err(e) => {
-                    return SendReport::failure(
-                        attempt as usize,
-                        format!("request failed: {e}"),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::RequestError(e),
+                    };
                 }
             };
 
@@ -127,17 +139,35 @@ impl Transport for HttpTransport {
 
             if status.is_success() {
                 if attempt > 0 {
-                    eprintln!("  \u{2713} Retry[http]: request succeeded after {} retries", attempt);
+                    eprintln!(
+                        "  \u{2713} Retry[http]: request succeeded after {} retries",
+                        attempt
+                    );
                 }
-                return SendReport::success(attempt as usize);
+                return SendOutcome::Success {
+                    retries: attempt as usize,
+                };
             }
 
             if status.as_u16() == 429 {
                 if attempt == max_retries {
-                    return SendReport::failure(
-                        attempt as usize,
-                        format!("rate limit exceeded after {} attempts", max_retries + 1),
+                    let retry_after = response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    let body = response.text().await.unwrap_or_default();
+                    eprintln!(
+                        "  \u{26a0} Retry[http]: 429 Too Many Requests, attempt {}/{}, retry-after: {:?}, body: {}",
+                        attempt + 1,
+                        max_retries + 1,
+                        retry_after,
+                        body
                     );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::RateLimitExceeded(attempt),
+                    };
                 }
 
                 // Parse Retry-After header (integer seconds)
@@ -157,19 +187,19 @@ impl Transport for HttpTransport {
                 );
 
                 if *shutdown_rx.borrow() {
-                    return SendReport::failure(
-                        attempt as usize,
-                        "request interrupted by shutdown after 429".to_string(),
-                    );
+                    return SendOutcome::Failure {
+                        retries: attempt as usize,
+                        error: GeneratorError::Interrupted,
+                    };
                 }
                 tokio::select! {
                     _ = sleep(Duration::from_millis(delay)) => {}
                     changed = shutdown_rx.changed() => {
                         if changed.is_ok() && *shutdown_rx.borrow() {
-                            return SendReport::failure(
-                                attempt as usize,
-                                "request interrupted during 429 retry wait".to_string(),
-                            );
+                            return SendOutcome::Failure {
+                                retries: attempt as usize,
+                                error: GeneratorError::Interrupted,
+                            };
                         }
                     }
                 }
@@ -178,16 +208,13 @@ impl Transport for HttpTransport {
 
             // Non-retryable HTTP error: fail immediately
             let error_text = response.text().await.unwrap_or_default();
-            return SendReport::failure(
-                attempt as usize,
-                format!("http error {}: {}", status.as_u16(), error_text),
-            );
+            return SendOutcome::Failure {
+                retries: attempt as usize,
+                error: GeneratorError::HttpError(status.as_u16(), error_text),
+            };
         }
 
-        SendReport::failure(
-            max_retries as usize,
-            format!("request retries exhausted after {} attempts", max_retries + 1),
-        )
+        unreachable!("all loop paths return explicitly")
     }
 }
 
@@ -207,7 +234,7 @@ mod tests {
     fn message(tenant_id: &str) -> OTLPLogMessage {
         OTLPLogMessage::new(
             MessagePayload::Json(json!({"resourceLogs": []})),
-            tenant_id.to_string(),
+            Some(tenant_id.to_string()),
             "project1".to_string(),
             "source1".to_string(),
             crate::message::OTLPLogMessageType::Valid,
@@ -250,5 +277,25 @@ mod tests {
 
         assert_eq!(first.headers().get("X-Scope-OrgID").unwrap(), "tenant1");
         assert_eq!(second.headers().get("X-Scope-OrgID").unwrap(), "tenant3");
+    }
+
+    #[test]
+    fn http_omits_scope_header_when_tenant_id_none() {
+        let transport = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+        )
+        .unwrap();
+
+        let msg = OTLPLogMessage::new(
+            MessagePayload::Json(json!({"resourceLogs": []})),
+            None,
+            "project1".to_string(),
+            "source1".to_string(),
+            crate::message::OTLPLogMessageType::Valid,
+        );
+        let request = transport.build_request(&msg).build().unwrap();
+        assert!(request.headers().get("X-Scope-OrgID").is_none());
     }
 }

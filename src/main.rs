@@ -58,10 +58,17 @@ async fn main() -> anyhow::Result<()> {
                     result = &mut generator_task.1 => {
                         let result = result??;
                         if !config.print_logs {
-                            println!(
-                                "\nSummary: {}/{} messages sent successfully",
-                                result.success, result.total
-                            );
+                            if config.dry_run {
+                                println!(
+                                    "\nSummary: {} messages generated (dry-run, nothing sent)",
+                                    result.total
+                                );
+                            } else {
+                                println!(
+                                    "\nSummary: {}/{} messages sent successfully",
+                                    result.success, result.total
+                                );
+                            }
                             if result.failed > 0 {
                                 println!("Failed: {} messages", result.failed);
                             }
@@ -71,10 +78,17 @@ async fn main() -> anyhow::Result<()> {
                         let _ = generator_task.0.send(true);
                         let result = generator_task.1.await??;
                         generator.close().await?;
-                        println!(
-                            "Shutdown complete. Final summary: {}/{} messages sent successfully",
-                            result.success, result.total
-                        );
+                        if config.dry_run {
+                            println!(
+                                "Shutdown complete. Final summary: {} messages generated (dry-run, nothing sent)",
+                                result.total
+                            );
+                        } else {
+                            println!(
+                                "Shutdown complete. Final summary: {}/{} messages sent successfully",
+                                result.success, result.total
+                            );
+                        }
                         if result.failed > 0 {
                             println!("Failed: {} messages", result.failed);
                         }
@@ -84,10 +98,17 @@ async fn main() -> anyhow::Result<()> {
                 let result = generator
                     .send_messages_batch(config.count, config.message_interval_ms)
                     .await?;
-                println!(
-                    "\nSummary: {}/{} messages sent successfully",
-                    result.success, result.total
-                );
+                if config.dry_run {
+                    println!(
+                        "\nSummary: {} messages generated (dry-run, nothing sent)",
+                        result.total
+                    );
+                } else {
+                    println!(
+                        "\nSummary: {}/{} messages sent successfully",
+                        result.success, result.total
+                    );
+                }
                 if result.failed > 0 {
                     println!("Failed: {} messages", result.failed);
                 }

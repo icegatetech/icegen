@@ -25,9 +25,9 @@ pub enum GeneratorType {
 
 #[derive(Args)]
 pub struct OtelArgs {
-    /// OTEL logs ingest endpoint
+    /// OTEL logs ingest endpoint (not required with --dry-run)
     #[arg(long, env = "OTEL_LOGS_ENDPOINT")]
-    pub endpoint: String,
+    pub endpoint: Option<String>,
 
     /// Health check endpoint (optional)
     #[arg(long, env = "OTEL_HEALTHCHECK_ENDPOINT")]
@@ -69,6 +69,10 @@ pub struct OtelArgs {
     #[arg(long, env = "PRINT_LOGS", default_value = "false", value_parser = parse_bool)]
     pub print_logs: bool,
 
+    /// Generate messages and print to stdout only; do not open any network transport
+    #[arg(long, env = "DRY_RUN", default_value = "false", value_parser = parse_bool)]
+    pub dry_run: bool,
+
     /// Run in continuous mode
     #[arg(long, env = "CONTINUOUS_MODE", default_value = "false", value_parser = parse_bool)]
     pub continuous: bool,
@@ -89,15 +93,18 @@ pub struct OtelArgs {
     #[arg(long, env = "TENANT_ID")]
     pub tenant_id: Option<String>,
 
-    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID
+    /// Number of tenants for random routing; when > 1 uses tenant1..tenantN and ignores TENANT_ID.
+    /// Set to 0 to omit the X-Scope-OrgID header/metadata entirely; TENANT_ID is ignored.
     #[arg(long, env = "TENANT_COUNT", default_value = "1")]
     pub tenant_count: usize,
 
-    /// Number of cloud.account.id values generated per tenant
+    /// Number of cloud.account.id values generated per tenant.
+    /// Set to 0 to omit cloud.account.id from resource attributes.
     #[arg(long, env = "CLOUD_ACCOUNT_COUNT_PER_TENANT", default_value = "4")]
     pub cloud_account_count_per_tenant: usize,
 
-    /// Number of service.name values generated per tenant
+    /// Number of service.name values generated per tenant.
+    /// Set to 0 to omit service.name from resource attributes; scope.name uses default 'io.trihub.icegen'.
     #[arg(long, env = "SERVICE_COUNT_PER_TENANT", default_value = "6")]
     pub service_count_per_tenant: usize,
 
@@ -117,6 +124,32 @@ pub struct OtelArgs {
     /// Per-key cardinality limits as CSV map, e.g. key1=32,key2=64
     #[arg(long, env = "OTEL_LABEL_CARDINALITY_LIMITS", default_value = "")]
     pub label_cardinality_limits: String,
+
+    /// Per-batch jitter for log record timestamps in milliseconds; whole request shifts back by
+    /// rand(0, value). Applied once per batch, not per record. (0 to disable, max 3600000)
+    #[arg(
+        long,
+        env = "RECORD_ACROSS_BATCH_TIMESTAMP_JITTER_MS",
+        default_value = "1000"
+    )]
+    pub record_across_batch_timestamp_jitter_ms: u64,
+
+    /// Intra-batch jitter in nanoseconds: forward step between adjacent records and size of
+    /// rare backward nudge. (0 to disable, max 60000000000)
+    #[arg(
+        long,
+        env = "RECORD_INTRA_BATCH_TIMESTAMP_JITTER_NS",
+        default_value = "5"
+    )]
+    pub record_intra_batch_timestamp_jitter_ns: u64,
+
+    /// Probability [0.0, 1.0] that a record (i > 0) steps backward instead of forward
+    #[arg(
+        long,
+        env = "RECORD_INTRA_BATCH_OVERLAP_PROBABILITY",
+        default_value = "0.05"
+    )]
+    pub record_intra_batch_overlap_probability: f32,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -124,13 +157,14 @@ impl From<OtelArgs> for OtelConfig {
         let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
 
         Self {
-            ingest_endpoint: args.endpoint,
+            ingest_endpoint: args.endpoint.unwrap_or_default(),
             healthcheck_endpoint: args.healthcheck_endpoint,
             use_protobuf: args.use_protobuf,
             transport: args.transport,
             invalid_record_percent: args.invalid_record_percent,
             records_per_message: args.records_per_message,
-            print_logs: args.print_logs,
+            print_logs: args.print_logs || args.dry_run,
+            dry_run: args.dry_run,
             count: args.count,
             message_interval_ms: args
                 .message_interval_ms
@@ -148,6 +182,9 @@ impl From<OtelArgs> for OtelConfig {
             label_cardinality_enabled: args.label_cardinality_enabled,
             label_cardinality_default_limit: args.label_cardinality_default_limit,
             label_cardinality_limits: args.label_cardinality_limits,
+            record_across_batch_timestamp_jitter_ms: args.record_across_batch_timestamp_jitter_ms,
+            record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
+            record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
         }
     }
 }
@@ -243,6 +280,37 @@ mod tests {
         let config: OtelConfig = args.into();
         assert_eq!(config.cloud_account_count_per_tenant, 5);
         assert_eq!(config.service_count_per_tenant, 7);
+    }
+
+    #[test]
+    fn cli_reads_intra_batch_jitter_options() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--record-intra-batch-timestamp-jitter-ns",
+            "10",
+            "--record-intra-batch-overlap-probability",
+            "0.2",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.record_intra_batch_timestamp_jitter_ns, 10);
+        assert!((config.record_intra_batch_overlap_probability - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cli_accepts_dry_run_without_endpoint() {
+        let cli = Cli::parse_from(["otel-log-generator", "otel", "--dry-run"]);
+        let GeneratorType::Otel(args) = cli.generator;
+        assert!(args.dry_run);
+        assert!(args.endpoint.is_none());
+        let config: OtelConfig = args.into();
+        assert!(config.dry_run);
+        assert!(config.ingest_endpoint.is_empty());
+        assert!(config.print_logs);
     }
 
     #[test]

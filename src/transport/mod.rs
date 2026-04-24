@@ -1,34 +1,32 @@
 pub mod grpc;
 pub mod http;
+pub mod noop;
 pub mod protobuf;
 
+use crate::error::GeneratorError;
 use crate::message::OTLPLogMessage;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
-#[derive(Debug, Clone)]
-pub struct SendReport {
-    pub success: bool,
-    /// Retry attempt index for the final send result (0-based).
-    /// Examples: `0` means no retry; `1` means one retry before success/failure.
-    pub retries: usize,
-    pub error: Option<String>,
+#[derive(Debug)]
+pub enum SendOutcome {
+    Success {
+        retries: usize,
+    },
+    Failure {
+        retries: usize,
+        error: GeneratorError,
+    },
 }
 
-impl SendReport {
-    pub fn success(retries: usize) -> Self {
-        Self {
-            success: true,
-            retries,
-            error: None,
-        }
+impl SendOutcome {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
     }
 
-    pub fn failure(retries: usize, error: impl Into<String>) -> Self {
-        Self {
-            success: false,
-            retries,
-            error: Some(error.into()),
+    pub fn retries(&self) -> usize {
+        match self {
+            Self::Success { retries } | Self::Failure { retries, .. } => *retries,
         }
     }
 }
@@ -39,8 +37,9 @@ pub trait Transport: Send + Sync {
         &self,
         message: &OTLPLogMessage,
         shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendReport;
+    ) -> SendOutcome;
 }
 
 pub use grpc::GrpcTransport;
 pub use http::HttpTransport;
+pub use noop::NoopTransport;

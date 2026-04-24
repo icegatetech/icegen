@@ -96,6 +96,50 @@ impl Default for RetryConfig {
     }
 }
 
+/// Timestamp jitter configuration used by [`crate::message::OTLPLogMessageGenerator`].
+///
+/// All fields in this struct use nanoseconds because generated OTLP payloads store
+/// timestamps in `timeUnixNano` / `observedTimeUnixNano`. CLI and [`OtelConfig`]
+/// accept jitter settings in milliseconds and convert them to this internal form via
+/// [`OtelConfig::timestamp_jitter_config`].
+///
+/// Validation of user-provided ranges happens in [`OtelConfig::validate`]:
+/// `record_across_batch_timestamp_jitter_ms` must be in `0..=3_600_000`,
+/// `record_intra_batch_timestamp_jitter_ns` must be in `0..=60_000_000_000`, and
+/// `record_intra_batch_overlap_probability` must be in `0.0..=1.0`.
+#[derive(Debug, Clone, Copy)]
+pub struct TimestampJitterConfig {
+    /// Maximum backward shift, in nanoseconds, applied to the whole generated batch.
+    ///
+    /// Each batch is anchored at `now - offset`, where `offset` is sampled uniformly from
+    /// `0..across_batch_timestamp_jitter_ns`. This keeps generated timestamps out of the future
+    /// while allowing batches to look slightly delayed as a group.
+    pub across_batch_timestamp_jitter_ns: i64,
+    /// Maximum local spacing step, in nanoseconds, between neighbouring records in one batch.
+    ///
+    /// When this value is `0`, records inside one batch collapse to the same timestamp before any
+    /// overlap logic is applied. When it is positive, each record advances the monotonic base plan
+    /// by a random step from `0..intra_batch_timestamp_jitter_ns`.
+    pub intra_batch_timestamp_jitter_ns: i64,
+    /// Probability of forcing a local timestamp overlap between neighbouring records.
+    ///
+    /// `0.0` preserves the monotonic base plan, so aggregated timestamps do not decrease.
+    /// Values above `0.0` occasionally move the emitted timestamp of a record backwards relative
+    /// to its predecessor while still keeping the whole batch anchored by
+    /// [`Self::across_batch_timestamp_jitter_ns`].
+    pub intra_batch_overlap_probability: f32,
+}
+
+impl Default for TimestampJitterConfig {
+    fn default() -> Self {
+        Self {
+            across_batch_timestamp_jitter_ns: 1_000_000_000,
+            intra_batch_timestamp_jitter_ns: 5_000_000,
+            intra_batch_overlap_probability: 0.05,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     pub ingest_endpoint: String,
@@ -105,6 +149,7 @@ pub struct OtelConfig {
     pub invalid_record_percent: f32,
     pub records_per_message: usize,
     pub print_logs: bool,
+    pub dry_run: bool,
     pub count: usize,
     pub message_interval_ms: u64,
     pub concurrency: usize,
@@ -119,6 +164,9 @@ pub struct OtelConfig {
     pub label_cardinality_enabled: bool,
     pub label_cardinality_default_limit: Option<usize>,
     pub label_cardinality_limits: String,
+    pub record_across_batch_timestamp_jitter_ms: u64,
+    pub record_intra_batch_timestamp_jitter_ns: u64,
+    pub record_intra_batch_overlap_probability: f32,
 }
 
 impl OtelConfig {
@@ -141,11 +189,19 @@ impl OtelConfig {
             ));
         }
 
-        if self.transport != "http" && self.transport != "grpc" {
-            return Err(GeneratorError::InvalidTransport(format!(
-                "Invalid transport '{}', must be 'http' or 'grpc'",
-                self.transport
-            )));
+        if !self.dry_run {
+            if self.ingest_endpoint.trim().is_empty() {
+                return Err(GeneratorError::InvalidConfiguration(
+                    "ingest_endpoint must not be empty (unless --dry-run)".to_string(),
+                ));
+            }
+
+            if self.transport != "http" && self.transport != "grpc" {
+                return Err(GeneratorError::InvalidTransport(format!(
+                    "Invalid transport '{}', must be 'http' or 'grpc'",
+                    self.transport
+                )));
+            }
         }
 
         if self.retry_max_retries > MAX_RETRIES_UPPER_BOUND {
@@ -167,24 +223,6 @@ impl OtelConfig {
             ));
         }
 
-        if self.tenant_count < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "tenant_count must be >= 1".to_string(),
-            ));
-        }
-
-        if self.cloud_account_count_per_tenant < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "cloud_account_count_per_tenant must be >= 1".to_string(),
-            ));
-        }
-
-        if self.service_count_per_tenant < 1 {
-            return Err(GeneratorError::InvalidConfiguration(
-                "service_count_per_tenant must be >= 1".to_string(),
-            ));
-        }
-
         if self.tenant_count == 1 {
             validate_tenant_id(&self.tenant_id)?;
         }
@@ -199,7 +237,39 @@ impl OtelConfig {
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
 
+        if self.record_across_batch_timestamp_jitter_ms > 3_600_000 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_across_batch_timestamp_jitter_ms must be <= 3600000 (1 hour)".to_string(),
+            ));
+        }
+
+        if self.record_intra_batch_timestamp_jitter_ns > 60_000_000_000 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_intra_batch_timestamp_jitter_ns must be <= 60000000000 (1 minute)".to_string(),
+            ));
+        }
+
+        if !(0.0f32..=1.0f32).contains(&self.record_intra_batch_overlap_probability) {
+            return Err(GeneratorError::InvalidConfiguration(
+                "record_intra_batch_overlap_probability must be between 0.0 and 1.0".to_string(),
+            ));
+        }
+
         Ok(())
+    }
+
+    /// Convert CLI-facing jitter settings into generator-facing nanoseconds.
+    ///
+    /// This method does not perform validation on its own and expects [`Self::validate`] to be
+    /// called first. The returned config is consumed by
+    /// [`crate::message::OTLPLogMessageGenerator::new`].
+    pub fn timestamp_jitter_config(&self) -> TimestampJitterConfig {
+        TimestampJitterConfig {
+            across_batch_timestamp_jitter_ns: self.record_across_batch_timestamp_jitter_ms as i64
+                * 1_000_000,
+            intra_batch_timestamp_jitter_ns: self.record_intra_batch_timestamp_jitter_ns as i64,
+            intra_batch_overlap_probability: self.record_intra_batch_overlap_probability,
+        }
     }
 
     pub fn retry_config(&self) -> Result<RetryConfig> {
@@ -349,6 +419,7 @@ mod tests {
             invalid_record_percent: 0.0,
             records_per_message: 1,
             print_logs: false,
+            dry_run: false,
             count: 1,
             message_interval_ms: 0,
             concurrency: 1,
@@ -363,7 +434,18 @@ mod tests {
             label_cardinality_enabled: true,
             label_cardinality_default_limit: None,
             label_cardinality_limits: String::new(),
+            record_across_batch_timestamp_jitter_ms: 1_000,
+            record_intra_batch_timestamp_jitter_ns: 5,
+            record_intra_batch_overlap_probability: 0.05,
         }
+    }
+
+    #[test]
+    fn validate_allows_missing_endpoint_with_dry_run() {
+        let mut cfg = base_config();
+        cfg.ingest_endpoint = String::new();
+        cfg.dry_run = true;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -412,21 +494,29 @@ mod tests {
     fn test_tenant_count_validation() {
         let mut cfg = base_config();
         cfg.tenant_count = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_cloud_account_count_per_tenant_validation() {
         let mut cfg = base_config();
         cfg.cloud_account_count_per_tenant = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_service_count_per_tenant_validation() {
         let mut cfg = base_config();
         cfg.service_count_per_tenant = 0;
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_tenant_count_ignores_invalid_tenant_id() {
+        let mut cfg = base_config();
+        cfg.tenant_count = 0;
+        cfg.tenant_id = "invalid tenant id!".to_string();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -444,6 +534,35 @@ mod tests {
         let mut cfg = base_config();
         cfg.tenant_count = 3;
         cfg.tenant_id = "tenant with spaces".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_intra_batch_jitter_validation() {
+        let mut cfg = base_config();
+        cfg.record_intra_batch_timestamp_jitter_ns = 60_000_000_001;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_timestamp_jitter_ns = 60_000_000_000;
+        assert!(cfg.validate().is_ok());
+
+        cfg.record_intra_batch_timestamp_jitter_ns = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_overlap_probability_validation() {
+        let mut cfg = base_config();
+        cfg.record_intra_batch_overlap_probability = -0.1;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_overlap_probability = 1.1;
+        assert!(cfg.validate().is_err());
+
+        cfg.record_intra_batch_overlap_probability = 0.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.record_intra_batch_overlap_probability = 1.0;
         assert!(cfg.validate().is_ok());
     }
 }

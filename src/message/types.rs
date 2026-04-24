@@ -17,7 +17,7 @@ pub enum MessagePayload {
 #[derive(Debug, Clone)]
 pub struct OTLPLogMessage {
     pub message: MessagePayload,
-    pub tenant_id: String,
+    pub tenant_id: Option<String>,
     pub project_id: String,
     pub source: String,
     pub message_type: OTLPLogMessageType,
@@ -26,7 +26,7 @@ pub struct OTLPLogMessage {
 impl OTLPLogMessage {
     pub fn new(
         message: MessagePayload,
-        tenant_id: String,
+        tenant_id: Option<String>,
         project_id: String,
         source: String,
         message_type: OTLPLogMessageType,
@@ -41,6 +41,7 @@ impl OTLPLogMessage {
     }
 
     pub fn payload_size_bytes(&self) -> usize {
+        // Protobuf is usually 10-30% smaller than JSON for the same data. The main savings are the lack of keys ("severity_text": → field tag 1 byte) and more compact numbers (varint).
         match &self.message {
             MessagePayload::Json(json) => serde_json::to_vec(json).map(|v| v.len()).unwrap_or(0),
             MessagePayload::Protobuf(bytes) => bytes.len(),

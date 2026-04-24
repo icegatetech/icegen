@@ -1,4 +1,4 @@
-use crate::config::LabelCardinalityConfig;
+use crate::config::{LabelCardinalityConfig, TimestampJitterConfig};
 use crate::error::{GeneratorError, Result};
 use crate::message::fake_data::FakeDataGenerator;
 use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
@@ -7,24 +7,35 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::{json, Value};
 
+const DEFAULT_SERVICE_NAME: &str = "icegen";
+
 #[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
     source: String,
     label_cardinality: LabelCardinalityConfig,
+    jitter: TimestampJitterConfig,
 }
 
 impl OTLPLogMessageGenerator {
-    pub fn new(source: String) -> Self {
-        Self {
-            source,
-            label_cardinality: LabelCardinalityConfig::default(),
-        }
-    }
-
-    pub fn new_with_cardinality(source: String, label_cardinality: LabelCardinalityConfig) -> Self {
+    /// Create a generator with explicit cardinality and timestamp jitter settings.
+    ///
+    /// `jitter.across_batch_timestamp_jitter_ns` shifts the whole batch backwards in time,
+    /// while `jitter.intra_batch_timestamp_jitter_ns` controls spacing between neighbouring
+    /// records inside that batch. `jitter.intra_batch_overlap_probability` controls how often
+    /// the emitted timestamp for a record is moved backwards relative to the previous record.
+    ///
+    /// The generator expects jitter values in nanoseconds. When configuration comes from
+    /// [`crate::config::OtelConfig`], use [`crate::config::OtelConfig::timestamp_jitter_config`]
+    /// so CLI millisecond values are converted consistently.
+    pub fn new(
+        source: String,
+        label_cardinality: LabelCardinalityConfig,
+        jitter: TimestampJitterConfig,
+    ) -> Self {
         Self {
             source,
             label_cardinality,
+            jitter,
         }
     }
 
@@ -45,51 +56,52 @@ impl OTLPLogMessageGenerator {
     fn generate_resource_attributes_pairs(
         &self,
         project_id: &str,
-        cloud_account_id: &str,
-        service_name: &str,
+        cloud_account_id: Option<&str>,
+        service_name: Option<&str>,
     ) -> Vec<(String, String)> {
-        let attributes = vec![
-            ("project_id".to_string(), project_id.to_string()),
-            ("cloud.account.id".to_string(), cloud_account_id.to_string()),
-            ("service.name".to_string(), service_name.to_string()),
-            (
-                "service.version".to_string(),
-                FakeDataGenerator::generate_service_version(),
-            ),
-            (
-                "deployment.environment".to_string(),
-                FakeDataGenerator::generate_deployment_environment(),
-            ),
-            (
-                "host.name".to_string(),
-                FakeDataGenerator::generate_host_name(),
-            ),
-            (
-                "k8s.pod.name".to_string(),
-                FakeDataGenerator::generate_k8s_pod_name(),
-            ),
-            (
-                "k8s.namespace.name".to_string(),
-                FakeDataGenerator::generate_k8s_namespace(),
-            ),
-            ("generator.source".to_string(), self.source.clone()),
-        ];
+        let mut attributes = vec![("project_id".to_string(), project_id.to_string())];
+        if let Some(acc) = cloud_account_id {
+            attributes.push(("cloud.account.id".to_string(), acc.to_string()));
+        }
+        if let Some(svc) = service_name {
+            attributes.push(("service.name".to_string(), svc.to_string()));
+        }
+        attributes.push((
+            "service.version".to_string(),
+            FakeDataGenerator::generate_service_version(),
+        ));
+        attributes.push((
+            "deployment.environment".to_string(),
+            FakeDataGenerator::generate_deployment_environment(),
+        ));
+        attributes.push((
+            "host.name".to_string(),
+            FakeDataGenerator::generate_host_name(),
+        ));
+        attributes.push((
+            "k8s.pod.name".to_string(),
+            FakeDataGenerator::generate_k8s_pod_name(),
+        ));
+        attributes.push((
+            "k8s.namespace.name".to_string(),
+            FakeDataGenerator::generate_k8s_namespace(),
+        ));
+        attributes.push(("generator.source".to_string(), self.source.clone()));
 
         self.normalize_attribute_pairs(attributes)
     }
 
-    fn generate_scope_attributes_pairs(&self, service_name: &str) -> Vec<(String, String)> {
+    fn generate_scope_attributes_pairs(&self, service_name: Option<&str>) -> Vec<(String, String)> {
         let mut rng = rand::thread_rng();
-        vec![
-            (
-                "library.name".to_string(),
-                format!("trihub-{}", service_name),
-            ),
-            (
-                "library.version".to_string(),
-                format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-            ),
-        ]
+        let mut attrs = Vec::new();
+        if let Some(svc) = service_name {
+            attrs.push(("library.name".to_string(), format!("trihub-{}", svc)));
+        }
+        attrs.push((
+            "library.version".to_string(),
+            format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
+        ));
+        attrs
     }
 
     fn generate_log_attributes_pairs(
@@ -152,7 +164,7 @@ impl OTLPLogMessageGenerator {
         format!("bucket_{index:0width$}")
     }
 
-    fn generate_log_body(severity_text: &str, service_name: &str) -> String {
+    fn generate_log_body(severity_text: &str, service_name: Option<&str>) -> String {
         let mut rng = rand::thread_rng();
 
         let bodies = match severity_text {
@@ -173,7 +185,10 @@ impl OTLPLogMessageGenerator {
                     "Cache hit for key {}",
                     &FakeDataGenerator::generate_uuid()[..8]
                 ),
-                format!("Health check passed for service {}", service_name),
+                format!(
+                    "Health check passed for service {}",
+                    service_name.unwrap_or(DEFAULT_SERVICE_NAME)
+                ),
             ],
             "WARN" => vec![
                 format!("High memory usage detected: {}%", rng.gen_range(70..96)),
@@ -222,22 +237,52 @@ impl OTLPLogMessageGenerator {
         bodies.choose(&mut rng).unwrap().clone()
     }
 
-    /// Returns a per-record timestamp jittered uniformly across the past
-    /// `TIMESTAMP_JITTER_NS` window. Without jitter, every record produced in
-    /// the same batch (or burst) shares the same wall-clock nanosecond, which
-    /// makes downstream data appear clustered into specific seconds. Spreading
-    /// each record across the previous second produces a near-uniform
-    /// distribution over time.
-    fn jittered_timestamp_ns() -> i64 {
-        const TIMESTAMP_JITTER_NS: i64 = 1_000_000_000; // 1 second
+    fn batch_timestamps_ns(&self, num_records: usize) -> Vec<i64> {
+        if num_records == 0 {
+            return vec![];
+        }
+
         let mut rng = rand::thread_rng();
         let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        now - rng.gen_range(0..TIMESTAMP_JITTER_NS)
+
+        let batch_offset_ns = if self.jitter.across_batch_timestamp_jitter_ns > 0 {
+            rng.gen_range(0..self.jitter.across_batch_timestamp_jitter_ns)
+        } else {
+            0
+        };
+
+        let intra = self.jitter.intra_batch_timestamp_jitter_ns;
+        let overlap_prob = self.jitter.intra_batch_overlap_probability;
+
+        let mut result: Vec<i64> = Vec::with_capacity(num_records);
+        let mut total_span_ns: i64 = 0;
+        for _ in 0..num_records {
+            let step = if intra > 0 {
+                rng.gen_range(0..intra)
+            } else {
+                0
+            };
+            total_span_ns += step;
+            result.push(step);
+        }
+
+        let mut prev_ns = now - batch_offset_ns - total_span_ns;
+        for i in 0..num_records {
+            let step = result[i];
+            let candidate = prev_ns + step;
+            result[i] = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
+                prev_ns - rng.gen_range(0..intra)
+            } else {
+                candidate
+            };
+            prev_ns = candidate;
+        }
+
+        result
     }
 
-    fn generate_single_log_record(&self, service_name: &str) -> Value {
+    fn generate_single_log_record(&self, service_name: Option<&str>, timestamp_ns: i64) -> Value {
         let mut rng = rand::thread_rng();
-        let timestamp_ns = Self::jittered_timestamp_ns();
 
         let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
         let body = Self::generate_log_body(&severity_text, service_name);
@@ -266,8 +311,8 @@ impl OTLPLogMessageGenerator {
     fn wrap_log_records_in_otlp(
         &self,
         project_id: &str,
-        cloud_account_id: &str,
-        service_name: &str,
+        cloud_account_id: Option<&str>,
+        service_name: Option<&str>,
         log_records: Vec<Value>,
     ) -> Value {
         let mut rng = rand::thread_rng();
@@ -275,6 +320,7 @@ impl OTLPLogMessageGenerator {
         let resource_attributes =
             self.generate_resource_attributes_pairs(project_id, cloud_account_id, service_name);
         let scope_attributes = self.generate_scope_attributes_pairs(service_name);
+        let scope_name_src = service_name.unwrap_or(DEFAULT_SERVICE_NAME);
 
         json!({
             "resource": {
@@ -283,7 +329,7 @@ impl OTLPLogMessageGenerator {
             },
             "scopeLogs": [{
                 "scope": {
-                    "name": format!("io.trihub.{}", service_name.replace('-', ".")),
+                    "name": format!("io.trihub.{}", scope_name_src.replace('-', ".")),
                     "version": format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
                     "attributes": Self::attributes_pairs_to_dict_list(&scope_attributes),
                     "droppedAttributesCount": rng.gen_range(0..3)
@@ -298,7 +344,7 @@ impl OTLPLogMessageGenerator {
     fn build_message(
         &self,
         message: MessagePayload,
-        tenant_id: String,
+        tenant_id: Option<String>,
         project_id: String,
         message_type: OTLPLogMessageType,
     ) -> OTLPLogMessage {
@@ -311,28 +357,34 @@ impl OTLPLogMessageGenerator {
         )
     }
 
+    /// Generate a single-record OTLP JSON payload.
+    ///
+    /// The record timestamp is generated with the configured batch-level jitter and is never set
+    /// in the future. Because the payload contains one record, intra-batch spacing and overlap
+    /// settings have no observable effect here.
     pub fn generate_valid_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
     ) -> Result<OTLPLogMessage> {
         self.build_valid_message(tenant_id, cloud_account_id, service_name)
     }
 
     fn build_valid_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
     ) -> Result<OTLPLogMessage> {
         let project_id = FakeDataGenerator::generate_project_id();
 
-        let log_record = self.generate_single_log_record(&service_name);
+        let ts = self.batch_timestamps_ns(1)[0];
+        let log_record = self.generate_single_log_record(service_name.as_deref(), ts);
         let resource_log = self.wrap_log_records_in_otlp(
             &project_id,
-            &cloud_account_id,
-            &service_name,
+            cloud_account_id.as_deref(),
+            service_name.as_deref(),
             vec![log_record],
         );
 
@@ -348,11 +400,18 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
+    /// Generate a multi-record OTLP JSON payload.
+    ///
+    /// The whole batch is shifted backwards by `across_batch_timestamp_jitter_ns`, then record
+    /// timestamps are planned using `intra_batch_timestamp_jitter_ns`. With
+    /// `intra_batch_overlap_probability == 0.0`, emitted timestamps do not decrease. With
+    /// `intra_batch_timestamp_jitter_ns == 0`, all records in the batch collapse to the same
+    /// timestamp.
     pub fn generate_aggregated_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         if num_records == 1 {
@@ -367,14 +426,16 @@ impl OTLPLogMessageGenerator {
 
         let project_id = FakeDataGenerator::generate_project_id();
 
-        let log_records: Vec<Value> = (0..num_records)
-            .map(|_| self.generate_single_log_record(&service_name))
+        let ts_list = self.batch_timestamps_ns(num_records);
+        let log_records: Vec<Value> = ts_list
+            .into_iter()
+            .map(|ts| self.generate_single_log_record(service_name.as_deref(), ts))
             .collect();
 
         let resource_log = self.wrap_log_records_in_otlp(
             &project_id,
-            &cloud_account_id,
-            &service_name,
+            cloud_account_id.as_deref(),
+            service_name.as_deref(),
             log_records,
         );
 
@@ -390,7 +451,7 @@ impl OTLPLogMessageGenerator {
         ))
     }
 
-    pub fn generate_invalid_message(&self, tenant_id: String) -> Result<OTLPLogMessage> {
+    pub fn generate_invalid_message(&self, tenant_id: Option<String>) -> Result<OTLPLogMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
 
@@ -462,11 +523,16 @@ impl OTLPLogMessageGenerator {
         }
     }
 
+    /// Generate a protobuf OTLP payload with `num_records` log records.
+    ///
+    /// Timestamp planning matches [`Self::generate_aggregated_message`], but the final payload is
+    /// serialized as protobuf and negative intermediate values are clamped to `0` before writing
+    /// them into unsigned OTLP fields.
     pub fn generate_protobuf_message(
         &self,
-        tenant_id: String,
-        cloud_account_id: String,
-        service_name: String,
+        tenant_id: Option<String>,
+        cloud_account_id: Option<String>,
+        service_name: Option<String>,
         num_records: usize,
     ) -> Result<OTLPLogMessage> {
         use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
@@ -485,13 +551,17 @@ impl OTLPLogMessageGenerator {
 
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
+        let svc = service_name.as_deref();
+
+        let ts_list = self.batch_timestamps_ns(num_records);
 
         // Generate log records
-        let log_records: Vec<LogRecord> = (0..num_records)
-            .map(|_| {
-                let timestamp_ns = Self::jittered_timestamp_ns().max(0) as u64;
+        let log_records: Vec<LogRecord> = ts_list
+            .iter()
+            .map(|&ts_i64| {
+                let timestamp_ns = ts_i64.max(0) as u64;
                 let (severity_number, severity_text) = FakeDataGenerator::generate_severity();
-                let body = Self::generate_log_body(&severity_text, &service_name);
+                let body = Self::generate_log_body(&severity_text, svc);
                 let trace_id = FakeDataGenerator::generate_trace_id();
                 let span_id = FakeDataGenerator::generate_span_id();
                 let request_id = FakeDataGenerator::generate_uuid();
@@ -527,7 +597,7 @@ impl OTLPLogMessageGenerator {
 
         // Resource attributes
         let resource_attributes_pairs =
-            self.generate_resource_attributes_pairs(&project_id, &cloud_account_id, &service_name);
+            self.generate_resource_attributes_pairs(&project_id, cloud_account_id.as_deref(), svc);
         let resource_attributes: Vec<KeyValue> = resource_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -539,7 +609,7 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         // Scope attributes
-        let scope_attributes_pairs = self.generate_scope_attributes_pairs(&service_name);
+        let scope_attributes_pairs = self.generate_scope_attributes_pairs(svc);
         let scope_attributes: Vec<KeyValue> = scope_attributes_pairs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -555,8 +625,9 @@ impl OTLPLogMessageGenerator {
             dropped_attributes_count: rng.gen_range(0..4),
         };
 
+        let scope_name_src = svc.unwrap_or(DEFAULT_SERVICE_NAME);
         let scope = InstrumentationScope {
-            name: format!("io.trihub.{}", service_name.replace('-', ".")),
+            name: format!("io.trihub.{}", scope_name_src.replace('-', ".")),
             version: format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
             attributes: scope_attributes,
             dropped_attributes_count: rng.gen_range(0..3),
@@ -624,4 +695,155 @@ fn num_digits(mut number: usize) -> usize {
         digits += 1;
     }
     digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TimestampJitterConfig;
+    use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+    use chrono::Utc;
+    use prost::Message;
+
+    fn gen_with_jitter(
+        batch_jitter_ns: i64,
+        intra_batch_jitter_ns: i64,
+        intra_batch_overlap_probability: f32,
+    ) -> OTLPLogMessageGenerator {
+        OTLPLogMessageGenerator::new(
+            "test".to_string(),
+            LabelCardinalityConfig::default(),
+            TimestampJitterConfig {
+                across_batch_timestamp_jitter_ns: batch_jitter_ns,
+                intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
+                intra_batch_overlap_probability,
+            },
+        )
+    }
+
+    fn json_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+        let MessagePayload::Json(json) = message.message else {
+            panic!("Expected JSON payload");
+        };
+
+        json["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                record["timeUnixNano"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn protobuf_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+        let MessagePayload::Protobuf(bytes) = message.message else {
+            panic!("Expected protobuf payload");
+        };
+
+        ExportLogsServiceRequest::decode(bytes.as_slice())
+            .unwrap()
+            .resource_logs
+            .into_iter()
+            .flat_map(|resource_logs| resource_logs.scope_logs.into_iter())
+            .flat_map(|scope_logs| scope_logs.log_records.into_iter())
+            .map(|record| i64::try_from(record.time_unix_nano).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn generate_valid_message_keeps_single_timestamp_within_batch_window() {
+        let batch_jitter_ns = 2_000_000_000_i64;
+        let gen = gen_with_jitter(batch_jitter_ns, 5_000_000, 0.25);
+        let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamps = json_timestamps(
+            gen.generate_valid_message(None, None, Some("svc".to_string()))
+                .unwrap(),
+        );
+        let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        assert_eq!(timestamps.len(), 1);
+        let ts = timestamps[0];
+        assert!(
+            ts <= now_after,
+            "timestamp in future: {} > {}",
+            ts,
+            now_after
+        );
+        assert!(
+            ts >= now_before - batch_jitter_ns,
+            "timestamp too old: {} < {}",
+            ts,
+            now_before - batch_jitter_ns
+        );
+    }
+
+    #[test]
+    fn generate_aggregated_message_is_non_decreasing_when_overlap_disabled() {
+        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let ts = json_timestamps(
+            gen.generate_aggregated_message(None, None, None, 50)
+                .unwrap(),
+        );
+        for i in 1..ts.len() {
+            assert!(
+                ts[i - 1] <= ts[i],
+                "non-monotonic at i={}: {} > {}",
+                i,
+                ts[i - 1],
+                ts[i]
+            );
+        }
+    }
+
+    #[test]
+    fn generate_aggregated_message_collapses_timestamps_when_intra_jitter_zero() {
+        let gen = gen_with_jitter(0, 0, 0.0);
+        let ts = json_timestamps(
+            gen.generate_aggregated_message(None, None, None, 10)
+                .unwrap(),
+        );
+        assert!(
+            ts.windows(2).all(|w| w[0] == w[1]),
+            "all timestamps should be equal when intra_jitter=0 and batch_jitter=0"
+        );
+    }
+
+    #[test]
+    fn generate_protobuf_message_keeps_timestamps_within_batch_window() {
+        let batch_jitter_ns = 1_000_000_000_i64;
+        let gen = gen_with_jitter(batch_jitter_ns, 0, 0.0);
+        let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 5).unwrap());
+        let now_after = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        for &t in &ts {
+            assert!(t <= now_after, "timestamp in future: {} > {}", t, now_after);
+            assert!(
+                t >= now_before - batch_jitter_ns,
+                "timestamp too old: {} < {}",
+                t,
+                now_before - batch_jitter_ns
+            );
+        }
+    }
+
+    #[test]
+    fn generate_protobuf_message_is_non_decreasing_when_overlap_disabled() {
+        let gen = gen_with_jitter(1_000_000_000, 5_000_000, 0.0);
+        let ts = protobuf_timestamps(gen.generate_protobuf_message(None, None, None, 50).unwrap());
+        for i in 1..ts.len() {
+            assert!(
+                ts[i - 1] <= ts[i],
+                "non-monotonic at i={}: {} > {}",
+                i,
+                ts[i - 1],
+                ts[i]
+            );
+        }
+    }
 }
