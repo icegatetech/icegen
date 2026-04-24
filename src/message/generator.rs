@@ -17,18 +17,6 @@ pub struct OTLPLogMessageGenerator {
 }
 
 impl OTLPLogMessageGenerator {
-    pub fn new(source: String) -> Self {
-        Self {
-            source,
-            label_cardinality: LabelCardinalityConfig::default(),
-            jitter: TimestampJitterConfig {
-                across_batch_timestamp_jitter_ns: 1_000_000_000,
-                intra_batch_timestamp_jitter_ns: 5_000_000,
-                intra_batch_overlap_probability: 0.05,
-            },
-        }
-    }
-
     /// Create a generator with explicit cardinality and timestamp jitter settings.
     ///
     /// `jitter.across_batch_timestamp_jitter_ns` shifts the whole batch backwards in time,
@@ -39,7 +27,7 @@ impl OTLPLogMessageGenerator {
     /// The generator expects jitter values in nanoseconds. When configuration comes from
     /// [`crate::config::OtelConfig`], use [`crate::config::OtelConfig::timestamp_jitter_config`]
     /// so CLI millisecond values are converted consistently.
-    pub fn new_with_cardinality(
+    pub fn new(
         source: String,
         label_cardinality: LabelCardinalityConfig,
         jitter: TimestampJitterConfig,
@@ -722,7 +710,7 @@ mod tests {
         intra_batch_jitter_ns: i64,
         intra_batch_overlap_probability: f32,
     ) -> OTLPLogMessageGenerator {
-        OTLPLogMessageGenerator::new_with_cardinality(
+        OTLPLogMessageGenerator::new(
             "test".to_string(),
             LabelCardinalityConfig::default(),
             TimestampJitterConfig {

@@ -10,7 +10,11 @@ use prost::Message;
 
 #[test]
 fn test_generate_valid_message() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let result = generator.generate_valid_message(
         Some("tenant1".to_string()),
         Some("tenant1-acc-01".to_string()),
@@ -33,7 +37,11 @@ fn test_generate_valid_message() {
 
 #[test]
 fn test_generate_aggregated_message() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let result = generator.generate_aggregated_message(
         Some("tenant3".to_string()),
         Some("tenant3-acc-02".to_string()),
@@ -64,7 +72,11 @@ fn test_generate_aggregated_message() {
 
 #[test]
 fn test_json_payload_contains_tenant_aware_resource_attributes() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let message = generator
         .generate_valid_message(
             Some("tenant3".to_string()),
@@ -97,7 +109,11 @@ fn test_json_payload_contains_tenant_aware_resource_attributes() {
 
 #[test]
 fn test_generate_invalid_message() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let result = generator.generate_invalid_message(Some("tenant1".to_string()));
 
     assert!(result.is_ok());
@@ -113,7 +129,11 @@ fn test_generate_invalid_message() {
 
 #[test]
 fn test_generate_protobuf_message() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let result = generator.generate_protobuf_message(
         Some("tenant2".to_string()),
         Some("tenant2-acc-04".to_string()),
@@ -136,7 +156,11 @@ fn test_generate_protobuf_message() {
 
 #[test]
 fn test_protobuf_payload_contains_tenant_aware_resource_attributes() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let message = generator
         .generate_protobuf_message(
             Some("tenant2".to_string()),
@@ -179,7 +203,11 @@ fn test_protobuf_payload_contains_tenant_aware_resource_attributes() {
 
 #[test]
 fn test_public_generation_methods_return_some_tenant_id() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
 
     let valid = generator
         .generate_valid_message(
@@ -240,7 +268,7 @@ fn test_cardinality_limit_applies_to_resource_and_log_attributes() {
     limits.insert("k8s.pod.name".to_string(), 3);
     limits.insert("request.id".to_string(), 5);
 
-    let generator = OTLPLogMessageGenerator::new_with_cardinality(
+    let generator = OTLPLogMessageGenerator::new(
         "test-source".to_string(),
         LabelCardinalityConfig {
             enabled: true,
@@ -338,7 +366,7 @@ fn test_cardinality_disabled_keeps_original_values() {
     let mut limits = HashMap::new();
     limits.insert("request.id".to_string(), 1);
 
-    let generator = OTLPLogMessageGenerator::new_with_cardinality(
+    let generator = OTLPLogMessageGenerator::new(
         "test-source".to_string(),
         LabelCardinalityConfig {
             enabled: false,
@@ -398,7 +426,11 @@ fn test_cardinality_disabled_keeps_original_values() {
 
 #[test]
 fn test_protobuf_omits_service_name_and_cloud_account_when_none() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let message = generator
         .generate_protobuf_message(None, None, None, 2)
         .unwrap();
@@ -425,7 +457,11 @@ fn test_protobuf_omits_service_name_and_cloud_account_when_none() {
 
 #[test]
 fn test_protobuf_scope_name_and_attrs_when_service_omitted() {
-    let generator = OTLPLogMessageGenerator::new("test-source".to_string());
+    let generator = OTLPLogMessageGenerator::new(
+        "test-source".to_string(),
+        LabelCardinalityConfig::default(),
+        TimestampJitterConfig::default(),
+    );
     let message = generator
         .generate_protobuf_message(None, None, None, 2)
         .unwrap();

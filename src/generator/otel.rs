@@ -355,7 +355,7 @@ impl OtelLogGenerator {
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
         let cardinality_config = config.label_cardinality_config()?;
-        let message_generator = OTLPLogMessageGenerator::new_with_cardinality(
+        let message_generator = OTLPLogMessageGenerator::new(
             "rust-generator".to_string(),
             cardinality_config,
             config.timestamp_jitter_config(),

@@ -130,6 +130,16 @@ pub struct TimestampJitterConfig {
     pub intra_batch_overlap_probability: f32,
 }
 
+impl Default for TimestampJitterConfig {
+    fn default() -> Self {
+        Self {
+            across_batch_timestamp_jitter_ns: 1_000_000_000,
+            intra_batch_timestamp_jitter_ns: 5_000_000,
+            intra_batch_overlap_probability: 0.05,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
     pub ingest_endpoint: String,
@@ -252,7 +262,7 @@ impl OtelConfig {
     ///
     /// This method does not perform validation on its own and expects [`Self::validate`] to be
     /// called first. The returned config is consumed by
-    /// [`crate::message::OTLPLogMessageGenerator::new_with_cardinality`].
+    /// [`crate::message::OTLPLogMessageGenerator::new`].
     pub fn timestamp_jitter_config(&self) -> TimestampJitterConfig {
         TimestampJitterConfig {
             across_batch_timestamp_jitter_ns: self.record_across_batch_timestamp_jitter_ms as i64
