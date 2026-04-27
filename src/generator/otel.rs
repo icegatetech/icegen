@@ -294,7 +294,7 @@ impl OtelLogGenerator {
             println!("  Use Protobuf: {}", config.use_protobuf);
         }
         println!("  Records per message: {}", config.records_per_message);
-        println!("  Services per message: {}", config.services_per_message);
+        println!("  Services per message: {}", config.service_shards_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
         println!("  Concurrency: {}", config.concurrency);
         if config.tenant_count == 0 {
@@ -569,7 +569,7 @@ impl LogGenerator for OtelLogGenerator {
         let tenant_id = tenant_profile.tenant_id.clone();
         let cloud_account_id = tenant_profile.select_cloud_account_id();
         let shards = tenant_profile.select_service_shards(
-            self.config.services_per_message,
+            self.config.service_shards_per_message,
             self.config.records_per_message,
         );
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
@@ -856,7 +856,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
-            services_per_message: 1,
+            service_shards_per_message: 1,
         }
     }
 
@@ -935,7 +935,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
-            services_per_message: 1,
+            service_shards_per_message: 1,
         };
 
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
@@ -1430,12 +1430,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_message_with_services_per_message_emits_one_resource_logs_per_shard_json() {
+    fn generate_message_with_service_shards_per_message_emits_one_resource_logs_per_shard_json() {
         // End-to-end through OtelLogGenerator::generate_message: select_service_shards
         // distributes records across shards, JsonEncoder emits one ResourceLogs per shard.
         let mut config = test_config(1, 0, 1);
         config.records_per_message = 9;
-        config.services_per_message = 3;
+        config.service_shards_per_message = 3;
         config.service_count_per_tenant = 3;
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let pool: Vec<String> = generator.tenant_profiles[0]
@@ -1463,7 +1463,7 @@ mod tests {
         let mut config = test_config(1, 0, 1);
         config.use_protobuf = true;
         config.records_per_message = 8;
-        config.services_per_message = 2;
+        config.service_shards_per_message = 2;
         config.service_count_per_tenant = 2;
         // Disable overlap so monotonicity is a hard invariant.
         config.record_intra_batch_overlap_probability = 0.0;
@@ -1523,12 +1523,12 @@ mod tests {
 
     #[test]
     fn generate_message_without_service_pool_emits_single_shard_without_service_name() {
-        // Covers the None branch of select_service_shards: with no pool, services_per_message is
+        // Covers the None branch of select_service_shards: with no pool, service_shards_per_message is
         // ignored and we get exactly one shard with no service.name attribute, regardless of the
         // requested fan-out.
         let mut config = test_config(1, 0, 1);
         config.records_per_message = 5;
-        config.services_per_message = 5;
+        config.service_shards_per_message = 5;
         config.service_count_per_tenant = 0;
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 

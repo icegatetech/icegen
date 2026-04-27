@@ -36,11 +36,23 @@ impl FakeDataGenerator {
         &["production", "staging", "development"];
 
     pub fn generate_trace_id() -> [u8; 16] {
-        rand::thread_rng().gen::<[u8; 16]>()
+        let mut rng = rand::thread_rng();
+        loop {
+            let id = rng.gen::<[u8; 16]>();
+            if id != [0u8; 16] {
+                return id;
+            }
+        }
     }
 
     pub fn generate_span_id() -> [u8; 8] {
-        rand::thread_rng().gen::<[u8; 8]>()
+        let mut rng = rand::thread_rng();
+        loop {
+            let id = rng.gen::<[u8; 8]>();
+            if id != [0u8; 8] {
+                return id;
+            }
+        }
     }
 
     pub fn generate_project_id() -> String {

@@ -58,7 +58,7 @@ fn encode_shard_json(shard: &PlannedShard) -> Value {
 }
 
 fn encode_record_json(record: &PlannedRecord) -> Value {
-    let ts = record.timestamp_ns.to_string();
+    let ts = record.timestamp_ns.max(0).to_string();
     json!({
         "timeUnixNano": ts,
         "observedTimeUnixNano": ts,

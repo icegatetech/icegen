@@ -168,7 +168,7 @@ pub struct OtelConfig {
     pub record_across_batch_timestamp_jitter_ms: u64,
     pub record_intra_batch_timestamp_jitter_ns: u64,
     pub record_intra_batch_overlap_probability: f32,
-    pub services_per_message: usize,
+    pub service_shards_per_message: usize,
 }
 
 impl OtelConfig {
@@ -259,13 +259,13 @@ impl OtelConfig {
             ));
         }
 
-        // When services_per_message > service_count_per_tenant, service names are picked with
+        // When service_shards_per_message > service_count_per_tenant, service names are picked with
         // replacement from the pool, producing duplicate names across shards. This is intentional:
         // it simulates multiple pods running the same service. No error is raised; select_service_shards
         // normalises the count to min(requested, records_per_message) >= 1.
-        if self.services_per_message < 1 {
+        if self.service_shards_per_message < 1 {
             return Err(GeneratorError::InvalidConfiguration(
-                "services_per_message must be >= 1".to_string(),
+                "service_shards_per_message must be >= 1".to_string(),
             ));
         }
 
@@ -455,7 +455,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
-            services_per_message: 1,
+            service_shards_per_message: 1,
         }
     }
 
@@ -586,32 +586,32 @@ mod tests {
     }
 
     #[test]
-    fn test_services_per_message_validation() {
+    fn test_service_shards_per_message_validation() {
         let mut cfg = base_config();
-        cfg.services_per_message = 0;
+        cfg.service_shards_per_message = 0;
         assert!(cfg.validate().is_err());
 
-        cfg.services_per_message = 1;
+        cfg.service_shards_per_message = 1;
         assert!(cfg.validate().is_ok());
 
-        cfg.services_per_message = 10;
+        cfg.service_shards_per_message = 10;
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn test_services_per_message_has_no_upper_bound() {
+    fn test_service_shards_per_message_has_no_upper_bound() {
         // No upper bound is intentional: select_service_shards clamps to records_per_message at
         // runtime, and large values simulate "every record is its own pod". This test pins down
         // the missing upper-bound contract so a future regression that adds one fails loudly.
         let mut cfg = base_config();
-        cfg.services_per_message = usize::MAX;
+        cfg.service_shards_per_message = usize::MAX;
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
-    fn test_services_per_message_accepts_typical_value() {
+    fn test_service_shards_per_message_accepts_typical_value() {
         let mut cfg = base_config();
-        cfg.services_per_message = 4;
+        cfg.service_shards_per_message = 4;
         assert!(cfg.validate().is_ok());
     }
 }
