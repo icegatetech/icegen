@@ -1,7 +1,10 @@
 use crate::config::{BatchResult, OtelConfig};
 use crate::error::Result;
 use crate::generator::base::LogGenerator;
-use crate::message::{MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator};
+use crate::message::{
+    JsonEncoder, MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator, ProtobufEncoder,
+    ServiceShard,
+};
 use crate::transport::{GrpcTransport, HttpTransport, NoopTransport, SendOutcome, Transport};
 use async_trait::async_trait;
 use rand::Rng;
@@ -28,11 +31,30 @@ impl TenantProfile {
         Some(pool[index].clone())
     }
 
-    fn select_service_name(&self) -> Option<String> {
-        let pool = self.service_names.as_ref()?;
-        let mut rng = rand::thread_rng();
-        let index = rng.gen_range(0..pool.len());
-        Some(pool[index].clone())
+    fn select_service_shards(&self, requested: usize, records: usize) -> Vec<ServiceShard> {
+        let records = records.max(1);
+        match self.service_names.as_deref() {
+            None => vec![ServiceShard {
+                service_name: None,
+                num_records: records,
+            }],
+            Some(pool) => {
+                let k = requested.min(records).max(1);
+                let mut rng = rand::thread_rng();
+                let base = records / k;
+                let remainder = records % k;
+                (0..k)
+                    .map(|i| {
+                        let idx = rng.gen_range(0..pool.len());
+                        let n = base + usize::from(i < remainder);
+                        ServiceShard {
+                            service_name: Some(pool[idx].clone()),
+                            num_records: n,
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -107,6 +129,8 @@ impl ProgressTracker {
         self.processed.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    // `is_multiple_of` was stabilised in Rust 1.87; use `%` to stay within the declared MSRV.
+    #[allow(clippy::manual_is_multiple_of)]
     fn maybe_log(&self, processed: usize) {
         if processed % 10 != 0 {
             return;
@@ -270,6 +294,7 @@ impl OtelLogGenerator {
             println!("  Use Protobuf: {}", config.use_protobuf);
         }
         println!("  Records per message: {}", config.records_per_message);
+        println!("  Services per message: {}", config.service_shards_per_message);
         println!("  Invalid record %: {}", config.invalid_record_percent);
         println!("  Concurrency: {}", config.concurrency);
         if config.tenant_count == 0 {
@@ -350,15 +375,23 @@ impl OtelLogGenerator {
         Self::with_transport(config, transport)
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn with_transport(
         config: OtelConfig,
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
         let cardinality_config = config.label_cardinality_config()?;
+        let encoder: Arc<dyn crate::message::OtlpEncoder> =
+            if config.transport == "grpc" || config.use_protobuf {
+                Arc::new(ProtobufEncoder)
+            } else {
+                Arc::new(JsonEncoder)
+            };
         let message_generator = OTLPLogMessageGenerator::new(
             "rust-generator".to_string(),
             cardinality_config,
             config.timestamp_jitter_config(),
+            encoder,
         );
         let tenant_profiles = Self::build_tenant_profiles(&config);
         println!("✓ Generator initialized successfully\n");
@@ -535,25 +568,17 @@ impl LogGenerator for OtelLogGenerator {
         let tenant_profile = self.select_tenant_profile();
         let tenant_id = tenant_profile.tenant_id.clone();
         let cloud_account_id = tenant_profile.select_cloud_account_id();
-        let service_name = tenant_profile.select_service_name();
+        let shards = tenant_profile.select_service_shards(
+            self.config.service_shards_per_message,
+            self.config.records_per_message,
+        );
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
 
         if should_be_invalid {
             self.message_generator.generate_invalid_message(tenant_id)
-        } else if self.config.transport == "grpc" || self.config.use_protobuf {
-            self.message_generator.generate_protobuf_message(
-                tenant_id,
-                cloud_account_id,
-                service_name,
-                self.config.records_per_message,
-            )
         } else {
-            self.message_generator.generate_aggregated_message(
-                tenant_id,
-                cloud_account_id,
-                service_name,
-                self.config.records_per_message,
-            )
+            self.message_generator
+                .generate_message(tenant_id, cloud_account_id, shards)
         }
     }
 
@@ -831,6 +856,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
+            service_shards_per_message: 1,
         }
     }
 
@@ -909,6 +935,7 @@ mod tests {
             record_across_batch_timestamp_jitter_ms: 1_000,
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
+            service_shards_per_message: 1,
         };
 
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
@@ -1359,5 +1386,234 @@ mod tests {
         let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(message.tenant_id.is_none());
+    }
+
+    fn shard_count_json(message: &OTLPLogMessage) -> usize {
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("expected JSON payload");
+        };
+        json["resourceLogs"].as_array().expect("resourceLogs array").len()
+    }
+
+    fn shard_service_names_json(message: &OTLPLogMessage) -> Vec<String> {
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("expected JSON payload");
+        };
+        json["resourceLogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rl| {
+                rl["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find_map(|a| {
+                        (a["key"].as_str() == Some("service.name"))
+                            .then(|| a["value"]["stringValue"].as_str().unwrap().to_string())
+                    })
+                    .expect("service.name attribute missing")
+            })
+            .collect()
+    }
+
+    fn shard_record_counts_json(message: &OTLPLogMessage) -> Vec<usize> {
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("expected JSON payload");
+        };
+        json["resourceLogs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rl| rl["scopeLogs"][0]["logRecords"].as_array().unwrap().len())
+            .collect()
+    }
+
+    #[test]
+    fn generate_message_with_service_shards_per_message_emits_one_resource_logs_per_shard_json() {
+        // End-to-end through OtelLogGenerator::generate_message: select_service_shards
+        // distributes records across shards, JsonEncoder emits one ResourceLogs per shard.
+        let mut config = test_config(1, 0, 1);
+        config.records_per_message = 9;
+        config.service_shards_per_message = 3;
+        config.service_count_per_tenant = 3;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let pool: Vec<String> = generator.tenant_profiles[0]
+            .service_names
+            .as_ref()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+
+        let message = generator.generate_message().unwrap();
+        assert_eq!(shard_count_json(&message), 3);
+        assert_eq!(shard_record_counts_json(&message).iter().sum::<usize>(), 9);
+        for name in shard_service_names_json(&message) {
+            assert!(pool.contains(&name), "service name {name} must come from tenant pool");
+        }
+    }
+
+    #[test]
+    fn generate_message_with_use_protobuf_selects_protobuf_encoder() {
+        // Guards the encoder selection branch in with_transport: use_protobuf=true must produce
+        // MessagePayload::Protobuf even with transport="http". Also re-asserts intra-shard
+        // monotonicity on the protobuf path so we keep that signal after deleting the
+        // protobuf-only single-purpose test.
+        let mut config = test_config(1, 0, 1);
+        config.use_protobuf = true;
+        config.records_per_message = 8;
+        config.service_shards_per_message = 2;
+        config.service_count_per_tenant = 2;
+        // Disable overlap so monotonicity is a hard invariant.
+        config.record_intra_batch_overlap_probability = 0.0;
+        config.record_intra_batch_timestamp_jitter_ns = 5_000_000;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let message = generator.generate_message().unwrap();
+        let MessagePayload::Protobuf(bytes) = &message.message else {
+            panic!("expected Protobuf payload from use_protobuf=true");
+        };
+        use prost::Message;
+        let decoded = crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest::decode(
+            bytes.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(decoded.resource_logs.len(), 2);
+        let total: usize = decoded
+            .resource_logs
+            .iter()
+            .map(|rl| rl.scope_logs[0].log_records.len())
+            .sum();
+        assert_eq!(total, 8);
+
+        for (shard_idx, rl) in decoded.resource_logs.iter().enumerate() {
+            let ts: Vec<u64> = rl.scope_logs[0]
+                .log_records
+                .iter()
+                .map(|r| r.time_unix_nano)
+                .collect();
+            for i in 1..ts.len() {
+                assert!(
+                    ts[i - 1] <= ts[i],
+                    "shard {shard_idx}: non-monotonic at i={i}: {} > {}",
+                    ts[i - 1],
+                    ts[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generate_message_with_grpc_transport_forces_protobuf_encoder() {
+        // transport="grpc" must override use_protobuf=false and pick ProtobufEncoder (gRPC wire
+        // is always protobuf). This is the second leg of the encoder-selection conditional in
+        // with_transport; without this test, swapping the operands of the `||` would go silent.
+        let mut config = test_config(1, 0, 1);
+        config.transport = "grpc".to_string();
+        config.use_protobuf = false;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let message = generator.generate_message().unwrap();
+        assert!(
+            matches!(message.message, MessagePayload::Protobuf(_)),
+            "transport=grpc must force ProtobufEncoder regardless of use_protobuf"
+        );
+    }
+
+    #[test]
+    fn generate_message_without_service_pool_emits_single_shard_without_service_name() {
+        // Covers the None branch of select_service_shards: with no pool, service_shards_per_message is
+        // ignored and we get exactly one shard with no service.name attribute, regardless of the
+        // requested fan-out.
+        let mut config = test_config(1, 0, 1);
+        config.records_per_message = 5;
+        config.service_shards_per_message = 5;
+        config.service_count_per_tenant = 0;
+        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let message = generator.generate_message().unwrap();
+        assert_eq!(shard_count_json(&message), 1);
+        assert_eq!(shard_record_counts_json(&message), vec![5]);
+        assert!(
+            resource_attribute(&message, "service.name").is_none(),
+            "service.name must be absent when service_count_per_tenant=0"
+        );
+    }
+
+    fn make_profile(service_names: Option<Vec<&str>>) -> TenantProfile {
+        TenantProfile {
+            tenant_id: Some("t1".to_string()),
+            cloud_account_ids: None,
+            service_names: service_names
+                .map(|names| Arc::from(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())),
+        }
+    }
+
+    #[test]
+    fn select_service_shards_clamps_to_records() {
+        let profile = make_profile(Some(vec!["svc-a", "svc-b", "svc-c"]));
+        let shards = profile.select_service_shards(10, 3);
+        assert_eq!(shards.len(), 3, "clamped to records count");
+        assert_eq!(shards.iter().map(|s| s.num_records).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn select_service_shards_falls_back_to_single_shard_without_pool() {
+        let profile = make_profile(None);
+        let shards = profile.select_service_shards(5, 7);
+        assert_eq!(shards.len(), 1);
+        assert!(shards[0].service_name.is_none());
+        assert_eq!(shards[0].num_records, 7);
+    }
+
+    #[test]
+    fn select_service_shards_picks_with_replacement_when_requested_exceeds_pool() {
+        // Single-element pool makes "with replacement" deterministic: every shard must hold "a".
+        // This locks down the documented behaviour where requested > pool.len() simulates
+        // multiple pods of the same service.
+        let profile = make_profile(Some(vec!["a"]));
+        let shards = profile.select_service_shards(5, 5);
+        assert_eq!(shards.len(), 5, "5 shards even with pool_size=1");
+        assert_eq!(shards.iter().map(|s| s.num_records).sum::<usize>(), 5);
+        assert!(
+            shards.iter().all(|s| s.service_name.as_deref() == Some("a")),
+            "every shard must reuse the only pool entry"
+        );
+    }
+
+    #[test]
+    fn select_service_shards_returns_single_shard_when_requested_is_one() {
+        let profile = make_profile(Some(vec!["svc-a", "svc-b", "svc-c"]));
+        let shards = profile.select_service_shards(1, 7);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].num_records, 7);
+        let name = shards[0].service_name.as_deref().expect("name from pool");
+        assert!(["svc-a", "svc-b", "svc-c"].contains(&name));
+    }
+
+    #[test]
+    fn select_service_shards_collapses_to_one_shard_when_records_is_one() {
+        // k = min(requested, records).max(1) = min(5, 1) = 1; the records.max(1) floor on the
+        // input must not break the k clamp.
+        let profile = make_profile(Some(vec!["svc-a", "svc-b"]));
+        let shards = profile.select_service_shards(5, 1);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].num_records, 1);
+        assert!(shards[0].service_name.is_some());
+    }
+
+    #[test]
+    fn select_service_shards_distributes_records_evenly() {
+        let profile = make_profile(Some(vec!["svc-a", "svc-b", "svc-c"]));
+        let shards = profile.select_service_shards(3, 10);
+        assert_eq!(shards.len(), 3);
+        let counts: Vec<usize> = shards.iter().map(|s| s.num_records).collect();
+        assert_eq!(counts.iter().sum::<usize>(), 10);
+        // base=3, remainder=1 → first shard (i=0 < remainder=1) gets base+1, rest get base.
+        // The distribution contract is positional: index order determines which shard receives +1.
+        assert_eq!(counts[0], 4);
+        assert_eq!(counts[1], 3);
+        assert_eq!(counts[2], 3);
     }
 }

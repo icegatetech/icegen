@@ -17,6 +17,7 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    #[allow(clippy::result_large_err)]
     pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 

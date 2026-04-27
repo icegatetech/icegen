@@ -150,6 +150,12 @@ pub struct OtelArgs {
         default_value = "0.05"
     )]
     pub record_intra_batch_overlap_probability: f32,
+
+    /// Number of ResourceLogs groups (distinct service.name pods) packed into one request,
+    /// simulating OTEL Collector batching across services/pods.
+    /// RECORDS_PER_MESSAGE is divided evenly across groups (clamped to <= RECORDS_PER_MESSAGE).
+    #[arg(long, env = "SERVICE_SHARDS_PER_MESSAGE", default_value = "1")]
+    pub service_shards_per_message: usize,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -185,6 +191,7 @@ impl From<OtelArgs> for OtelConfig {
             record_across_batch_timestamp_jitter_ms: args.record_across_batch_timestamp_jitter_ms,
             record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
             record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
+            service_shards_per_message: args.service_shards_per_message,
         }
     }
 }
@@ -193,6 +200,45 @@ impl From<OtelArgs> for OtelConfig {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    /// Serializes all tests that touch process-wide env vars.
+    static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard: restores an env var to its prior value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: single-threaded access guaranteed by TEST_ENV_MUTEX.
+            #[allow(deprecated)]
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: single-threaded access guaranteed by TEST_ENV_MUTEX.
+            #[allow(deprecated)]
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            #[allow(deprecated)]
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn cli_accepts_new_message_interval_flag() {
@@ -311,6 +357,65 @@ mod tests {
         assert!(config.dry_run);
         assert!(config.ingest_endpoint.is_empty());
         assert!(config.print_logs);
+    }
+
+    #[test]
+    fn cli_service_shards_per_message_default_env_and_flag_precedence() {
+        // Serializes against any other test touching SERVICE_SHARDS_PER_MESSAGE.
+        let _lock = TEST_ENV_MUTEX.lock().unwrap();
+
+        // 1. No flag, no env -> default_value = "1".
+        let _guard = EnvGuard::remove("SERVICE_SHARDS_PER_MESSAGE");
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.service_shards_per_message, 1, "default when no flag and no env");
+
+        // 2. Env SERVICE_SHARDS_PER_MESSAGE=2 is read via clap's `env = "..."` binding.
+        let _guard = EnvGuard::set("SERVICE_SHARDS_PER_MESSAGE", "2");
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.service_shards_per_message, 2, "env binding must be honoured");
+
+        // 3. --service-shards-per-message flag overrides the env value.
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--service-shards-per-message",
+            "5",
+        ]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.service_shards_per_message, 5, "flag must beat env");
+    }
+
+    #[test]
+    fn cli_reads_service_shards_per_message() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+            "--service-shards-per-message",
+            "3",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.service_shards_per_message, 3);
     }
 
     #[test]

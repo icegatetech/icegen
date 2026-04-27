@@ -4,7 +4,17 @@ This file provides guidance to AI agents (Claude Code, Gemini Code Assist, etc.)
 
 ## Project Overview
 
-High-performance OpenTelemetry log generator written in Rust. Sends OTLP logs via HTTP (JSON/Protobuf) or gRPC transports with configurable concurrency, invalid record injection, timestamp jitter, and dry-run mode. Intended for load testing and error-handling validation of OTLP collectors.
+The project is a high-performance async OpenTelemetry log generator with:
+
+- Multi-mode Operation: Batch send, continuous stream, dry-run
+- Transport Flexibility: HTTP JSON, HTTP Protobuf, gRPC
+- Advanced Tenancy: Single/multi-tenant modes with cloud account and service pools
+- Timestamp Control: Sophisticated jitter at batch and record levels with overlap simulation
+- Cardinality Management: Deterministic bucketing with per-key limits
+- Robust Configuration: 30+ CLI flags, environment variables, validation
+- Concurrency: Per-worker scheduling with global pacing and progress tracking
+- Signal Handling: Graceful shutdown with current batch completion
+- Testing: 11+ integration tests, extensive unit tests in each module
 
 ## Development Conventions
 
