@@ -29,6 +29,16 @@ impl SendOutcome {
             Self::Success { retries } | Self::Failure { retries, .. } => *retries,
         }
     }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Failure {
+                error: crate::error::GeneratorError::Timeout,
+                ..
+            }
+        )
+    }
 }
 
 #[async_trait]
