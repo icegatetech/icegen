@@ -1,7 +1,8 @@
 use crate::error::Result;
+use crate::message::attrs::{pairs_to_json_attrs, pairs_to_proto_kv};
 use crate::message::plan::{PlannedRecord, PlannedRequest, PlannedShard};
 use crate::message::types::MessagePayload;
-use crate::pb::opentelemetry::proto::common::v1::{any_value, AnyValue, KeyValue};
+use crate::pb::opentelemetry::proto::common::v1::{any_value, AnyValue};
 use serde_json::{json, Value};
 
 /// Serializes a [`PlannedRequest`] into a wire-format [`MessagePayload`].
@@ -72,25 +73,6 @@ fn encode_record_json(record: &PlannedRecord) -> Value {
     })
 }
 
-fn pairs_to_json_attrs(pairs: &[(String, String)]) -> Vec<Value> {
-    pairs
-        .iter()
-        .map(|(key, value)| json!({ "key": key, "value": { "stringValue": value } }))
-        .collect()
-}
-
-fn pairs_to_proto_kv(pairs: &[(String, String)]) -> Vec<KeyValue> {
-    pairs
-        .iter()
-        .map(|(key, value)| KeyValue {
-            key: key.clone(),
-            value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue(value.clone())),
-            }),
-        })
-        .collect()
-}
-
 impl OtlpEncoder for ProtobufEncoder {
     #[allow(clippy::result_large_err)]
     fn encode(&self, request: &PlannedRequest) -> Result<MessagePayload> {
@@ -155,7 +137,7 @@ impl OtlpEncoder for ProtobufEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::types::OTLPLogMessageType;
+    use crate::message::types::OTLPMessageType;
     use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use prost::Message;
 
@@ -191,14 +173,17 @@ mod tests {
         PlannedRequest {
             project_id: "proj-1".to_string(),
             shards,
-            message_type: OTLPLogMessageType::Valid,
+            message_type: OTLPMessageType::Valid,
         }
     }
 
     #[test]
     fn json_encoder_serializes_planned_request_with_hex_ids_and_string_timestamp() {
         let request = make_request(vec![
-            make_shard("svc-a", vec![make_record(100, 0xAB), make_record(200, 0xCD)]),
+            make_shard(
+                "svc-a",
+                vec![make_record(100, 0xAB), make_record(200, 0xCD)],
+            ),
             make_shard("svc-b", vec![make_record(300, 0xEF)]),
         ]);
         let payload = JsonEncoder.encode(&request).unwrap();
@@ -209,7 +194,9 @@ mod tests {
         let resource_logs = json["resourceLogs"].as_array().unwrap();
         assert_eq!(resource_logs.len(), 2);
 
-        let records_a = resource_logs[0]["scopeLogs"][0]["logRecords"].as_array().unwrap();
+        let records_a = resource_logs[0]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap();
         assert_eq!(records_a.len(), 2);
         // timeUnixNano must be serialised as a string (OTLP/JSON spec for uint64-shaped fields).
         assert_eq!(records_a[0]["timeUnixNano"].as_str(), Some("100"));
@@ -222,7 +209,9 @@ mod tests {
         );
         assert_eq!(records_a[0]["spanId"].as_str(), Some("abababababababab"));
 
-        let records_b = resource_logs[1]["scopeLogs"][0]["logRecords"].as_array().unwrap();
+        let records_b = resource_logs[1]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap();
         assert_eq!(records_b.len(), 1);
         assert_eq!(records_b[0]["timeUnixNano"].as_str(), Some("300"));
     }
@@ -230,7 +219,10 @@ mod tests {
     #[test]
     fn protobuf_encoder_round_trips_planned_request() {
         let request = make_request(vec![
-            make_shard("svc-a", vec![make_record(1_000, 0x11), make_record(2_000, 0x22)]),
+            make_shard(
+                "svc-a",
+                vec![make_record(1_000, 0x11), make_record(2_000, 0x22)],
+            ),
             make_shard("svc-b", vec![make_record(3_000, 0x33)]),
         ]);
         let payload = ProtobufEncoder.encode(&request).unwrap();
@@ -259,7 +251,11 @@ mod tests {
         // protobuf field is u64 — the encoder is contractually responsible for clamping.
         let request = make_request(vec![make_shard(
             "svc-a",
-            vec![make_record(-1, 0x01), make_record(-1_000_000_000, 0x02), make_record(42, 0x03)],
+            vec![
+                make_record(-1, 0x01),
+                make_record(-1_000_000_000, 0x02),
+                make_record(42, 0x03),
+            ],
         )]);
         let payload = ProtobufEncoder.encode(&request).unwrap();
         let MessagePayload::Protobuf(bytes) = payload else {
@@ -268,9 +264,18 @@ mod tests {
         let decoded = ExportLogsServiceRequest::decode(bytes.as_slice()).unwrap();
         let records = &decoded.resource_logs[0].scope_logs[0].log_records;
 
-        assert_eq!(records[0].time_unix_nano, 0, "negative timestamp must clamp to 0");
+        assert_eq!(
+            records[0].time_unix_nano, 0,
+            "negative timestamp must clamp to 0"
+        );
         assert_eq!(records[0].observed_time_unix_nano, 0);
-        assert_eq!(records[1].time_unix_nano, 0, "large negative timestamp must clamp to 0");
-        assert_eq!(records[2].time_unix_nano, 42, "non-negative timestamp must pass through");
+        assert_eq!(
+            records[1].time_unix_nano, 0,
+            "large negative timestamp must clamp to 0"
+        );
+        assert_eq!(
+            records[2].time_unix_nano, 42,
+            "non-negative timestamp must pass through"
+        );
     }
 }

@@ -4,7 +4,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .out_dir("src/pb")
         .compile(
-            &["proto/opentelemetry/proto/collector/logs/v1/logs_service.proto"],
+            &[
+                "proto/opentelemetry/proto/collector/logs/v1/logs_service.proto",
+                "proto/opentelemetry/proto/collector/trace/v1/trace_service.proto",
+            ],
             &["proto/"],
         )?;
 

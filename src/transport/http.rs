@@ -1,8 +1,9 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
-use crate::message::{MessagePayload, OTLPLogMessage};
-use crate::transport::{SendOutcome, Transport};
+use crate::message::{MessagePayload, OTLPMessage};
+use crate::transport::{AuthHeaders, SendOutcome, Transport};
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -18,8 +19,33 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     #[allow(clippy::result_large_err)]
-    pub fn new(endpoint: String, use_protobuf: bool, retry_config: RetryConfig) -> Result<Self> {
-        let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    pub fn new(
+        endpoint: String,
+        use_protobuf: bool,
+        retry_config: RetryConfig,
+        auth: AuthHeaders,
+    ) -> Result<Self> {
+        // Vendor auth headers go in as client default headers, so reqwest attaches them to every
+        // request without touching build_request. An invalid header name/value fails at startup.
+        let mut default_headers = HeaderMap::new();
+        for (name, value) in auth.iter() {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                GeneratorError::InvalidConfiguration(format!(
+                    "invalid auth header name '{name}': {e}"
+                ))
+            })?;
+            let header_value = HeaderValue::from_str(value).map_err(|e| {
+                GeneratorError::InvalidConfiguration(format!(
+                    "invalid auth header value for '{name}': {e}"
+                ))
+            })?;
+            default_headers.insert(header_name, header_value);
+        }
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .default_headers(default_headers)
+            .build()?;
 
         Ok(Self {
             client,
@@ -46,7 +72,7 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn build_request(&self, message: &OTLPLogMessage) -> reqwest::RequestBuilder {
+    fn build_request(&self, message: &OTLPMessage) -> reqwest::RequestBuilder {
         match &message.message {
             MessagePayload::Json(json_value) => {
                 let mut req = self
@@ -89,7 +115,7 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     async fn send(
         &self,
-        message: &OTLPLogMessage,
+        message: &OTLPMessage,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> SendOutcome {
         let max_retries = self.retry_config.max_retries;
@@ -226,19 +252,21 @@ fn is_transient_reqwest_error(e: &reqwest::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Signal;
     use serde_json::json;
 
     fn retry_config() -> RetryConfig {
         RetryConfig::new(1, 1000, 2000).unwrap()
     }
 
-    fn message(tenant_id: &str) -> OTLPLogMessage {
-        OTLPLogMessage::new(
+    fn message(tenant_id: &str) -> OTLPMessage {
+        OTLPMessage::new(
             MessagePayload::Json(json!({"resourceLogs": []})),
+            Signal::Logs,
             Some(tenant_id.to_string()),
             "project1".to_string(),
             "source1".to_string(),
-            crate::message::OTLPLogMessageType::Valid,
+            crate::message::OTLPMessageType::Valid,
         )
     }
 
@@ -248,6 +276,7 @@ mod tests {
             "http://localhost:4318/v1/logs".to_string(),
             false,
             retry_config(),
+            AuthHeaders::default(),
         )
         .unwrap();
 
@@ -264,6 +293,7 @@ mod tests {
             "http://localhost:4318/v1/logs".to_string(),
             false,
             retry_config(),
+            AuthHeaders::default(),
         )
         .unwrap();
 
@@ -286,17 +316,120 @@ mod tests {
             "http://localhost:4318/v1/logs".to_string(),
             false,
             retry_config(),
+            AuthHeaders::default(),
         )
         .unwrap();
 
-        let msg = OTLPLogMessage::new(
+        let msg = OTLPMessage::new(
             MessagePayload::Json(json!({"resourceLogs": []})),
+            Signal::Logs,
             None,
             "project1".to_string(),
             "source1".to_string(),
-            crate::message::OTLPLogMessageType::Valid,
+            crate::message::OTLPMessageType::Valid,
         );
         let request = transport.build_request(&msg).build().unwrap();
         assert!(request.headers().get("X-Scope-OrgID").is_none());
+    }
+
+    #[test]
+    fn http_accepts_valid_vendor_auth_headers() {
+        // reqwest applies client default_headers at send time (see Client::execute_request), so they
+        // are not observable on a `.build()`-only request. Here we assert the construction path: a
+        // valid auth set builds a transport without error (the headers ride on every real request).
+        let auth = AuthHeaders::build("x-api-key=secret", Some("xyz"), None).unwrap();
+        assert!(HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+            auth,
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_send_carries_auth_headers_on_the_wire() {
+        // Proves vendor auth actually rides on a real request (parity with the gRPC metadata test):
+        // a throwaway TCP listener captures the raw request bytes and we assert the headers landed.
+        // Deleting `.default_headers(...)` in `HttpTransport::new` makes this red.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut data = Vec::new();
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                if data.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&data).to_string()
+        });
+
+        let auth = AuthHeaders::build("x-api-key=secret", Some("xyz"), None).unwrap();
+        let transport = HttpTransport::new(
+            format!("http://{addr}/v1/logs"),
+            false,
+            retry_config(),
+            auth,
+        )
+        .unwrap();
+
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = transport.send(&message("tenant1"), &rx).await;
+        assert!(matches!(outcome, SendOutcome::Success { .. }));
+
+        let raw = server.await.unwrap().to_lowercase();
+        assert!(
+            raw.contains("x-api-key: secret"),
+            "missing x-api-key: {raw}"
+        );
+        assert!(
+            raw.contains("authorization: bearer xyz"),
+            "missing authorization: {raw}"
+        );
+    }
+
+    #[test]
+    fn http_rejects_invalid_auth_header_name() {
+        let auth = AuthHeaders::build("bad key=value", None, None).unwrap();
+        let result = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+            auth,
+        );
+        assert!(matches!(
+            result,
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn http_rejects_invalid_auth_header_value() {
+        let auth = AuthHeaders::build("x-token=bad\u{1}val", None, None).unwrap();
+        let result = HttpTransport::new(
+            "http://localhost:4318/v1/logs".to_string(),
+            false,
+            retry_config(),
+            auth,
+        );
+        assert!(matches!(
+            result,
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
     }
 }

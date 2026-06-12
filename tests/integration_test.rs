@@ -5,7 +5,7 @@ use otel_log_generator::config::LabelCardinalityConfig;
 use otel_log_generator::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
 use otel_log_generator::pb::opentelemetry::proto::common::v1::any_value;
 use otel_log_generator::{
-    JsonEncoder, MessagePayload, OTLPLogMessageGenerator, OTLPLogMessageType, ProtobufEncoder,
+    JsonEncoder, MessagePayload, OTLPLogMessageGenerator, OTLPMessageType, ProtobufEncoder,
     ServiceShard, TimestampJitterConfig,
 };
 use prost::Message;
@@ -63,7 +63,7 @@ fn test_generate_valid_message() {
     let message = result.unwrap();
     assert!(message.tenant_id.is_some());
     assert_eq!(message.source, "test-source");
-    assert_eq!(message.message_type, OTLPLogMessageType::Valid);
+    assert_eq!(message.message_type, OTLPMessageType::Valid);
 
     match message.message {
         MessagePayload::Json(json) => {
@@ -147,8 +147,8 @@ fn test_generate_invalid_message() {
 
     // Should be either InvalidJson or InvalidMalformedJson
     assert!(
-        message.message_type == OTLPLogMessageType::InvalidJson
-            || message.message_type == OTLPLogMessageType::InvalidMalformedJson
+        message.message_type == OTLPMessageType::InvalidJson
+            || message.message_type == OTLPMessageType::InvalidMalformedJson
     );
 }
 
@@ -164,7 +164,7 @@ fn test_generate_protobuf_message() {
     assert!(result.is_ok());
     let message = result.unwrap();
     assert!(message.tenant_id.is_some());
-    assert_eq!(message.message_type, OTLPLogMessageType::Valid);
+    assert_eq!(message.message_type, OTLPMessageType::Valid);
 
     match message.message {
         MessagePayload::Protobuf(bytes) => {

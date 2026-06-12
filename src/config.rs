@@ -1,4 +1,6 @@
 use crate::error::{GeneratorError, Result};
+use crate::message::types::Signal;
+use crate::transport::AuthHeaders;
 use rand::Rng;
 use std::collections::HashMap;
 
@@ -169,6 +171,22 @@ pub struct OtelConfig {
     pub record_intra_batch_timestamp_jitter_ns: u64,
     pub record_intra_batch_overlap_probability: f32,
     pub service_shards_per_message: usize,
+    /// Telemetry signal to generate: logs (default) or traces. One signal per run.
+    pub signal: Signal,
+    /// Maximum number of `execute_tool` spans in an LLM trace (signal=traces).
+    pub llm_max_tool_calls: u32,
+    /// Capture prompt/completion content into span attributes (PII risk; signal=traces).
+    pub llm_capture_content: bool,
+    /// Relative weights of LLM call forms, e.g.
+    /// `simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1` (signal=traces).
+    pub llm_profile_weights: String,
+    /// Raw vendor auth headers as a CSV map, e.g. `Authorization=Bearer xxx,x-bt-parent=project:foo`.
+    /// Applied to every HTTP/gRPC request, independent of the tenant header.
+    pub auth_headers: String,
+    /// Shortcut for a Bearer token: produces `Authorization: Bearer <token>`.
+    pub auth_bearer: Option<String>,
+    /// Shortcut for Basic auth: `user:pass` is base64-encoded into `Authorization: Basic <b64>`.
+    pub auth_basic: Option<String>,
 }
 
 impl OtelConfig {
@@ -177,6 +195,14 @@ impl OtelConfig {
         if self.invalid_record_percent < 0.0 || self.invalid_record_percent > 100.0 {
             return Err(GeneratorError::InvalidConfiguration(
                 "invalid_record_percent must be between 0 and 100".to_string(),
+            ));
+        }
+
+        // Invalid-record generation is implemented for logs only; the trace factory always builds
+        // valid messages. Fail loud instead of silently ignoring an explicitly requested percentage.
+        if self.signal == Signal::Traces && self.invalid_record_percent > 0.0 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "invalid_record_percent is not supported for signal=traces (must be 0)".to_string(),
             ));
         }
 
@@ -239,6 +265,8 @@ impl OtelConfig {
         }
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
+        parse_profile_weights(&self.llm_profile_weights)?;
+        self.auth_headers()?;
 
         if self.record_across_batch_timestamp_jitter_ms > 3_600_000 {
             return Err(GeneratorError::InvalidConfiguration(
@@ -292,6 +320,18 @@ impl OtelConfig {
             self.retry_max_retries,
             self.retry_base_delay_ms,
             self.retry_max_delay_ms,
+        )
+    }
+
+    /// Build the vendor auth headers applied to every request. Validated eagerly in
+    /// [`Self::validate`] so a misconfigured spec fails at startup, like
+    /// [`parse_profile_weights`].
+    #[allow(clippy::result_large_err)]
+    pub fn auth_headers(&self) -> Result<AuthHeaders> {
+        AuthHeaders::build(
+            &self.auth_headers,
+            self.auth_bearer.as_deref(),
+            self.auth_basic.as_deref(),
         )
     }
 
@@ -385,6 +425,51 @@ fn parse_cardinality_limits(raw: &str) -> Result<HashMap<String, usize>> {
     Ok(parsed)
 }
 
+/// Tokenise the raw `LLM_PROFILE_WEIGHTS` spec (`name:weight,name:weight,…`) into neutral
+/// name→weight pairs. This is the *syntactic* layer: it validates the `key:value` shape and that
+/// weights are numeric, but knows nothing of the valid form names or the positive-total rule —
+/// those belong to the domain ([`crate::message::traces::span_profile::ProfileWeights::from_pairs`]).
+/// An empty (or whitespace) spec yields an empty map.
+#[allow(clippy::result_large_err)]
+pub fn parse_profile_weights(raw: &str) -> Result<HashMap<String, u32>> {
+    let mut parsed = HashMap::new();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(parsed);
+    }
+
+    for pair in trimmed.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (name, weight_str) = pair.split_once(':').ok_or_else(|| {
+            GeneratorError::InvalidConfiguration(format!(
+                "invalid llm profile weight pair '{pair}', expected name:weight"
+            ))
+        })?;
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(GeneratorError::InvalidConfiguration(
+                "llm profile weight name must not be empty".to_string(),
+            ));
+        }
+
+        let weight = weight_str.trim().parse::<u32>().map_err(|_| {
+            GeneratorError::InvalidConfiguration(format!(
+                "invalid weight '{}' for llm profile form '{name}'",
+                weight_str.trim()
+            ))
+        })?;
+
+        parsed.insert(name.to_string(), weight);
+    }
+
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchResult {
     pub total: usize,
@@ -456,6 +541,14 @@ mod tests {
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
             service_shards_per_message: 1,
+            signal: Signal::Logs,
+            llm_max_tool_calls: 3,
+            llm_capture_content: true,
+            llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
+                .to_string(),
+            auth_headers: String::new(),
+            auth_bearer: None,
+            auth_basic: None,
         }
     }
 
@@ -464,6 +557,25 @@ mod tests {
         let mut cfg = base_config();
         cfg.ingest_endpoint = String::new();
         cfg.dry_run = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_record_percent_for_traces() {
+        let mut cfg = base_config();
+        cfg.signal = Signal::Traces;
+        cfg.invalid_record_percent = 50.0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn validate_allows_zero_invalid_record_percent_for_traces() {
+        let mut cfg = base_config();
+        cfg.signal = Signal::Traces;
+        cfg.invalid_record_percent = 0.0;
         assert!(cfg.validate().is_ok());
     }
 
@@ -481,6 +593,24 @@ mod tests {
         assert!(parse_cardinality_limits("=1").is_err());
         assert!(parse_cardinality_limits("k=abc").is_err());
         assert!(parse_cardinality_limits("k=-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_profile_weights_ok() {
+        let parsed = parse_profile_weights("simple_chat:1, tool_loop:3,rag:0").unwrap();
+        assert_eq!(parsed.get("simple_chat"), Some(&1));
+        assert_eq!(parsed.get("tool_loop"), Some(&3));
+        assert_eq!(parsed.get("rag"), Some(&0));
+        // an empty spec is syntactically valid (the domain layer rejects an empty total)
+        assert!(parse_profile_weights("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_profile_weights_invalid_syntax() {
+        assert!(parse_profile_weights("rag").is_err()); // no colon
+        assert!(parse_profile_weights("rag:x").is_err()); // non-numeric weight
+        assert!(parse_profile_weights(":1").is_err()); // empty name
+        assert!(parse_profile_weights("rag:-1").is_err()); // negative weight
     }
 
     #[test]

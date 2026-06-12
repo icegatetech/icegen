@@ -1,4 +1,5 @@
 use crate::config::OtelConfig;
+use crate::message::types::Signal;
 use clap::{Args, Parser, Subcommand};
 
 /// Parse boolean values in a case-insensitive way
@@ -7,6 +8,17 @@ fn parse_bool(s: &str) -> Result<bool, String> {
         "true" | "1" | "yes" | "y" => Ok(true),
         "false" | "0" | "no" | "n" | "" => Ok(false),
         _ => Err(format!("invalid boolean value: '{}'", s)),
+    }
+}
+
+/// Parse the telemetry signal selector in a case-insensitive way.
+fn parse_signal(s: &str) -> Result<Signal, String> {
+    match s.to_lowercase().as_str() {
+        "logs" => Ok(Signal::Logs),
+        "traces" => Ok(Signal::Traces),
+        other => Err(format!(
+            "invalid signal '{other}', must be 'logs' or 'traces'"
+        )),
     }
 }
 
@@ -156,6 +168,38 @@ pub struct OtelArgs {
     /// RECORDS_PER_MESSAGE is divided evenly across groups (clamped to <= RECORDS_PER_MESSAGE).
     #[arg(long, env = "SERVICE_SHARDS_PER_MESSAGE", default_value = "1")]
     pub service_shards_per_message: usize,
+
+    /// Telemetry signal to generate: logs or traces (one signal per run)
+    #[arg(long, env = "OTEL_SIGNAL", default_value = "logs", value_parser = parse_signal)]
+    pub signal: Signal,
+
+    /// Maximum number of tool-call spans in an LLM trace (signal=traces)
+    #[arg(long, env = "LLM_MAX_TOOL_CALLS", default_value = "3")]
+    pub llm_max_tool_calls: u32,
+
+    /// Capture prompt/completion content into span attributes (PII!); signal=traces
+    #[arg(long, env = "LLM_CAPTURE_CONTENT", default_value = "true", value_parser = parse_bool)]
+    pub llm_capture_content: bool,
+
+    /// Relative weights of LLM call forms; signal=traces
+    #[arg(
+        long,
+        env = "LLM_PROFILE_WEIGHTS",
+        default_value = "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
+    )]
+    pub llm_profile_weights: String,
+
+    /// Raw vendor auth headers as a CSV map (key=value,key2=value2), applied to every request
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_HEADERS", default_value = "")]
+    pub auth_headers: String,
+
+    /// Bearer token shortcut -> Authorization: Bearer <token>
+    #[arg(long, env = "OTEL_AUTH_BEARER")]
+    pub auth_bearer: Option<String>,
+
+    /// Basic auth shortcut: user:pass -> base64 -> Authorization: Basic <b64>
+    #[arg(long, env = "OTEL_AUTH_BASIC")]
+    pub auth_basic: Option<String>,
 }
 
 impl From<OtelArgs> for OtelConfig {
@@ -192,6 +236,13 @@ impl From<OtelArgs> for OtelConfig {
             record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
             record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
             service_shards_per_message: args.service_shards_per_message,
+            signal: args.signal,
+            llm_max_tool_calls: args.llm_max_tool_calls,
+            llm_capture_content: args.llm_capture_content,
+            llm_profile_weights: args.llm_profile_weights,
+            auth_headers: args.auth_headers,
+            auth_bearer: args.auth_bearer,
+            auth_basic: args.auth_basic,
         }
     }
 }
@@ -374,7 +425,10 @@ mod tests {
         ]);
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
-        assert_eq!(config.service_shards_per_message, 1, "default when no flag and no env");
+        assert_eq!(
+            config.service_shards_per_message, 1,
+            "default when no flag and no env"
+        );
 
         // 2. Env SERVICE_SHARDS_PER_MESSAGE=2 is read via clap's `env = "..."` binding.
         let _guard = EnvGuard::set("SERVICE_SHARDS_PER_MESSAGE", "2");
@@ -386,7 +440,10 @@ mod tests {
         ]);
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
-        assert_eq!(config.service_shards_per_message, 2, "env binding must be honoured");
+        assert_eq!(
+            config.service_shards_per_message, 2,
+            "env binding must be honoured"
+        );
 
         // 3. --service-shards-per-message flag overrides the env value.
         let cli = Cli::parse_from([
@@ -416,6 +473,86 @@ mod tests {
         let GeneratorType::Otel(args) = cli.generator;
         let config: OtelConfig = args.into();
         assert_eq!(config.service_shards_per_message, 3);
+    }
+
+    #[test]
+    fn cli_parses_signal_traces() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/traces",
+            "--signal",
+            "traces",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.signal, Signal::Traces);
+    }
+
+    #[test]
+    fn cli_signal_defaults_to_logs() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.signal, Signal::Logs);
+    }
+
+    #[test]
+    fn cli_reads_llm_trace_knobs() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/traces",
+            "--signal",
+            "traces",
+            "--llm-max-tool-calls",
+            "5",
+            "--llm-capture-content",
+            "--llm-profile-weights",
+            "simple_chat:2,rag:1",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.llm_max_tool_calls, 5);
+        assert!(config.llm_capture_content);
+        assert_eq!(config.llm_profile_weights, "simple_chat:2,rag:1");
+    }
+
+    #[test]
+    fn cli_reads_auth_flags() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--auth-headers",
+            "x-api-key=secret,x-bt-parent=project:foo",
+            "--auth-bearer",
+            "token123",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(
+            config.auth_headers,
+            "x-api-key=secret,x-bt-parent=project:foo"
+        );
+        assert_eq!(config.auth_bearer.as_deref(), Some("token123"));
+        assert_eq!(config.auth_basic, None);
+
+        let cli = Cli::parse_from(["otel-log-generator", "otel", "--auth-basic", "user:pass"]);
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.auth_basic.as_deref(), Some("user:pass"));
+        assert_eq!(config.auth_bearer, None);
     }
 
     #[test]
