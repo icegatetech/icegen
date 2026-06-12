@@ -19,6 +19,11 @@ Before completing a task, perform an additional optimization pass to verify the 
 
 - Use `cargo` for project management, building, and dependency management.
 - Use `serde` with `serde_json` for JSON serialization/deserialization.
+- Use `axum` for creating any web servers or HTTP APIs.
+    - Keep request handlers async, returning `Result<Response, AppError>` to centralize error handling.
+    - Use layered extractors and shared state structs instead of global mutable data.
+    - Add `tower` middleware (timeouts, tracing, compression) for observability and resilience.
+    - Offload CPU-bound work to `tokio::task::spawn_blocking` or background services to avoid blocking the reactor.
 - When reporting errors to the console, use `tracing::error!` or `log::error!` instead of `println!`.
 
 ## Code Style and Formatting
@@ -107,6 +112,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 - **MUST** write unit tests for all new functions and types
 - **MUST** mock external dependencies (APIs, databases, file systems)
 - **MUST** use the built-in `#[test]` attribute and `cargo test`
+- **NEVER** create methods in a structure just for tests (`#[cfg(test)]`).
 - Follow the Arrange-Act-Assert pattern
 - Do not commit commented-out tests
 - Use `#[cfg(test)]` modules for test code
@@ -163,6 +169,7 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 ## Tools
 
 - **MUST** use `rustfmt` for code formatting
+- **MUST** use `clippy` for linting and follow its suggestions
 - **MUST** ensure code compiles with no warnings (use `-D warnings` flag in CI, not `#![deny(warnings)]` in source)
 - Use `cargo` for building, testing, and dependency management
 - Use `cargo test` for running tests
@@ -171,6 +178,10 @@ pub fn calculate_total(items: &[Item], tax_rate: f64) -> Result<f64, Calculation
 ## Before Committing
 
 - [ ] All tests pass (`make test`)
+- [ ] No compiler warnings (`make check`)
+- [ ] Clippy passes (`make clippy`)
+- [ ] Code is formatted (`make fmt`)
+- [ ] All CI checks pass (`make ci` runs check, fmt, clippy, test, and audit)
 - [ ] All public items have doc comments
 - [ ] No commented-out code or debug statements
 - [ ] No hardcoded credentials

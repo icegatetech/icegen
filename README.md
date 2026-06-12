@@ -167,7 +167,10 @@ Boolean environment variables accept the following values:
 
 | Option | Environment Variable | Default | Description |
 |--------|---------------------|---------|-------------|
-| `--endpoint` | `OTEL_LOGS_ENDPOINT` | (required) | OTEL logs ingest endpoint |
+| `--endpoint` | `OTEL_LOGS_ENDPOINT` | (required) | OTLP ingest endpoint. With `--signal traces`, point it at the traces path (e.g. `.../v1/traces`) |
+| `--signal` | `OTEL_SIGNAL` | logs | Telemetry signal to generate: `logs` or `traces` (one signal per run) |
+| `--llm-max-tool-calls` | `LLM_MAX_TOOL_CALLS` | 3 | Max `execute_tool` spans per LLM trace (`--signal traces` only) |
+| `--llm-capture-content` | `LLM_CAPTURE_CONTENT` | false | Capture prompt/completion content into span attributes — PII risk (`--signal traces` only) |
 | `--healthcheck-endpoint` | `OTEL_HEALTHCHECK_ENDPOINT` | none | Health check endpoint |
 | `--use-protobuf` | `OTEL_USE_PROTOBUF` | false | Use protobuf encoding |
 | `--transport` | `OTEL_TRANSPORT` | http | Transport type (http/grpc) |
@@ -186,6 +189,43 @@ Boolean environment variables accept the following values:
 | `--label-cardinality-enabled` | `OTEL_LABEL_CARDINALITY_ENABLED` | true | Enable/disable label cardinality limiting |
 | `--label-cardinality-default-limit` | `OTEL_LABEL_CARDINALITY_DEFAULT_LIMIT` | none | Default limit for unlisted keys |
 | `--label-cardinality-limits` | `OTEL_LABEL_CARDINALITY_LIMITS` | `""` | CSV map `key=limit,key2=limit2` |
+
+## Signals: Logs and Traces
+
+The generator emits one telemetry signal per run, selected with `--signal` / `OTEL_SIGNAL`:
+
+- `logs` (default) — flat OTLP log records, unchanged from previous releases.
+- `traces` — synthetic OTLP traces with LLM (`gen_ai.*`) semantics following the current OpenTelemetry GenAI semantic conventions.
+
+In `traces` mode each service shard becomes one trace (a single `trace_id`) whose span tree is:
+
+```
+invoke_agent {agent}        (INTERNAL)   gen_ai.operation.name, gen_ai.provider.name, gen_ai.agent.name
+└─ chat {model}             (CLIENT)     gen_ai.request.*, gen_ai.response.*, gen_ai.usage.{input,output}_tokens
+   └─ execute_tool {tool}*  (INTERNAL)   gen_ai.tool.name, gen_ai.tool.call.id  (0..LLM_MAX_TOOL_CALLS)
+└─ embeddings {model}?      (CLIENT)     gen_ai.embeddings.dimension.count  (~40% of traces)
+```
+
+Span timing is consistent: the root span fully encloses its children, which are laid out sequentially.
+Numeric attributes (token counts, temperature) use typed OTLP values (`intValue`/`doubleValue`), and
+`gen_ai.response.finish_reasons` is an array value.
+
+Prompt/completion content is omitted by default. Enable `--llm-capture-content` to attach
+`gen_ai.input.messages` / `gen_ai.output.messages` — note this can carry PII and inflate payloads.
+
+```bash
+# Generate one LLM trace to stdout without any network transport
+otel-log-generator otel --signal traces --dry-run --print-logs
+
+# Stream traces over HTTP JSON to a collector
+otel-log-generator otel --signal traces --endpoint http://localhost:4318/v1/traces --continuous
+
+# gRPC transport (always protobuf wire format)
+otel-log-generator otel --signal traces --transport grpc --endpoint http://localhost:4317
+```
+
+Tenant routing, cloud-account/service pools, cardinality limiting, concurrency, and retry behaviour
+apply to both signals identically.
 
 ## Tenant Routing
 
