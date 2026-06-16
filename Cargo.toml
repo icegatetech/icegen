@@ -12,8 +12,12 @@ path = "src/main.rs"
 [lib]
 name = "otel_log_generator"
 path = "src/lib.rs"
+# Generated OTLP protobuf modules carry upstream doc comments whose indented text is
+# misparsed as Rust doctests; the crate has no real doctests, so disable them entirely.
+doctest = false
 
 [dependencies]
+base64 = "0.21"
 tokio = { version = "1.35", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "blocking"] }
 tonic = "0.11"

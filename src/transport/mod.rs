@@ -1,10 +1,12 @@
+pub mod auth;
 pub mod grpc;
+pub mod grpc_retry;
 pub mod http;
 pub mod noop;
 pub mod protobuf;
 
 use crate::error::GeneratorError;
-use crate::message::OTLPLogMessage;
+use crate::message::OTLPMessage;
 use async_trait::async_trait;
 use tokio::sync::watch;
 
@@ -29,17 +31,25 @@ impl SendOutcome {
             Self::Success { retries } | Self::Failure { retries, .. } => *retries,
         }
     }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::Failure {
+                error: crate::error::GeneratorError::Timeout,
+                ..
+            }
+        )
+    }
 }
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn send(
-        &self,
-        message: &OTLPLogMessage,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendOutcome;
+    async fn send(&self, message: &OTLPMessage, shutdown_rx: &watch::Receiver<bool>)
+        -> SendOutcome;
 }
 
-pub use grpc::GrpcTransport;
+pub use auth::AuthHeaders;
+pub use grpc::{LogGrpcTransport, TraceGrpcTransport};
 pub use http::HttpTransport;
 pub use noop::NoopTransport;

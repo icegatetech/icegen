@@ -1,11 +1,18 @@
-use crate::config::{BatchResult, OtelConfig};
+use crate::config::{parse_profile_weights, BatchResult, OtelConfig};
 use crate::error::Result;
-use crate::generator::base::LogGenerator;
-use crate::message::{
-    JsonEncoder, MessagePayload, OTLPLogMessage, OTLPLogMessageGenerator, ProtobufEncoder,
-    ServiceShard,
+use crate::generator::base::SignalGenerator;
+use crate::message::factory::{GenContext, LogMessageFactory, MessageFactory, TraceMessageFactory};
+use crate::message::traces::span_profile::{LlmSpanProfile, ProfileWeights};
+use crate::message::traces::{
+    ConversationPool, TraceEncoder, TraceJsonEncoder, TraceMessageGenerator, TraceProtobufEncoder,
 };
-use crate::transport::{GrpcTransport, HttpTransport, NoopTransport, SendOutcome, Transport};
+use crate::message::{
+    JsonEncoder, MessagePayload, OTLPLogMessageGenerator, OTLPMessage, ProtobufEncoder,
+    ServiceShard, Signal,
+};
+use crate::transport::{
+    HttpTransport, LogGrpcTransport, NoopTransport, SendOutcome, TraceGrpcTransport, Transport,
+};
 use async_trait::async_trait;
 use rand::Rng;
 use std::future::Future;
@@ -59,9 +66,9 @@ impl TenantProfile {
 }
 
 #[derive(Clone)]
-pub struct OtelLogGenerator {
+pub struct OtelGenerator {
     config: OtelConfig,
-    message_generator: OTLPLogMessageGenerator,
+    factory: Arc<dyn MessageFactory>,
     transport: Arc<dyn Transport>,
     tenant_profiles: Arc<[TenantProfile]>,
 }
@@ -76,8 +83,10 @@ struct ProgressTracker {
     total_payload_bytes: AtomicUsize,
     window_payload_bytes: AtomicUsize,
     total_response_time_micros: AtomicU64,
+    max_response_time_micros: AtomicU64,
     total_responses: AtomicUsize,
     total_retries: AtomicUsize,
+    total_timeouts: AtomicUsize,
 }
 
 impl ProgressTracker {
@@ -93,20 +102,26 @@ impl ProgressTracker {
             total_payload_bytes: AtomicUsize::new(0),
             window_payload_bytes: AtomicUsize::new(0),
             total_response_time_micros: AtomicU64::new(0),
+            max_response_time_micros: AtomicU64::new(0),
             total_responses: AtomicUsize::new(0),
             total_retries: AtomicUsize::new(0),
+            total_timeouts: AtomicUsize::new(0),
         }
     }
 
     fn record(
         &self,
         sent: bool,
+        is_timeout: bool,
         retries: usize,
         payload_size_bytes: usize,
         response_time: Duration,
     ) -> usize {
         if sent {
             self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+        if is_timeout {
+            self.total_timeouts.fetch_add(1, Ordering::Relaxed);
         }
         if retries > 0 {
             self.total_retries.fetch_add(retries, Ordering::Relaxed);
@@ -124,6 +139,20 @@ impl ProgressTracker {
             self.total_response_time_micros
                 .fetch_add(response_micros, Ordering::Relaxed);
             self.total_responses.fetch_add(1, Ordering::Relaxed);
+
+            // CAS loop to update the running maximum without a mutex.
+            let mut current = self.max_response_time_micros.load(Ordering::Relaxed);
+            while response_micros > current {
+                match self.max_response_time_micros.compare_exchange_weak(
+                    current,
+                    response_micros,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
         }
 
         self.processed.fetch_add(1, Ordering::Relaxed) + 1
@@ -155,12 +184,15 @@ impl ProgressTracker {
         let retries_per_processed_message = total_retries as f64 / processed as f64;
 
         let total_response_time_micros = self.total_response_time_micros.load(Ordering::Relaxed);
+        let max_response_time_micros = self.max_response_time_micros.load(Ordering::Relaxed);
         let total_responses = self.total_responses.load(Ordering::Relaxed);
+        let total_timeouts = self.total_timeouts.load(Ordering::Relaxed);
         let avg_response_time_ms = if total_responses > 0 {
             (total_response_time_micros as f64 / total_responses as f64) / 1000.0
         } else {
             0.0
         };
+        let max_response_time_ms = max_response_time_micros as f64 / 1000.0;
 
         let window_payload_bytes = self.window_payload_bytes.swap(0, Ordering::Relaxed);
         let mut last_progress_at = self
@@ -174,7 +206,7 @@ impl ProgressTracker {
 
         match self.total_target {
             Some(total_target) => println!(
-                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; retries/processed: {:.3}",
+                "Progress: {}/{} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms, max: {:.2} ms; timeouts: {}; retries total: {}; retries/processed: {:.3}",
                 processed,
                 total_target,
                 total_sent_mib,
@@ -182,17 +214,21 @@ impl ProgressTracker {
                 current_speed_mib_s,
                 avg_rps,
                 avg_response_time_ms,
+                max_response_time_ms,
+                total_timeouts,
                 total_retries,
                 retries_per_processed_message
             ),
             None => println!(
-                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms; retries total: {}; retries/processed: {:.3}",
+                "Progress: {} messages processed; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms, max: {:.2} ms; timeouts: {}; retries total: {}; retries/processed: {:.3}",
                 processed,
                 total_sent_mib,
                 avg_speed_mib_s,
                 current_speed_mib_s,
                 avg_rps,
                 avg_response_time_ms,
+                max_response_time_ms,
+                total_timeouts,
                 total_retries,
                 retries_per_processed_message
             ),
@@ -235,7 +271,7 @@ impl BatchPacer {
 
 type BatchFuture<'a> = Pin<Box<dyn Future<Output = Result<BatchResult>> + Send + 'a>>;
 
-impl OtelLogGenerator {
+impl OtelGenerator {
     fn build_tenant_profiles(config: &OtelConfig) -> Arc<[TenantProfile]> {
         let tenant_ids: Vec<Option<String>> = match config.tenant_count {
             0 => vec![None],
@@ -285,7 +321,14 @@ impl OtelLogGenerator {
     pub async fn new(config: OtelConfig) -> Result<Self> {
         config.validate()?;
 
-        println!("Initializing OTEL Log Generator...");
+        println!("Initializing OTEL Generator...");
+        println!(
+            "  Signal: {}",
+            match config.signal {
+                Signal::Logs => "logs",
+                Signal::Traces => "traces",
+            }
+        );
         if config.dry_run {
             println!("  Dry-run: no network transport, stdout only");
         } else {
@@ -294,7 +337,10 @@ impl OtelLogGenerator {
             println!("  Use Protobuf: {}", config.use_protobuf);
         }
         println!("  Records per message: {}", config.records_per_message);
-        println!("  Services per message: {}", config.service_shards_per_message);
+        println!(
+            "  Services per message: {}",
+            config.service_shards_per_message
+        );
         println!("  Invalid record %: {}", config.invalid_record_percent);
         println!("  Concurrency: {}", config.concurrency);
         if config.tenant_count == 0 {
@@ -334,14 +380,24 @@ impl OtelLogGenerator {
             "  Retry: max_retries={}, base_delay={}ms, max_delay={}ms",
             retry_config.max_retries, retry_config.base_delay_ms, retry_config.max_delay_ms
         );
-        println!(
-            "  Label cardinality limiting: {}",
-            config.label_cardinality_enabled
-        );
+        // Cardinality normalization is wired into the log path only; the trace generator does not
+        // receive LabelCardinalityConfig, so report it honestly per signal instead of always
+        // printing the configured flag.
+        match config.signal {
+            Signal::Logs => println!(
+                "  Label cardinality limiting: {}",
+                config.label_cardinality_enabled
+            ),
+            // TODO(high): add cardinality support
+            Signal::Traces => println!("  Label cardinality limiting: n/a (logs only)"),
+        }
 
         if config.dry_run {
             return Self::with_transport(config, Arc::new(NoopTransport));
         }
+
+        // Vendor auth headers, applied to every request regardless of transport/tenant.
+        let auth = config.auth_headers()?;
 
         let transport: Arc<dyn Transport> = match config.transport.as_str() {
             "http" => {
@@ -349,6 +405,7 @@ impl OtelLogGenerator {
                     config.ingest_endpoint.clone(),
                     config.use_protobuf,
                     retry_config,
+                    auth,
                 )?;
 
                 if let Some(ref health_endpoint) = config.healthcheck_endpoint {
@@ -364,11 +421,16 @@ impl OtelLogGenerator {
 
                 Arc::new(http_transport)
             }
-            "grpc" => {
-                let grpc_transport =
-                    GrpcTransport::new(config.ingest_endpoint.clone(), retry_config).await?;
-                Arc::new(grpc_transport)
-            }
+            "grpc" => match config.signal {
+                Signal::Logs => Arc::new(
+                    LogGrpcTransport::new(config.ingest_endpoint.clone(), retry_config, auth)
+                        .await?,
+                ),
+                Signal::Traces => Arc::new(
+                    TraceGrpcTransport::new(config.ingest_endpoint.clone(), retry_config, auth)
+                        .await?,
+                ),
+            },
             _ => unreachable!(),
         };
 
@@ -380,25 +442,54 @@ impl OtelLogGenerator {
         config: OtelConfig,
         transport: Arc<dyn Transport>,
     ) -> Result<Self> {
-        let cardinality_config = config.label_cardinality_config()?;
-        let encoder: Arc<dyn crate::message::OtlpEncoder> =
-            if config.transport == "grpc" || config.use_protobuf {
-                Arc::new(ProtobufEncoder)
-            } else {
-                Arc::new(JsonEncoder)
-            };
-        let message_generator = OTLPLogMessageGenerator::new(
-            "rust-generator".to_string(),
-            cardinality_config,
-            config.timestamp_jitter_config(),
-            encoder,
-        );
+        let want_protobuf = config.transport == "grpc" || config.use_protobuf;
+        let factory: Arc<dyn MessageFactory> = match config.signal {
+            Signal::Logs => {
+                let encoder: Arc<dyn crate::message::OtlpEncoder> = if want_protobuf {
+                    Arc::new(ProtobufEncoder)
+                } else {
+                    Arc::new(JsonEncoder)
+                };
+                Arc::new(LogMessageFactory {
+                    generator: OTLPLogMessageGenerator::new(
+                        "rust-generator".to_string(),
+                        config.label_cardinality_config()?,
+                        config.timestamp_jitter_config(),
+                        encoder,
+                    ),
+                })
+            }
+            Signal::Traces => {
+                let encoder: Arc<dyn TraceEncoder> = if want_protobuf {
+                    Arc::new(TraceProtobufEncoder)
+                } else {
+                    Arc::new(TraceJsonEncoder)
+                };
+                // TODO(med): for generic traces add GenericSpanProfile and create TRACE_PROFILE env to switch
+                let conversations = ConversationPool::shared_default(&mut rand::thread_rng());
+                let weights = ProfileWeights::from_pairs(&parse_profile_weights(
+                    &config.llm_profile_weights,
+                )?)?;
+                Arc::new(TraceMessageFactory {
+                    generator: TraceMessageGenerator::new(
+                        "rust-generator".to_string(),
+                        encoder,
+                        Arc::new(LlmSpanProfile {
+                            max_tool_calls: config.llm_max_tool_calls,
+                            capture_content: config.llm_capture_content,
+                            weights,
+                            conversations,
+                        }),
+                    ),
+                })
+            }
+        };
         let tenant_profiles = Self::build_tenant_profiles(&config);
         println!("✓ Generator initialized successfully\n");
 
         Ok(Self {
             config,
-            message_generator,
+            factory,
             transport,
             tenant_profiles,
         })
@@ -549,6 +640,7 @@ impl OtelLogGenerator {
             if let Some(progress) = &progress {
                 let processed = progress.record(
                     send_report.is_success(),
+                    send_report.is_timeout(),
                     send_report.retries(),
                     sent_payload_bytes,
                     response_time,
@@ -562,8 +654,8 @@ impl OtelLogGenerator {
 }
 
 #[async_trait]
-impl LogGenerator for OtelLogGenerator {
-    fn generate_message(&self) -> Result<OTLPLogMessage> {
+impl SignalGenerator for OtelGenerator {
+    fn generate_message(&self) -> Result<OTLPMessage> {
         let mut rng = rand::thread_rng();
         let tenant_profile = self.select_tenant_profile();
         let tenant_id = tenant_profile.tenant_id.clone();
@@ -574,17 +666,17 @@ impl LogGenerator for OtelLogGenerator {
         );
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
 
-        if should_be_invalid {
-            self.message_generator.generate_invalid_message(tenant_id)
-        } else {
-            self.message_generator
-                .generate_message(tenant_id, cloud_account_id, shards)
-        }
+        self.factory.build(GenContext {
+            tenant_id,
+            cloud_account_id,
+            shards,
+            invalid: should_be_invalid,
+        })
     }
 
     async fn send_message(
         &self,
-        message: &OTLPLogMessage,
+        message: &OTLPMessage,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> Result<SendOutcome> {
         if self.config.print_logs {
@@ -761,7 +853,7 @@ mod tests {
     impl Transport for CountingTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             _shutdown_rx: &watch::Receiver<bool>,
         ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -791,7 +883,7 @@ mod tests {
     impl Transport for RetryAwareTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             shutdown_rx: &watch::Receiver<bool>,
         ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -817,7 +909,7 @@ mod tests {
     impl Transport for TimestampTransport {
         async fn send(
             &self,
-            _message: &OTLPLogMessage,
+            _message: &OTLPMessage,
             _shutdown_rx: &watch::Receiver<bool>,
         ) -> SendOutcome {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -857,6 +949,14 @@ mod tests {
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
             service_shards_per_message: 1,
+            signal: crate::message::Signal::Logs,
+            llm_max_tool_calls: 3,
+            llm_capture_content: false,
+            llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
+                .to_string(),
+            auth_headers: String::new(),
+            auth_bearer: None,
+            auth_basic: None,
         }
     }
 
@@ -875,7 +975,7 @@ mod tests {
         );
     }
 
-    fn resource_attribute(message: &OTLPLogMessage, key: &str) -> Option<String> {
+    fn resource_attribute(message: &OTLPMessage, key: &str) -> Option<String> {
         let MessagePayload::Json(json) = &message.message else {
             return None;
         };
@@ -899,7 +999,7 @@ mod tests {
             })
     }
 
-    fn profile_for<'a>(generator: &'a OtelLogGenerator, tenant_id: &str) -> &'a TenantProfile {
+    fn profile_for<'a>(generator: &'a OtelGenerator, tenant_id: &str) -> &'a TenantProfile {
         generator
             .tenant_profiles
             .iter()
@@ -936,9 +1036,17 @@ mod tests {
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
             service_shards_per_message: 1,
+            signal: crate::message::Signal::Logs,
+            llm_max_tool_calls: 3,
+            llm_capture_content: false,
+            llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
+                .to_string(),
+            auth_headers: String::new(),
+            auth_bearer: None,
+            auth_basic: None,
         };
 
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let attempts = AtomicUsize::new(0);
 
@@ -975,7 +1083,7 @@ mod tests {
     async fn batch_result_scales_with_concurrency() {
         let config = test_config(3, 0, 4);
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(20)));
-        let generator = OtelLogGenerator::with_transport(config.clone(), transport).unwrap();
+        let generator = OtelGenerator::with_transport(config.clone(), transport).unwrap();
 
         let result = generator
             .send_messages_batch(config.count, config.message_interval_ms)
@@ -991,8 +1099,7 @@ mod tests {
     async fn parallelism_does_not_exceed_configured_concurrency() {
         let config = test_config(3, 0, 4);
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(50)));
-        let generator =
-            OtelLogGenerator::with_transport(config.clone(), transport.clone()).unwrap();
+        let generator = OtelGenerator::with_transport(config.clone(), transport.clone()).unwrap();
 
         let result = generator
             .send_messages_batch(config.count, config.message_interval_ms)
@@ -1007,8 +1114,7 @@ mod tests {
     async fn batch_result_preserves_total_count_with_remainder_distribution() {
         let config = test_config(5, 0, 3);
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(20)));
-        let generator =
-            OtelLogGenerator::with_transport(config.clone(), transport.clone()).unwrap();
+        let generator = OtelGenerator::with_transport(config.clone(), transport.clone()).unwrap();
 
         let result = generator
             .send_messages_batch(config.count, config.message_interval_ms)
@@ -1025,8 +1131,7 @@ mod tests {
     async fn batch_interval_is_global_across_workers() {
         let config = test_config(4, 40, 2);
         let transport = Arc::new(TimestampTransport::new());
-        let generator =
-            OtelLogGenerator::with_transport(config.clone(), transport.clone()).unwrap();
+        let generator = OtelGenerator::with_transport(config.clone(), transport.clone()).unwrap();
 
         let result = generator
             .send_messages_batch(config.count, config.message_interval_ms)
@@ -1055,8 +1160,7 @@ mod tests {
         config.continuous = true;
 
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(50)));
-        let generator =
-            Arc::new(OtelLogGenerator::with_transport(config, transport.clone()).unwrap());
+        let generator = Arc::new(OtelGenerator::with_transport(config, transport.clone()).unwrap());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task = {
@@ -1086,8 +1190,7 @@ mod tests {
         config.continuous = true;
 
         let transport = Arc::new(RetryAwareTransport::new(Duration::from_millis(200)));
-        let generator =
-            Arc::new(OtelLogGenerator::with_transport(config, transport.clone()).unwrap());
+        let generator = Arc::new(OtelGenerator::with_transport(config, transport.clone()).unwrap());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task = {
@@ -1125,7 +1228,7 @@ mod tests {
 
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(30)));
         let generator =
-            Arc::new(OtelLogGenerator::with_transport(config.clone(), transport.clone()).unwrap());
+            Arc::new(OtelGenerator::with_transport(config.clone(), transport.clone()).unwrap());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let task = {
@@ -1155,8 +1258,7 @@ mod tests {
     async fn concurrency_one_preserves_sequential_behavior() {
         let config = test_config(3, 0, 1);
         let transport = Arc::new(CountingTransport::new(Duration::from_millis(20)));
-        let generator =
-            OtelLogGenerator::with_transport(config.clone(), transport.clone()).unwrap();
+        let generator = OtelGenerator::with_transport(config.clone(), transport.clone()).unwrap();
 
         let result = generator
             .send_messages_batch(config.count, config.message_interval_ms)
@@ -1171,7 +1273,7 @@ mod tests {
     #[test]
     fn generate_message_uses_single_tenant_config() {
         let config = test_config(3, 0, 1);
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         for _ in 0..5 {
             let message = generator.generate_message().unwrap();
@@ -1183,7 +1285,7 @@ mod tests {
     fn single_tenant_builds_one_profile_for_explicit_tenant_id() {
         let mut config = test_config(3, 0, 1);
         config.tenant_id = "tenant_custom".to_string();
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         assert_eq!(generator.tenant_profiles.len(), 1);
         let profile = &generator.tenant_profiles[0];
@@ -1208,7 +1310,7 @@ mod tests {
     fn multi_tenant_builds_profiles_for_tenant_range() {
         let mut config = test_config(3, 0, 1);
         config.tenant_count = 3;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         let tenant_ids = generator
             .tenant_profiles
@@ -1224,7 +1326,7 @@ mod tests {
         config.tenant_count = 3;
         config.cloud_account_count_per_tenant = 2;
         config.service_count_per_tenant = 3;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         for _ in 0..50 {
             let message = generator.generate_message().unwrap();
@@ -1256,7 +1358,7 @@ mod tests {
         config.tenant_count = 4;
         config.cloud_account_count_per_tenant = 2;
         config.service_count_per_tenant = 2;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         let mut seen_tenants = std::collections::BTreeSet::new();
 
@@ -1281,7 +1383,7 @@ mod tests {
         let mut config = test_config(3, 0, 1);
         config.tenant_count = 3;
         config.tenant_id = "legacy_tenant".to_string();
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         for _ in 0..50 {
             let message = generator.generate_message().unwrap();
@@ -1296,7 +1398,7 @@ mod tests {
     fn zero_tenant_count_builds_single_profile_without_tenant_id() {
         let mut config = test_config(1, 0, 1);
         config.tenant_count = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         assert_eq!(generator.tenant_profiles.len(), 1);
         assert!(generator.tenant_profiles[0].tenant_id.is_none());
     }
@@ -1305,7 +1407,7 @@ mod tests {
     fn zero_cloud_account_count_builds_profile_without_pool() {
         let mut config = test_config(1, 0, 1);
         config.cloud_account_count_per_tenant = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         assert!(generator.tenant_profiles[0].cloud_account_ids.is_none());
     }
 
@@ -1313,7 +1415,7 @@ mod tests {
     fn zero_service_count_builds_profile_without_pool() {
         let mut config = test_config(1, 0, 1);
         config.service_count_per_tenant = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         assert!(generator.tenant_profiles[0].service_names.is_none());
     }
 
@@ -1321,7 +1423,7 @@ mod tests {
     fn message_omits_service_name_when_disabled() {
         let mut config = test_config(1, 0, 1);
         config.service_count_per_tenant = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(resource_attribute(&message, "service.name").is_none());
         let MessagePayload::Json(json) = &message.message else {
@@ -1361,7 +1463,7 @@ mod tests {
     fn message_omits_cloud_account_id_when_disabled() {
         let mut config = test_config(1, 0, 1);
         config.cloud_account_count_per_tenant = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(resource_attribute(&message, "cloud.account.id").is_none());
     }
@@ -1372,7 +1474,7 @@ mod tests {
         config.dry_run = true;
         config.ingest_endpoint = String::new();
 
-        let generator = OtelLogGenerator::new(config).await.unwrap();
+        let generator = OtelGenerator::new(config).await.unwrap();
         let result = generator.send_messages_batch(1, 0).await.unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.success, 1);
@@ -1383,19 +1485,22 @@ mod tests {
     fn message_has_no_tenant_id_when_disabled() {
         let mut config = test_config(1, 0, 1);
         config.tenant_count = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let message = generator.generate_message().unwrap();
         assert!(message.tenant_id.is_none());
     }
 
-    fn shard_count_json(message: &OTLPLogMessage) -> usize {
+    fn shard_count_json(message: &OTLPMessage) -> usize {
         let MessagePayload::Json(json) = &message.message else {
             panic!("expected JSON payload");
         };
-        json["resourceLogs"].as_array().expect("resourceLogs array").len()
+        json["resourceLogs"]
+            .as_array()
+            .expect("resourceLogs array")
+            .len()
     }
 
-    fn shard_service_names_json(message: &OTLPLogMessage) -> Vec<String> {
+    fn shard_service_names_json(message: &OTLPMessage) -> Vec<String> {
         let MessagePayload::Json(json) = &message.message else {
             panic!("expected JSON payload");
         };
@@ -1417,7 +1522,7 @@ mod tests {
             .collect()
     }
 
-    fn shard_record_counts_json(message: &OTLPLogMessage) -> Vec<usize> {
+    fn shard_record_counts_json(message: &OTLPMessage) -> Vec<usize> {
         let MessagePayload::Json(json) = &message.message else {
             panic!("expected JSON payload");
         };
@@ -1431,13 +1536,13 @@ mod tests {
 
     #[test]
     fn generate_message_with_service_shards_per_message_emits_one_resource_logs_per_shard_json() {
-        // End-to-end through OtelLogGenerator::generate_message: select_service_shards
+        // End-to-end through OtelGenerator::generate_message: select_service_shards
         // distributes records across shards, JsonEncoder emits one ResourceLogs per shard.
         let mut config = test_config(1, 0, 1);
         config.records_per_message = 9;
         config.service_shards_per_message = 3;
         config.service_count_per_tenant = 3;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
         let pool: Vec<String> = generator.tenant_profiles[0]
             .service_names
             .as_ref()
@@ -1450,7 +1555,10 @@ mod tests {
         assert_eq!(shard_count_json(&message), 3);
         assert_eq!(shard_record_counts_json(&message).iter().sum::<usize>(), 9);
         for name in shard_service_names_json(&message) {
-            assert!(pool.contains(&name), "service name {name} must come from tenant pool");
+            assert!(
+                pool.contains(&name),
+                "service name {name} must come from tenant pool"
+            );
         }
     }
 
@@ -1468,17 +1576,18 @@ mod tests {
         // Disable overlap so monotonicity is a hard invariant.
         config.record_intra_batch_overlap_probability = 0.0;
         config.record_intra_batch_timestamp_jitter_ns = 5_000_000;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         let message = generator.generate_message().unwrap();
         let MessagePayload::Protobuf(bytes) = &message.message else {
             panic!("expected Protobuf payload from use_protobuf=true");
         };
         use prost::Message;
-        let decoded = crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest::decode(
-            bytes.as_slice(),
-        )
-        .unwrap();
+        let decoded =
+            crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest::decode(
+                bytes.as_slice(),
+            )
+            .unwrap();
         assert_eq!(decoded.resource_logs.len(), 2);
         let total: usize = decoded
             .resource_logs
@@ -1505,6 +1614,59 @@ mod tests {
     }
 
     #[test]
+    fn generate_message_with_traces_signal_emits_resource_spans() {
+        // signal=traces routes through TraceMessageFactory: payload must carry resourceSpans
+        // with gen_ai.* span attributes, and the message must be tagged Signal::Traces.
+        let mut config = test_config(1, 0, 1);
+        config.signal = crate::message::Signal::Traces;
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let message = generator.generate_message().unwrap();
+        assert_eq!(message.signal, crate::message::Signal::Traces);
+        let MessagePayload::Json(json) = &message.message else {
+            panic!("expected JSON trace payload");
+        };
+        let resource_spans = json["resourceSpans"]
+            .as_array()
+            .expect("resourceSpans array");
+        assert!(!resource_spans.is_empty());
+        let spans = resource_spans[0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans array");
+        // Spans are emitted in random order; the root is the single parent-less span.
+        let root = spans
+            .iter()
+            .find(|s| s["parentSpanId"].as_str().is_none())
+            .expect("exactly one root span");
+        assert!(root["name"].as_str().unwrap().starts_with("invoke_agent"));
+        let has_gen_ai = spans.iter().any(|s| {
+            s["attributes"]
+                .as_array()
+                .map(|attrs| {
+                    attrs
+                        .iter()
+                        .any(|a| a["key"].as_str().unwrap_or("").starts_with("gen_ai."))
+                })
+                .unwrap_or(false)
+        });
+        assert!(has_gen_ai, "trace spans must carry gen_ai.* attributes");
+    }
+
+    #[test]
+    fn generate_message_with_traces_signal_and_protobuf_uses_protobuf_encoder() {
+        let mut config = test_config(1, 0, 1);
+        config.signal = crate::message::Signal::Traces;
+        config.use_protobuf = true;
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        let message = generator.generate_message().unwrap();
+        assert!(
+            matches!(message.message, MessagePayload::Protobuf(_)),
+            "use_protobuf=true must select TraceProtobufEncoder"
+        );
+    }
+
+    #[test]
     fn generate_message_with_grpc_transport_forces_protobuf_encoder() {
         // transport="grpc" must override use_protobuf=false and pick ProtobufEncoder (gRPC wire
         // is always protobuf). This is the second leg of the encoder-selection conditional in
@@ -1512,7 +1674,7 @@ mod tests {
         let mut config = test_config(1, 0, 1);
         config.transport = "grpc".to_string();
         config.use_protobuf = false;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         let message = generator.generate_message().unwrap();
         assert!(
@@ -1530,7 +1692,7 @@ mod tests {
         config.records_per_message = 5;
         config.service_shards_per_message = 5;
         config.service_count_per_tenant = 0;
-        let generator = OtelLogGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
 
         let message = generator.generate_message().unwrap();
         assert_eq!(shard_count_json(&message), 1);
@@ -1577,7 +1739,9 @@ mod tests {
         assert_eq!(shards.len(), 5, "5 shards even with pool_size=1");
         assert_eq!(shards.iter().map(|s| s.num_records).sum::<usize>(), 5);
         assert!(
-            shards.iter().all(|s| s.service_name.as_deref() == Some("a")),
+            shards
+                .iter()
+                .all(|s| s.service_name.as_deref() == Some("a")),
             "every shard must reuse the only pool entry"
         );
     }

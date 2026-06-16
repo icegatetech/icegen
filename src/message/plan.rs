@@ -1,4 +1,4 @@
-use crate::message::types::OTLPLogMessageType;
+use crate::message::types::OTLPMessageType;
 
 /// A single log record in format-neutral form.
 ///
@@ -35,5 +35,5 @@ pub struct PlannedShard {
 pub struct PlannedRequest {
     pub project_id: String,
     pub shards: Vec<PlannedShard>,
-    pub message_type: OTLPLogMessageType,
+    pub message_type: OTLPMessageType,
 }

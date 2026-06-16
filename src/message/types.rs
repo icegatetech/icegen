@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// Telemetry signal type carried by the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OTLPLogMessageType {
+pub enum Signal {
+    Logs,
+    Traces,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OTLPMessageType {
     Valid,
     InvalidJson,
     InvalidMalformedJson,
@@ -14,25 +21,29 @@ pub enum MessagePayload {
     MalformedJson(String),
 }
 
+/// A single OTLP message (logs or traces), ready to be sent by the transport.
 #[derive(Debug, Clone)]
-pub struct OTLPLogMessage {
+pub struct OTLPMessage {
     pub message: MessagePayload,
+    pub signal: Signal,
     pub tenant_id: Option<String>,
     pub project_id: String,
     pub source: String,
-    pub message_type: OTLPLogMessageType,
+    pub message_type: OTLPMessageType,
 }
 
-impl OTLPLogMessage {
+impl OTLPMessage {
     pub fn new(
         message: MessagePayload,
+        signal: Signal,
         tenant_id: Option<String>,
         project_id: String,
         source: String,
-        message_type: OTLPLogMessageType,
+        message_type: OTLPMessageType,
     ) -> Self {
         Self {
             message,
+            signal,
             tenant_id,
             project_id,
             source,
@@ -47,5 +58,23 @@ impl OTLPLogMessage {
             MessagePayload::Protobuf(bytes) => bytes.len(),
             MessagePayload::MalformedJson(s) => s.len(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_message_carries_logs_signal() {
+        let msg = OTLPMessage::new(
+            MessagePayload::Json(serde_json::json!({"resourceLogs": []})),
+            Signal::Logs,
+            Some("tenant1".to_string()),
+            "proj".to_string(),
+            "src".to_string(),
+            OTLPMessageType::Valid,
+        );
+        assert_eq!(msg.signal, Signal::Logs);
     }
 }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use otel_log_generator::{Cli, GeneratorType, LogGenerator, OtelConfig, OtelLogGenerator};
+use otel_log_generator::{Cli, GeneratorType, OtelConfig, OtelGenerator, SignalGenerator};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::watch;
@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.generator {
         GeneratorType::Otel(args) => {
             let config: OtelConfig = args.into();
-            let generator = Arc::new(OtelLogGenerator::new(config.clone()).await?);
+            let generator = Arc::new(OtelGenerator::new(config.clone()).await?);
 
             if config.continuous {
                 println!("Running in continuous mode. Press Ctrl+C or send SIGTERM to stop.");

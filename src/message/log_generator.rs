@@ -3,14 +3,13 @@ use crate::error::{GeneratorError, Result};
 use crate::message::encoder::OtlpEncoder;
 use crate::message::fake_data::FakeDataGenerator;
 use crate::message::plan::{PlannedRecord, PlannedRequest, PlannedShard};
-use crate::message::types::{MessagePayload, OTLPLogMessage, OTLPLogMessageType};
+use crate::message::resource_attrs::DEFAULT_SERVICE_NAME;
+use crate::message::types::{MessagePayload, OTLPMessage, OTLPMessageType, Signal};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::json;
 use std::sync::Arc;
-
-const DEFAULT_SERVICE_NAME: &str = "icegen";
 
 /// One shard of a multi-service OTLP request, mapping to a single `ResourceLogs` entry.
 #[derive(Debug, Clone)]
@@ -58,36 +57,13 @@ impl OTLPLogMessageGenerator {
         cloud_account_id: Option<&str>,
         service_name: Option<&str>,
     ) -> Vec<(String, String)> {
-        let mut attributes = vec![("project_id".to_string(), project_id.to_string())];
-        if let Some(acc) = cloud_account_id {
-            attributes.push(("cloud.account.id".to_string(), acc.to_string()));
-        }
-        if let Some(svc) = service_name {
-            attributes.push(("service.name".to_string(), svc.to_string()));
-        }
-        attributes.push((
-            "service.version".to_string(),
-            FakeDataGenerator::generate_service_version(),
-        ));
-        attributes.push((
-            "deployment.environment".to_string(),
-            FakeDataGenerator::generate_deployment_environment(),
-        ));
-        attributes.push((
-            "host.name".to_string(),
-            FakeDataGenerator::generate_host_name(),
-        ));
-        attributes.push((
-            "k8s.pod.name".to_string(),
-            FakeDataGenerator::generate_k8s_pod_name(service_name.unwrap_or(DEFAULT_SERVICE_NAME)),
-        ));
-        attributes.push((
-            "k8s.namespace.name".to_string(),
-            FakeDataGenerator::generate_k8s_namespace(),
-        ));
-        attributes.push(("generator.source".to_string(), self.source.clone()));
-
-        self.normalize_attribute_pairs(attributes)
+        let pairs = crate::message::resource_attrs::build_resource_attribute_pairs(
+            project_id,
+            cloud_account_id,
+            service_name,
+            &self.source,
+        );
+        self.normalize_attribute_pairs(pairs)
     }
 
     fn generate_scope_attributes_pairs(&self, service_name: Option<&str>) -> Vec<(String, String)> {
@@ -291,10 +267,11 @@ impl OTLPLogMessageGenerator {
         message: MessagePayload,
         tenant_id: Option<String>,
         project_id: String,
-        message_type: OTLPLogMessageType,
-    ) -> OTLPLogMessage {
-        OTLPLogMessage::new(
+        message_type: OTLPMessageType,
+    ) -> OTLPMessage {
+        OTLPMessage::new(
             message,
+            Signal::Logs,
             tenant_id,
             project_id,
             self.source.clone(),
@@ -392,7 +369,7 @@ impl OTLPLogMessageGenerator {
         Ok(PlannedRequest {
             project_id,
             shards: planned_shards,
-            message_type: OTLPLogMessageType::Valid,
+            message_type: OTLPMessageType::Valid,
         })
     }
 
@@ -415,14 +392,14 @@ impl OTLPLogMessageGenerator {
         tenant_id: Option<String>,
         cloud_account_id: Option<String>,
         shards: Vec<ServiceShard>,
-    ) -> Result<OTLPLogMessage> {
+    ) -> Result<OTLPMessage> {
         let planned = self.plan_shards(cloud_account_id.as_deref(), &shards)?;
         let payload = self.encoder.encode(&planned)?;
         Ok(self.build_message(
             payload,
             tenant_id,
             planned.project_id,
-            OTLPLogMessageType::Valid,
+            OTLPMessageType::Valid,
         ))
     }
 
@@ -431,7 +408,7 @@ impl OTLPLogMessageGenerator {
     // protobuf, truncated message, invalid field tags) should live as a separate encoder-specific
     // "invalid" path once we decide the contract with the receiver tests.
     #[allow(clippy::result_large_err)]
-    pub fn generate_invalid_message(&self, tenant_id: Option<String>) -> Result<OTLPLogMessage> {
+    pub fn generate_invalid_message(&self, tenant_id: Option<String>) -> Result<OTLPMessage> {
         let mut rng = rand::thread_rng();
         let project_id = FakeDataGenerator::generate_project_id();
 
@@ -452,7 +429,7 @@ impl OTLPLogMessageGenerator {
                     MessagePayload::Json(invalid_message),
                     tenant_id,
                     project_id,
-                    OTLPLogMessageType::InvalidJson,
+                    OTLPMessageType::InvalidJson,
                 ))
             }
             "missing_resource_logs" => {
@@ -464,7 +441,7 @@ impl OTLPLogMessageGenerator {
                     MessagePayload::Json(invalid_message),
                     tenant_id,
                     project_id,
-                    OTLPLogMessageType::InvalidJson,
+                    OTLPMessageType::InvalidJson,
                 ))
             }
             "null_resource_logs" => {
@@ -473,7 +450,7 @@ impl OTLPLogMessageGenerator {
                     MessagePayload::Json(invalid_message),
                     tenant_id,
                     project_id,
-                    OTLPLogMessageType::InvalidJson,
+                    OTLPMessageType::InvalidJson,
                 ))
             }
             "invalid_resource_logs_type" => {
@@ -482,14 +459,14 @@ impl OTLPLogMessageGenerator {
                     MessagePayload::Json(invalid_message),
                     tenant_id,
                     project_id,
-                    OTLPLogMessageType::InvalidJson,
+                    OTLPMessageType::InvalidJson,
                 ))
             }
             "malformed_json" => Ok(self.build_message(
                 MessagePayload::MalformedJson(r#"{"resourceLogs": [ invalid json"#.to_string()),
                 tenant_id,
                 project_id,
-                OTLPLogMessageType::InvalidMalformedJson,
+                OTLPMessageType::InvalidMalformedJson,
             )),
             _ => {
                 let invalid_message = json!({"resourceLogs": []});
@@ -497,7 +474,7 @@ impl OTLPLogMessageGenerator {
                     MessagePayload::Json(invalid_message),
                     tenant_id,
                     project_id,
-                    OTLPLogMessageType::InvalidJson,
+                    OTLPMessageType::InvalidJson,
                 ))
             }
         }
@@ -604,7 +581,7 @@ mod tests {
         }]
     }
 
-    fn json_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+    fn json_timestamps(message: OTLPMessage) -> Vec<i64> {
         let MessagePayload::Json(json) = message.message else {
             panic!("Expected JSON payload");
         };
@@ -623,7 +600,7 @@ mod tests {
             .collect()
     }
 
-    fn json_timestamps_for_shard(message: &OTLPLogMessage, shard_index: usize) -> Vec<i64> {
+    fn json_timestamps_for_shard(message: &OTLPMessage, shard_index: usize) -> Vec<i64> {
         let MessagePayload::Json(json) = &message.message else {
             panic!("Expected JSON payload");
         };
@@ -642,7 +619,7 @@ mod tests {
             .collect()
     }
 
-    fn protobuf_timestamps(message: OTLPLogMessage) -> Vec<i64> {
+    fn protobuf_timestamps(message: OTLPMessage) -> Vec<i64> {
         let MessagePayload::Protobuf(bytes) = message.message else {
             panic!("Expected protobuf payload");
         };
@@ -1045,10 +1022,16 @@ mod tests {
     #[test]
     fn generate_message_returns_error_for_zero_num_records_shard() {
         let gen = gen_json_with_jitter(0, 0, 0.0);
-        let shards = vec![ServiceShard { service_name: None, num_records: 0 }];
+        let shards = vec![ServiceShard {
+            service_name: None,
+            num_records: 0,
+        }];
         let result = gen.generate_message(None, None, shards);
         assert!(
-            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
             "expected InvalidConfiguration for shard with num_records=0"
         );
     }
@@ -1057,12 +1040,21 @@ mod tests {
     fn generate_message_returns_error_when_second_shard_has_zero_records() {
         let gen = gen_json_with_jitter(0, 0, 0.0);
         let shards = vec![
-            ServiceShard { service_name: Some("svc-a".to_string()), num_records: 2 },
-            ServiceShard { service_name: Some("svc-b".to_string()), num_records: 0 },
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 2,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 0,
+            },
         ];
         let result = gen.generate_message(None, None, shards);
         assert!(
-            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
             "expected InvalidConfiguration when any shard has num_records=0"
         );
     }
@@ -1073,13 +1065,25 @@ mod tests {
         // the position-agnostic check in plan_shards must catch zero-records at index 0.
         let gen = gen_json_with_jitter(0, 0, 0.0);
         let shards = vec![
-            ServiceShard { service_name: Some("svc-a".to_string()), num_records: 0 },
-            ServiceShard { service_name: Some("svc-b".to_string()), num_records: 2 },
-            ServiceShard { service_name: Some("svc-c".to_string()), num_records: 3 },
+            ServiceShard {
+                service_name: Some("svc-a".to_string()),
+                num_records: 0,
+            },
+            ServiceShard {
+                service_name: Some("svc-b".to_string()),
+                num_records: 2,
+            },
+            ServiceShard {
+                service_name: Some("svc-c".to_string()),
+                num_records: 3,
+            },
         ];
         let result = gen.generate_message(None, None, shards);
         assert!(
-            matches!(result, Err(crate::error::GeneratorError::InvalidConfiguration(_))),
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
             "expected InvalidConfiguration when first shard has num_records=0"
         );
     }

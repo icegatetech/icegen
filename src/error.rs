@@ -34,6 +34,12 @@ pub enum GeneratorError {
     #[error("Request timeout")]
     Timeout,
 
+    #[error("span profile produced an empty trace (expected at least a root span)")]
+    EmptySpanTree,
+
+    #[error("malformed span tree: {0}")]
+    MalformedSpanTree(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
 

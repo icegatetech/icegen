@@ -292,7 +292,7 @@ CONTINUOUS_MODE=  # empty string
 
 Potential improvements (not in scope for initial release):
 - [ ] Metrics collection
-- [ ] Trace generation
+- [x] Trace generation
 - [ ] Multiple project configurations
 - [ ] Rate limiting
 - [ ] Custom log body templates

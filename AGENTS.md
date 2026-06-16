@@ -20,8 +20,8 @@ The project is a high-performance async OpenTelemetry log generator with:
 
 ### Code Style
 
-The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.toml`.
-@RUST.md
+The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.toml`. 
+For Rust development rules, see `/docs/RUST.md`.
 
 ### Important Instructions
 
@@ -33,3 +33,4 @@ The project uses `rustfmt` for code formatting. Configuration is in `rustfmt.tom
 - It is better to give an error than to use/calculate/show invalid data.
 - NEVER delete TODO comments if the changes do not fully cover the necessary edits in the comment.
 - When mutating a config parameter, ALWAYS reflect the change in `.env.example`.
+- All code and comments should be in English only.
