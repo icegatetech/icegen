@@ -1,4 +1,5 @@
 use crate::error::{GeneratorError, Result};
+use crate::message::traces::span_profile::ProfileWeights;
 use crate::message::types::Signal;
 use crate::transport::AuthHeaders;
 use rand::Rng;
@@ -265,8 +266,20 @@ impl OtelConfig {
         }
 
         parse_cardinality_limits(&self.label_cardinality_limits)?;
-        parse_profile_weights(&self.llm_profile_weights)?;
-        self.auth_headers()?;
+
+        // Profile weights are consumed only by the traces branch (see
+        // OtelGenerator::with_transport), including on the dry-run path. Run the full domain
+        // validation here so a malformed trace-only setting fails fast on a traces run and never
+        // blocks a logs-only run.
+        if self.signal == Signal::Traces {
+            ProfileWeights::from_pairs(&parse_profile_weights(&self.llm_profile_weights)?)?;
+        }
+
+        // Auth headers are built only on the live send path, after the dry-run early return, so
+        // skip parsing them on a dry-run that will never send a request.
+        if !self.dry_run {
+            self.auth_headers()?;
+        }
 
         if self.record_across_batch_timestamp_jitter_ms > 3_600_000 {
             return Err(GeneratorError::InvalidConfiguration(

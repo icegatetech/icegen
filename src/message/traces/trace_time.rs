@@ -1,6 +1,8 @@
 //! Time allocator for the span tree: recursively lays out each node's direct children
 //! sequentially within its window so that the parent fully encloses the whole subtree.
 
+use crate::error::GeneratorError;
+
 /// Resolve a relative event position (`offset_frac` of the span window) to an absolute
 /// timestamp, clamped into `[start_ns, end_ns]` to absorb rounding drift.
 ///
@@ -31,35 +33,97 @@ pub fn resolve_event_time(start_ns: i64, end_ns: i64, offset_frac: f64) -> i64 {
 /// * `gap_ns` — gap between adjacent children (negative is treated as 0).
 /// * `parallel` — per-node flag: when set, the node's direct children overlap instead of running
 ///   sequentially. Must be the same length as `parents`.
+///
+/// # Errors
+///
+/// Returns [`GeneratorError::MalformedSpanTree`] if the inputs do not describe a valid rooted
+/// tree: mismatched slice lengths, a parent index out of bounds, zero or multiple roots, or a
+/// cycle / disconnected node. Validating up front turns what would otherwise be a panic or
+/// unbounded recursion in `layout_node` into a typed error.
+#[allow(clippy::result_large_err)]
 pub fn layout_span_tree(
     root_start_ns: i64,
     parents: &[Option<usize>],
     durations_ns: &[i64],
     gap_ns: i64,
     parallel: &[bool],
-) -> Vec<(i64, i64)> {
+) -> Result<Vec<(i64, i64)>, GeneratorError> {
     let n = parents.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if durations_ns.len() != n {
+        return Err(GeneratorError::MalformedSpanTree(format!(
+            "durations_ns length {} != parents length {n}",
+            durations_ns.len()
+        )));
+    }
+    if parallel.len() != n {
+        return Err(GeneratorError::MalformedSpanTree(format!(
+            "parallel length {} != parents length {n}",
+            parallel.len()
+        )));
+    }
+
     let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut root = 0;
+    let mut root = None;
     for (i, parent) in parents.iter().enumerate() {
         match parent {
-            Some(p) => children[*p].push(i),
-            None => root = i,
+            Some(p) => {
+                let p = *p;
+                if p >= n {
+                    return Err(GeneratorError::MalformedSpanTree(format!(
+                        "node {i} has parent index {p} out of bounds (n={n})"
+                    )));
+                }
+                children[p].push(i);
+            }
+            None => {
+                if root.is_some() {
+                    return Err(GeneratorError::MalformedSpanTree(
+                        "more than one root (multiple None parents)".to_string(),
+                    ));
+                }
+                root = Some(i);
+            }
         }
     }
-    let mut windows = vec![(0_i64, 0_i64); n];
-    if n > 0 {
-        layout_node(
-            root,
-            root_start_ns,
-            &children,
-            durations_ns,
-            gap_ns,
-            parallel,
-            &mut windows,
-        );
+    let root = root.ok_or_else(|| {
+        GeneratorError::MalformedSpanTree("no root (no None parent)".to_string())
+    })?;
+
+    // Reachability from the root catches cycles and disconnected nodes. Done iteratively so a
+    // cyclic graph cannot overflow the stack here the way recursive `layout_node` would.
+    let mut visited = vec![false; n];
+    let mut stack = vec![root];
+    visited[root] = true;
+    let mut reached = 0_usize;
+    while let Some(node) = stack.pop() {
+        reached += 1;
+        for &child in &children[node] {
+            if !visited[child] {
+                visited[child] = true;
+                stack.push(child);
+            }
+        }
     }
-    windows
+    if reached != n {
+        return Err(GeneratorError::MalformedSpanTree(format!(
+            "cycle or disconnected node: {reached}/{n} nodes reachable from the root"
+        )));
+    }
+
+    let mut windows = vec![(0_i64, 0_i64); n];
+    layout_node(
+        root,
+        root_start_ns,
+        &children,
+        durations_ns,
+        gap_ns,
+        parallel,
+        &mut windows,
+    );
+    Ok(windows)
 }
 
 /// Lay out node `idx` from `start_ns`, recursively laying out its children. Returns the node's window end.
@@ -117,7 +181,7 @@ mod tests {
         // root (own duration 0) + 3 children at the same level
         let parents = [None, Some(0), Some(0), Some(0)];
         let durations = [0, 100, 200, 50];
-        let windows = layout_span_tree(1_000, &parents, &durations, 10, &no_parallel(4));
+        let windows = layout_span_tree(1_000, &parents, &durations, 10, &no_parallel(4)).unwrap();
         assert_eq!(windows.len(), 4);
         // children sequential, with a gap of 10
         assert_eq!(windows[1], (1_000, 1_100));
@@ -133,7 +197,7 @@ mod tests {
 
     #[test]
     fn no_children_returns_own_window() {
-        let windows = layout_span_tree(500, &[None], &[300], 10, &no_parallel(1));
+        let windows = layout_span_tree(500, &[None], &[300], 10, &no_parallel(1)).unwrap();
         assert_eq!(windows, vec![(500, 800)]);
     }
 
@@ -142,7 +206,7 @@ mod tests {
         // root(0) → chat(1) → tool(2); tool is longer than chat — chat's window must stretch
         let parents = [None, Some(0), Some(1)];
         let durations = [0, 100, 200];
-        let windows = layout_span_tree(0, &parents, &durations, 10, &no_parallel(3));
+        let windows = layout_span_tree(0, &parents, &durations, 10, &no_parallel(3)).unwrap();
         let (root_s, root_e) = windows[0];
         let (chat_s, chat_e) = windows[1];
         let (tool_s, tool_e) = windows[2];
@@ -158,7 +222,7 @@ mod tests {
         // chat itself is short, but tool is long — embeddings must not overlap chat's tail
         let parents = [None, Some(0), Some(1), Some(0)];
         let durations = [0, 50, 500, 80];
-        let windows = layout_span_tree(0, &parents, &durations, 10, &no_parallel(4));
+        let windows = layout_span_tree(0, &parents, &durations, 10, &no_parallel(4)).unwrap();
         let (_, chat_e) = windows[1];
         let (tool_s, tool_e) = windows[2];
         let (embed_s, _) = windows[3];
@@ -167,6 +231,54 @@ mod tests {
         // embeddings (sibling of chat) starts after chat's full window + gap
         assert!(embed_s >= chat_e, "sibling does not overlap extended chat");
         assert!(tool_s <= tool_e);
+    }
+
+    fn assert_malformed(result: Result<Vec<(i64, i64)>, GeneratorError>) {
+        assert!(
+            matches!(result, Err(GeneratorError::MalformedSpanTree(_))),
+            "expected MalformedSpanTree, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_tree_is_ok_and_empty() {
+        let windows = layout_span_tree(0, &[], &[], 10, &[]).unwrap();
+        assert!(windows.is_empty());
+    }
+
+    #[test]
+    fn parent_index_out_of_bounds_is_rejected() {
+        let parents = [None, Some(5)];
+        assert_malformed(layout_span_tree(0, &parents, &[0, 0], 10, &no_parallel(2)));
+    }
+
+    #[test]
+    fn mismatched_slice_lengths_are_rejected() {
+        let parents = [None, Some(0)];
+        // durations too short
+        assert_malformed(layout_span_tree(0, &parents, &[0], 10, &no_parallel(2)));
+        // parallel too short
+        assert_malformed(layout_span_tree(0, &parents, &[0, 0], 10, &no_parallel(1)));
+    }
+
+    #[test]
+    fn missing_root_is_rejected() {
+        // Two nodes pointing at each other: no None parent and a cycle.
+        let parents = [Some(1), Some(0)];
+        assert_malformed(layout_span_tree(0, &parents, &[0, 0], 10, &no_parallel(2)));
+    }
+
+    #[test]
+    fn multiple_roots_are_rejected() {
+        let parents = [None, None];
+        assert_malformed(layout_span_tree(0, &parents, &[0, 0], 10, &no_parallel(2)));
+    }
+
+    #[test]
+    fn cycle_with_valid_root_is_rejected() {
+        // root 0 is fine, but 1 and 2 form a cycle unreachable from the root.
+        let parents = [None, Some(2), Some(1)];
+        assert_malformed(layout_span_tree(0, &parents, &[0, 0, 0], 10, &no_parallel(3)));
     }
 
     #[test]
@@ -188,7 +300,7 @@ mod tests {
         let parents = [None, Some(0), Some(0)];
         let durations = [0, 100, 250];
         let parallel = [true, false, false]; // root fans its children out in parallel
-        let windows = layout_span_tree(1_000, &parents, &durations, 10, &parallel);
+        let windows = layout_span_tree(1_000, &parents, &durations, 10, &parallel).unwrap();
         let (root_s, root_e) = windows[0];
         let (a_s, a_e) = windows[1];
         let (b_s, b_e) = windows[2];

@@ -4,6 +4,7 @@
 
 use crate::message::fake_data::FakeDataGenerator;
 use rand::{Rng, RngCore};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Default number of distinct conversation ids in the pool. A constant for now; promote to config
@@ -24,11 +25,21 @@ impl ConversationPool {
     /// * `size` - number of distinct ids to pre-generate.
     /// * `rng` - randomness source for the identifiers.
     pub fn new(size: usize, rng: &mut dyn RngCore) -> Self {
-        let size = size.max(1);
-        let ids = (0..size)
-            .map(|_| FakeDataGenerator::generate_conversation_id(rng))
-            .collect();
-        Self { ids }
+        // Conversation ids are 4 random bytes, so at most 2^32 distinct values exist. Cap the
+        // request to that space (minus one to stay within usize on 32-bit targets) so the
+        // distinct-collection loop below always terminates.
+        const ID_SPACE_LIMIT: u64 = (1u64 << 32) - 1;
+        let size = (size.max(1) as u64).min(ID_SPACE_LIMIT) as usize;
+
+        // Collect into a set so duplicate draws are retried until `size` distinct ids exist,
+        // honouring the documented cardinality instead of letting collisions shrink the pool.
+        let mut set = HashSet::with_capacity(size);
+        while set.len() < size {
+            set.insert(FakeDataGenerator::generate_conversation_id(rng));
+        }
+        Self {
+            ids: set.into_iter().collect(),
+        }
     }
 
     /// Build a pool of [`DEFAULT_CONVERSATION_POOL_SIZE`] ids, wrapped in an [`Arc`] for sharing.
@@ -70,6 +81,15 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(2);
         let pool = ConversationPool::new(0, &mut rng);
         assert_eq!(pool.ids.len(), 1);
+    }
+
+    #[test]
+    fn pool_ids_are_distinct() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let pool = ConversationPool::new(256, &mut rng);
+        let unique: std::collections::HashSet<_> = pool.ids.iter().collect();
+        assert_eq!(unique.len(), pool.ids.len());
+        assert_eq!(pool.ids.len(), 256);
     }
 
     #[test]

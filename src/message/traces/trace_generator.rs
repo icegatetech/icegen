@@ -2,7 +2,7 @@
 //! `SpanProfile`), assigns time via `trace_time::layout_span_tree`, and encodes with
 //! `TraceEncoder`.
 
-use crate::error::Result;
+use crate::error::{GeneratorError, Result};
 use crate::message::fake_data::FakeDataGenerator;
 use crate::message::resource_attrs::{build_resource_attribute_pairs, DEFAULT_SERVICE_NAME};
 use crate::message::traces::span_profile::SpanProfile;
@@ -45,7 +45,8 @@ impl TraceMessageGenerator {
     /// # Errors
     ///
     /// Returns [`crate::error::GeneratorError::ProtobufEncodeError`] if the configured encoder
-    /// fails to serialize (only possible with [`crate::message::TraceProtobufEncoder`]).
+    /// fails to serialize (only possible with [`crate::message::TraceProtobufEncoder`]), or
+    /// [`crate::error::GeneratorError::EmptySpanTree`] if a span profile yields no nodes.
     #[allow(clippy::result_large_err)]
     pub fn generate_message(
         &self,
@@ -71,7 +72,7 @@ impl TraceMessageGenerator {
                     &mut rng,
                 )
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let planned = PlannedTraces {
             project_id: project_id.clone(),
@@ -88,6 +89,7 @@ impl TraceMessageGenerator {
         ))
     }
 
+    #[allow(clippy::result_large_err)]
     fn plan_one_trace(
         &self,
         project_id: &str,
@@ -95,11 +97,18 @@ impl TraceMessageGenerator {
         service_name: Option<&str>,
         now_ns: i64,
         rng: &mut dyn rand::RngCore,
-    ) -> PlannedResourceSpans {
+    ) -> Result<PlannedResourceSpans> {
         let trace_id = FakeDataGenerator::generate_trace_id();
         // The profile owns all span semantics, including the per-trace `gen_ai.conversation.id`
         // it stamps on every node — this generator stays signal-agnostic.
         let nodes = self.profile.build_tree(rng);
+
+        // Layout indexes the root at `relative[0]`; an empty tree would panic there. Enforce the
+        // "index 0 is the root" contract as an explicit error so a misbehaving profile fails
+        // message generation cleanly instead of crashing.
+        if nodes.is_empty() {
+            return Err(GeneratorError::EmptySpanTree);
+        }
 
         // id for each node
         let span_ids: Vec<[u8; 8]> = (0..nodes.len())
@@ -116,7 +125,7 @@ impl TraceMessageGenerator {
         let parents: Vec<Option<usize>> = nodes.iter().map(|n| n.parent).collect();
         let durations: Vec<i64> = nodes.iter().map(|n| n.duration_ns).collect();
         let parallel: Vec<bool> = nodes.iter().map(|n| n.parallel_children).collect();
-        let relative = layout_span_tree(0, &parents, &durations, CHILD_GAP_NS, &parallel);
+        let relative = layout_span_tree(0, &parents, &durations, CHILD_GAP_NS, &parallel)?;
         let shift = now_ns - relative[0].1.max(1);
         let windows: Vec<(i64, i64)> = relative
             .iter()
@@ -159,7 +168,7 @@ impl TraceMessageGenerator {
         let scope_name = format!("io.trihub.{}", svc.replace('-', "."));
         let scope_version = format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10));
 
-        PlannedResourceSpans {
+        Ok(PlannedResourceSpans {
             resource_attrs: build_resource_attribute_pairs(
                 project_id,
                 cloud_account_id,
@@ -174,7 +183,7 @@ impl TraceMessageGenerator {
                 scope_attrs: vec![],
                 spans,
             },
-        }
+        })
     }
 }
 
@@ -246,6 +255,34 @@ mod tests {
                 },
             ]
         }
+    }
+
+    /// A profile that violates the "at least a root" contract by returning no nodes.
+    struct EmptyTree;
+    impl SpanProfile for EmptyTree {
+        fn build_tree(&self, _rng: &mut dyn rand::RngCore) -> Vec<SpanNode> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn empty_span_tree_is_a_clean_error_not_a_panic() {
+        let generator = TraceMessageGenerator::new(
+            "test-src".to_string(),
+            Arc::new(TraceJsonEncoder),
+            Arc::new(EmptyTree),
+        );
+        let err = generator
+            .generate_message(
+                Some("tenant1".to_string()),
+                None,
+                vec![ServiceShard {
+                    service_name: Some("svc-a".to_string()),
+                    num_records: 1,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, GeneratorError::EmptySpanTree));
     }
 
     #[test]
@@ -479,7 +516,9 @@ mod tests {
         );
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let rs = generator.plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng);
+            let rs = generator
+                .plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng)
+                .unwrap();
             let id = planned_conversation_id(&rs.scope.spans[0]).expect("conversation.id present");
             seen.insert(id.to_string());
         }
@@ -501,8 +540,9 @@ mod tests {
         );
         let root_first = (0..40)
             .filter(|_| {
-                let rs =
-                    generator.plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng);
+                let rs = generator
+                    .plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng)
+                    .unwrap();
                 rs.scope.spans[0].parent_span_id.is_none()
             })
             .count();

@@ -141,23 +141,41 @@ impl Transport for HttpTransport {
                             error: GeneratorError::Interrupted,
                         };
                     }
-                    tokio::select! {
-                        _ = sleep(Duration::from_millis(delay)) => {}
-                        changed = shutdown_rx.changed() => {
-                            if changed.is_ok() && *shutdown_rx.borrow() {
-                                return SendOutcome::Failure {
-                                    retries: attempt as usize,
-                                    error: GeneratorError::Interrupted,
-                                };
+                    let sleep_fut = sleep(Duration::from_millis(delay));
+                    tokio::pin!(sleep_fut);
+                    loop {
+                        tokio::select! {
+                            _ = &mut sleep_fut => break,
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() {
+                                    // Sender dropped: no shutdown signal will arrive.
+                                    // Preserve the remaining backoff delay instead of
+                                    // spinning hot and hammering the collector.
+                                    (&mut sleep_fut).await;
+                                    break;
+                                }
+                                if *shutdown_rx.borrow() {
+                                    return SendOutcome::Failure {
+                                        retries: attempt as usize,
+                                        error: GeneratorError::Interrupted,
+                                    };
+                                }
                             }
                         }
                     }
                     continue;
                 }
                 Err(e) => {
+                    // Normalize a terminal request timeout into the dedicated Timeout variant
+                    // so SendOutcome::is_timeout() and the timeout counter recognize it.
+                    let error = if e.is_timeout() {
+                        GeneratorError::Timeout
+                    } else {
+                        GeneratorError::RequestError(e)
+                    };
                     return SendOutcome::Failure {
                         retries: attempt as usize,
-                        error: GeneratorError::RequestError(e),
+                        error,
                     };
                 }
             };
@@ -219,14 +237,25 @@ impl Transport for HttpTransport {
                         error: GeneratorError::Interrupted,
                     };
                 }
-                tokio::select! {
-                    _ = sleep(Duration::from_millis(delay)) => {}
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_ok() && *shutdown_rx.borrow() {
-                            return SendOutcome::Failure {
-                                retries: attempt as usize,
-                                error: GeneratorError::Interrupted,
-                            };
+                let sleep_fut = sleep(Duration::from_millis(delay));
+                tokio::pin!(sleep_fut);
+                loop {
+                    tokio::select! {
+                        _ = &mut sleep_fut => break,
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() {
+                                // Sender dropped: no shutdown signal will arrive.
+                                // Preserve the remaining backoff delay instead of
+                                // spinning hot and hammering the collector.
+                                (&mut sleep_fut).await;
+                                break;
+                            }
+                            if *shutdown_rx.borrow() {
+                                return SendOutcome::Failure {
+                                    retries: attempt as usize,
+                                    error: GeneratorError::Interrupted,
+                                };
+                            }
                         }
                     }
                 }
