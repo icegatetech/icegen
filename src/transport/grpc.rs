@@ -12,7 +12,7 @@ use prost::Message;
 use std::time::Duration;
 use tokio::sync::watch;
 use tonic::metadata::{Ascii, MetadataKey, MetadataValue};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 /// A vendor auth header precompiled into a gRPC metadata key/value pair.
 type AuthMetadata = Vec<(MetadataKey<Ascii>, MetadataValue<Ascii>)>;
@@ -50,7 +50,6 @@ fn insert_auth_metadata<T>(request: &mut tonic::Request<T>, auth_meta: &AuthMeta
 async fn connect_channel(endpoint: &str) -> Result<Channel> {
     // Detect the original scheme and preserve it
     let (scheme, host) = if let Some(rest) = endpoint.strip_prefix("https://") {
-        eprintln!("  ⚠ gRPC endpoint uses HTTPS scheme: {}", endpoint);
         ("https", rest)
     } else if let Some(rest) = endpoint.strip_prefix("http://") {
         ("http", rest)
@@ -58,12 +57,21 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         ("http", endpoint)
     };
     let full_endpoint = format!("{}://{}", scheme, host);
-
-    let channel = Channel::from_shared(full_endpoint)
+    let mut builder = Channel::from_shared(full_endpoint)
         .map_err(|e| GeneratorError::InvalidConfiguration(e.to_string()))?
-        .timeout(Duration::from_secs(5))
-        .connect()
-        .await?;
+        .timeout(Duration::from_secs(5));
+
+    // An https endpoint terminates TLS; tonic does not negotiate it implicitly, so a plaintext
+    // channel to a TLS-only port stalls until the timeout fires. Enable TLS for https endpoints.
+    // ClientTlsConfig::new() loads the platform's native root certificates via the `tls-roots`
+    // feature.
+    if scheme == "https" {
+        builder = builder
+            .tls_config(ClientTlsConfig::new())
+            .map_err(|e| GeneratorError::InvalidConfiguration(e.to_string()))?;
+    }
+
+    let channel = builder.connect().await?;
 
     Ok(channel)
 }
