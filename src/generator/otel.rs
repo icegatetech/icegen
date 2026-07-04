@@ -4,7 +4,7 @@ use crate::generator::base::SignalGenerator;
 use crate::message::factory::{GenContext, LogMessageFactory, MessageFactory, TraceMessageFactory};
 use crate::message::traces::span_profile::{LlmSpanProfile, ProfileWeights};
 use crate::message::traces::{
-    ConversationPool, TraceEncoder, TraceJsonEncoder, TraceMessageGenerator, TraceProtobufEncoder,
+    ConversationCursor, TraceEncoder, TraceJsonEncoder, TraceMessageGenerator, TraceProtobufEncoder,
 };
 use crate::message::{
     JsonEncoder, MessagePayload, OTLPLogMessageGenerator, OTLPMessage, ProtobufEncoder,
@@ -466,7 +466,7 @@ impl OtelGenerator {
                     Arc::new(TraceJsonEncoder)
                 };
                 // TODO(med): for generic traces add GenericSpanProfile and create TRACE_PROFILE env to switch
-                let conversations = ConversationPool::shared_default(&mut rand::thread_rng());
+                let conversations = ConversationCursor::shared();
                 let weights = ProfileWeights::from_pairs(&parse_profile_weights(
                     &config.llm_profile_weights,
                 )?)?;

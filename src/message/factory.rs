@@ -55,7 +55,7 @@ impl MessageFactory for TraceMessageFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::traces::conversation::ConversationPool;
+    use crate::message::traces::conversation::ConversationCursor;
     use crate::message::traces::span_profile::{LlmSpanProfile, ProfileWeights};
     use crate::message::traces::trace_encoder::TraceJsonEncoder;
     use crate::message::types::Signal;
@@ -71,7 +71,7 @@ mod tests {
                     max_tool_calls: 1,
                     capture_content: false,
                     weights: ProfileWeights::default(),
-                    conversations: ConversationPool::shared_default(&mut rand::thread_rng()),
+                    conversations: ConversationCursor::shared(),
                 }),
             ),
         };

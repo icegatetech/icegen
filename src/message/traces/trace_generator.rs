@@ -190,7 +190,7 @@ impl TraceMessageGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::traces::conversation::ConversationPool;
+    use crate::message::traces::conversation::{ConversationCursor, MAX_TRACES_PER_CONVERSATION};
     use crate::message::traces::span_profile::{
         LlmSpanProfile, ProfileWeights, RelEvent, SpanNode,
     };
@@ -207,8 +207,8 @@ mod tests {
     /// Fixed anchor for plan-level tests that inspect structure, not wall-clock time.
     const TEST_NOW_NS: i64 = 1_700_000_000_000_000_000;
 
-    fn test_pool() -> Arc<ConversationPool> {
-        ConversationPool::shared_default(&mut rand::thread_rng())
+    fn test_cursor() -> Arc<ConversationCursor> {
+        ConversationCursor::shared()
     }
 
     fn gen() -> TraceMessageGenerator {
@@ -219,7 +219,7 @@ mod tests {
                 max_tool_calls: 2,
                 capture_content: false,
                 weights: ProfileWeights::default(),
-                conversations: test_pool(),
+                conversations: test_cursor(),
             }),
         )
     }
@@ -500,9 +500,11 @@ mod tests {
     }
 
     #[test]
-    fn conversation_ids_are_reused_across_traces() {
-        // A small pool forces reuse across independently planned traces. A single seeded rng
-        // drives the pool build and every conversation pick, so the run is deterministic.
+    fn conversation_ids_are_bounded_and_reused_across_traces() {
+        // Consecutive traces reuse one conversation id until its 1–3 budget is spent, then the
+        // cursor mints a fresh one — so ids recur across traces but no id ever grows past its
+        // budget. A single seeded rng drives every mint and budget draw, so the run is
+        // deterministic.
         let mut rng = StdRng::seed_from_u64(20);
         let generator = TraceMessageGenerator::new(
             "test-src".to_string(),
@@ -511,20 +513,29 @@ mod tests {
                 max_tool_calls: 0,
                 capture_content: false,
                 weights: ProfileWeights::default(),
-                conversations: Arc::new(ConversationPool::new(4, &mut rng)),
+                conversations: ConversationCursor::shared(),
             }),
         );
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..50 {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for _ in 0..200 {
             let rs = generator
                 .plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng)
                 .unwrap();
             let id = planned_conversation_id(&rs.scope.spans[0]).expect("conversation.id present");
-            seen.insert(id.to_string());
+            *counts.entry(id.to_string()).or_insert(0) += 1;
         }
-        // Reuse (cardinality below the draw count) but more than a single id.
-        assert!(seen.len() > 1, "expected more than one conversation id");
-        assert!(seen.len() <= 4, "cardinality must not exceed the pool size");
+        // Reuse happened: fewer distinct ids than traces.
+        assert!(
+            counts.len() < 200,
+            "expected conversation-id reuse across traces"
+        );
+        // But no conversation grew past its trace budget.
+        assert!(
+            counts
+                .values()
+                .all(|&c| c <= MAX_TRACES_PER_CONVERSATION as usize),
+            "a conversation id exceeded the max trace budget"
+        );
     }
 
     /// Spans are emitted in random order, so the root is not always first. `FixedNestedTree` has

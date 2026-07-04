@@ -4,7 +4,7 @@
 
 use crate::error::GeneratorError;
 use crate::message::fake_data::{ExceptionKind, FakeDataGenerator};
-use crate::message::traces::conversation::ConversationPool;
+use crate::message::traces::conversation::ConversationCursor;
 use crate::message::traces::{AttrValue, SpanAttrs, SpanKind, SpanStatusCode};
 use rand::rngs::ThreadRng;
 use rand::{Rng, RngCore};
@@ -144,9 +144,10 @@ pub struct LlmSpanProfile {
     pub max_tool_calls: u32,
     pub capture_content: bool,
     pub weights: ProfileWeights,
-    /// Cross-trace pool of `gen_ai.conversation.id` values. The conversation concept is LLM
-    /// domain knowledge, so it lives in the profile, not the signal-agnostic trace generator.
-    pub conversations: Arc<ConversationPool>,
+    /// Source of `gen_ai.conversation.id` values, budgeting a small number of traces per
+    /// conversation. The conversation concept is LLM domain knowledge, so it lives in the profile,
+    /// not the signal-agnostic trace generator.
+    pub conversations: Arc<ConversationCursor>,
 }
 
 impl SpanProfile for LlmSpanProfile {
@@ -174,12 +175,12 @@ impl SpanProfile for LlmSpanProfile {
 }
 
 impl LlmSpanProfile {
-    /// Stamp one pooled `gen_ai.conversation.id` onto every span of the tree: one id per trace,
-    /// shared by all spans — including the generic `workflow`/`task` wrappers, which are steps of
-    /// the same agent conversation, not independent infrastructure spans. The pool yields
-    /// cross-trace reuse (multi-trace agent sessions).
+    /// Stamp one `gen_ai.conversation.id` onto every span of the tree: one id per trace, shared by
+    /// all spans — including the generic `workflow`/`task` wrappers, which are steps of the same
+    /// agent conversation, not independent infrastructure spans. Consecutive traces reuse the id
+    /// until the conversation's 1–3 trace budget is spent (multi-trace agent sessions).
     fn tag_conversation(&self, nodes: &mut [SpanNode], rng: &mut dyn RngCore) {
-        let id = self.conversations.pick(rng).to_string();
+        let id = self.conversations.next_id(rng);
         for node in nodes.iter_mut() {
             node.attributes.push((
                 "gen_ai.conversation.id".to_string(),
@@ -682,9 +683,9 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    /// A default-sized conversation pool for profile tests.
-    fn pool() -> Arc<ConversationPool> {
-        ConversationPool::shared_default(&mut rand::thread_rng())
+    /// A fresh conversation cursor for profile tests.
+    fn cursor() -> Arc<ConversationCursor> {
+        ConversationCursor::shared()
     }
 
     #[test]
@@ -693,7 +694,7 @@ mod tests {
             max_tool_calls: 2,
             capture_content: false,
             weights: ProfileWeights::default(),
-            conversations: pool(),
+            conversations: cursor(),
         };
         let mut rng = StdRng::seed_from_u64(1);
         let nodes = profile.build_tree(&mut rng);
@@ -721,7 +722,7 @@ mod tests {
             max_tool_calls: 0,
             capture_content: false,
             weights: ProfileWeights::default(),
-            conversations: pool(),
+            conversations: cursor(),
         };
         let mut rng = StdRng::seed_from_u64(2);
         let nodes = profile.build_tree(&mut rng);
@@ -739,7 +740,7 @@ mod tests {
             max_tool_calls: 5,
             capture_content: false,
             weights: ProfileWeights::default(),
-            conversations: pool(),
+            conversations: cursor(),
         };
         let shape = |seed| {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -757,7 +758,7 @@ mod tests {
             max_tool_calls,
             capture_content: false,
             weights,
-            conversations: pool(),
+            conversations: cursor(),
         };
         let mut rng = StdRng::seed_from_u64(seed);
         profile.build_tree(&mut rng)
@@ -857,7 +858,7 @@ mod tests {
             max_tool_calls: 2,
             capture_content: false,
             weights: w,
-            conversations: pool(),
+            conversations: cursor(),
         };
 
         let simple = profile(only(CallForm::SimpleChat)).build_tree(&mut rng);
@@ -922,7 +923,7 @@ mod tests {
             max_tool_calls: 3,
             capture_content: false,
             weights: ProfileWeights::default(),
-            conversations: pool(),
+            conversations: cursor(),
         };
         let mut rng = StdRng::seed_from_u64(9);
         let nodes = profile.build_tree(&mut rng);
@@ -950,7 +951,7 @@ mod tests {
             max_tool_calls: 2,
             capture_content: false,
             weights: only(CallForm::Rag),
-            conversations: pool(),
+            conversations: cursor(),
         };
         // RAG is the only weighted form, so every draw must produce an embeddings span.
         for seed in 0..50 {
