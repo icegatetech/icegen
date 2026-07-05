@@ -220,6 +220,7 @@ mod tests {
                 capture_content: false,
                 weights: ProfileWeights::default(),
                 conversations: test_cursor(),
+                budget: None,
             }),
         )
     }
@@ -514,6 +515,7 @@ mod tests {
                 capture_content: false,
                 weights: ProfileWeights::default(),
                 conversations: ConversationCursor::shared(),
+                budget: None,
             }),
         );
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();

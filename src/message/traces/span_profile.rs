@@ -137,6 +137,15 @@ enum CallForm {
     Rag,
 }
 
+/// Target span-count budget for a single trace. Domain-neutral: a `SpanProfile` grows its tree
+/// until the node count lands in `[min, max]`. `min == max` pins an exact size. Held as
+/// `Option` on the profile; `None` disables budgeting (the profile emits its natural shape).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpanBudget {
+    pub min: u32,
+    pub max: u32,
+}
+
 /// LLM profile: dispatches to one of several call forms (simple chat, tool loop, plan/execute/
 /// reflect, RAG) weighted by [`ProfileWeights`].
 #[derive(Debug, Clone)]
@@ -148,6 +157,9 @@ pub struct LlmSpanProfile {
     /// conversation. The conversation concept is LLM domain knowledge, so it lives in the profile,
     /// not the signal-agnostic trace generator.
     pub conversations: Arc<ConversationCursor>,
+    /// When set, overrides call-form selection: the tree is grown to an exact span count drawn
+    /// from this budget. `None` keeps the weighted per-form shapes.
+    pub budget: Option<SpanBudget>,
 }
 
 impl SpanProfile for LlmSpanProfile {
@@ -159,13 +171,21 @@ impl SpanProfile for LlmSpanProfile {
         let provider = FakeDataGenerator::generate_gen_ai_provider();
         let model = FakeDataGenerator::generate_gen_ai_model(&provider);
 
-        let mut nodes = match self.pick_form(rng) {
-            CallForm::SimpleChat => self.build_simple_chat(&mut val, &provider, &model),
-            CallForm::ToolLoop => self.build_tool_loop(&mut val, rng, &provider, &model),
-            CallForm::PlanExecuteReflect => {
-                self.build_plan_execute_reflect(&mut val, &provider, &model)
+        let mut nodes = match self.budget {
+            // Budget mode: ignore call-form weights and grow one agent-loop tree to an exact size
+            // drawn from [min, max]. This is the "large / controllable trace" mode.
+            Some(budget) => {
+                let target = draw_target(budget, rng);
+                self.build_budgeted(target, &mut val, rng, &provider, &model)
             }
-            CallForm::Rag => self.build_rag(&mut val, &provider, &model),
+            None => match self.pick_form(rng) {
+                CallForm::SimpleChat => self.build_simple_chat(&mut val, &provider, &model),
+                CallForm::ToolLoop => self.build_tool_loop(&mut val, rng, &provider, &model),
+                CallForm::PlanExecuteReflect => {
+                    self.build_plan_execute_reflect(&mut val, &provider, &model)
+                }
+                CallForm::Rag => self.build_rag(&mut val, &provider, &model),
+            },
         };
 
         inject_error(&mut nodes, self.capture_content, rng);
@@ -282,6 +302,51 @@ impl LlmSpanProfile {
             rel_event("agent.turn", 0.6),
             rel_event("agent.final", 0.95),
         ];
+        nodes
+    }
+
+    /// Build an agent-loop tree of exactly `target` spans (`target >= 1`). The `invoke_agent` root
+    /// is one span; the remainder is filled with chat turns, each a `chat` span plus
+    /// `0..=max_tool_calls` `execute_tool` children, until the exact count is reached. Turns are
+    /// siblings under the root, so the tree stays 3 levels deep (root -> chat -> tool) at any size
+    /// and the recursive time layout never deepens with span count.
+    fn build_budgeted(
+        &self,
+        target: usize,
+        val: &mut ThreadRng,
+        rng: &mut dyn RngCore,
+        provider: &str,
+        model: &str,
+    ) -> Vec<SpanNode> {
+        let mut nodes = vec![agent_root_node(val, provider)];
+        // A budget of 1 is a lone root span.
+        let mut first_turn = true;
+        while nodes.len() < target {
+            let turn = nodes.len();
+            // Room left after this turn's own chat span. Never emit more than that many tools, so
+            // the total lands on `target` exactly and never overshoots.
+            let room_for_tools = target - nodes.len() - 1;
+            let cap = self.max_tool_calls as usize;
+            let tools = if cap == 0 || room_for_tools == 0 {
+                0
+            } else {
+                rng.gen_range(0..=cap.min(room_for_tools))
+            };
+            // First turn fans its tools out in parallel (like the classic tool_loop turn 1);
+            // pointless without tools, so gate on `tools > 0`.
+            nodes.push(chat_node(
+                Some(0),
+                val,
+                provider,
+                model,
+                self.capture_content,
+                first_turn && tools > 0,
+            ));
+            for _ in 0..tools {
+                nodes.push(tool_node(Some(turn), val, self.capture_content));
+            }
+            first_turn = false;
+        }
         nodes
     }
 
@@ -583,6 +648,12 @@ fn is_generic_wrapper(node: &SpanNode) -> bool {
     node.attributes.iter().any(|(k, _)| k == "trihub.span.kind")
 }
 
+/// Draw a concrete target span count from the budget. `min == max` yields a fixed size, which is
+/// what the edge-case tests rely on.
+fn draw_target(budget: SpanBudget, rng: &mut dyn RngCore) -> usize {
+    rng.gen_range(budget.min..=budget.max) as usize
+}
+
 /// With probability [`ERROR_TRACE_PROB`], turn one span of the tree into a failure.
 ///
 /// The failing span gets `status_code = Error`, the failure message, an `error.type` attribute,
@@ -695,6 +766,7 @@ mod tests {
             capture_content: false,
             weights: ProfileWeights::default(),
             conversations: cursor(),
+            budget: None,
         };
         let mut rng = StdRng::seed_from_u64(1);
         let nodes = profile.build_tree(&mut rng);
@@ -723,6 +795,7 @@ mod tests {
             capture_content: false,
             weights: ProfileWeights::default(),
             conversations: cursor(),
+            budget: None,
         };
         let mut rng = StdRng::seed_from_u64(2);
         let nodes = profile.build_tree(&mut rng);
@@ -741,6 +814,7 @@ mod tests {
             capture_content: false,
             weights: ProfileWeights::default(),
             conversations: cursor(),
+            budget: None,
         };
         let shape = |seed| {
             let mut rng = StdRng::seed_from_u64(seed);
@@ -759,6 +833,7 @@ mod tests {
             capture_content: false,
             weights,
             conversations: cursor(),
+            budget: None,
         };
         let mut rng = StdRng::seed_from_u64(seed);
         profile.build_tree(&mut rng)
@@ -859,6 +934,7 @@ mod tests {
             capture_content: false,
             weights: w,
             conversations: cursor(),
+            budget: None,
         };
 
         let simple = profile(only(CallForm::SimpleChat)).build_tree(&mut rng);
@@ -924,6 +1000,7 @@ mod tests {
             capture_content: false,
             weights: ProfileWeights::default(),
             conversations: cursor(),
+            budget: None,
         };
         let mut rng = StdRng::seed_from_u64(9);
         let nodes = profile.build_tree(&mut rng);
@@ -952,6 +1029,7 @@ mod tests {
             capture_content: false,
             weights: only(CallForm::Rag),
             conversations: cursor(),
+            budget: None,
         };
         // RAG is the only weighted form, so every draw must produce an embeddings span.
         for seed in 0..50 {
@@ -961,5 +1039,97 @@ mod tests {
                 .iter()
                 .any(|n| operation_name(n) == Some("embeddings")));
         }
+    }
+
+    /// Build a budgeted tree with the given bounds under a seed.
+    fn budgeted(min: u32, max: u32, seed: u64) -> Vec<SpanNode> {
+        let profile = LlmSpanProfile {
+            max_tool_calls: 3,
+            capture_content: false,
+            weights: ProfileWeights::default(),
+            conversations: cursor(),
+            budget: Some(SpanBudget { min, max }),
+        };
+        let mut rng = StdRng::seed_from_u64(seed);
+        profile.build_tree(&mut rng)
+    }
+
+    #[test]
+    fn budget_fixed_size_yields_exact_span_count() {
+        // min == max: every trace has exactly that many spans (edge-case mode).
+        for seed in 0..100 {
+            assert_eq!(budgeted(20, 20, seed).len(), 20, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn budget_range_stays_within_bounds() {
+        for seed in 0..500 {
+            let n = budgeted(5, 40, seed).len();
+            assert!((5..=40).contains(&n), "seed {seed}: span count {n} outside [5,40]");
+        }
+    }
+
+    #[test]
+    fn budget_of_one_is_root_only() {
+        let nodes = budgeted(1, 1, 7);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].parent.is_none());
+        assert_eq!(operation_name(&nodes[0]), Some("invoke_agent"));
+    }
+
+    #[test]
+    fn budgeted_tree_is_a_valid_single_rooted_tree() {
+        // Exactly one root; every child references an in-range, non-self parent.
+        let nodes = budgeted(500, 500, 3);
+        assert_eq!(nodes.len(), 500);
+        assert_eq!(nodes.iter().filter(|n| n.parent.is_none()).count(), 1);
+        for (i, n) in nodes.iter().enumerate() {
+            if let Some(p) = n.parent {
+                assert!(p < nodes.len() && p != i, "node {i} parent {p} out of range");
+            }
+        }
+    }
+
+    #[test]
+    fn budgeted_tree_lays_out_without_panic() {
+        // Feed a large budgeted tree through the real time layout: nesting holds and 500 spans do
+        // not overflow the recursive layout (turns are siblings, depth stays <= 3).
+        let nodes = budgeted(500, 500, 11);
+        let parents: Vec<Option<usize>> = nodes.iter().map(|n| n.parent).collect();
+        let durations: Vec<i64> = nodes.iter().map(|n| n.duration_ns).collect();
+        let parallel: Vec<bool> = nodes.iter().map(|n| n.parallel_children).collect();
+        let windows = crate::message::traces::trace_time::layout_span_tree(
+            0, &parents, &durations, 1_000_000, &parallel,
+        )
+        .unwrap();
+        assert_eq!(windows.len(), 500);
+    }
+
+    #[test]
+    fn budget_stamps_one_conversation_id_on_every_span() {
+        let nodes = budgeted(30, 30, 5);
+        let id_of = |n: &SpanNode| {
+            n.attributes.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                ("gen_ai.conversation.id", AttrValue::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let first = id_of(&nodes[0]).expect("conversation.id present on root");
+        assert!(nodes.iter().all(|n| id_of(n).as_deref() == Some(first.as_str())));
+    }
+
+    #[test]
+    fn no_budget_keeps_natural_form_shapes() {
+        // Sanity: with budget None, simple_chat still yields its 2-span shape.
+        let profile = LlmSpanProfile {
+            max_tool_calls: 0,
+            capture_content: false,
+            weights: only(CallForm::SimpleChat),
+            conversations: cursor(),
+            budget: None,
+        };
+        let mut rng = StdRng::seed_from_u64(1);
+        assert_eq!(profile.build_tree(&mut rng).len(), 2);
     }
 }

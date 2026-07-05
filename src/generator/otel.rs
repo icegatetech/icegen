@@ -479,6 +479,7 @@ impl OtelGenerator {
                             capture_content: config.llm_capture_content,
                             weights,
                             conversations,
+                            budget: config.span_budget(),
                         }),
                     ),
                 })
@@ -954,6 +955,8 @@ mod tests {
             llm_capture_content: false,
             llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
                 .to_string(),
+            trace_min_spans: 0,
+            trace_max_spans: 0,
             auth_headers: String::new(),
             auth_bearer: None,
             auth_basic: None,
@@ -1041,6 +1044,8 @@ mod tests {
             llm_capture_content: false,
             llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
                 .to_string(),
+            trace_min_spans: 0,
+            trace_max_spans: 0,
             auth_headers: String::new(),
             auth_bearer: None,
             auth_basic: None,
@@ -1779,5 +1784,27 @@ mod tests {
         assert_eq!(counts[0], 4);
         assert_eq!(counts[1], 3);
         assert_eq!(counts[2], 3);
+    }
+
+    #[test]
+    fn budgeted_traces_emit_exact_span_count_end_to_end() {
+        // signal=traces + fixed budget (min == max) => every trace carries exactly N spans through
+        // the real factory/encoder path.
+        let mut config = test_config(1, 0, 1);
+        config.signal = crate::message::Signal::Traces;
+        config.trace_min_spans = 20;
+        config.trace_max_spans = 20;
+        let generator = OtelGenerator::with_transport(config, Arc::new(NoopTransport)).unwrap();
+
+        for _ in 0..20 {
+            let message = generator.generate_message().unwrap();
+            let MessagePayload::Json(json) = &message.message else {
+                panic!("expected JSON trace payload");
+            };
+            let spans = json["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .expect("spans array");
+            assert_eq!(spans.len(), 20);
+        }
     }
 }

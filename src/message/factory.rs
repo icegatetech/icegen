@@ -72,6 +72,7 @@ mod tests {
                     capture_content: false,
                     weights: ProfileWeights::default(),
                     conversations: ConversationCursor::shared(),
+                    budget: None,
                 }),
             ),
         };
