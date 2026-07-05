@@ -1,11 +1,13 @@
 use crate::error::{GeneratorError, Result};
-use crate::message::traces::span_profile::ProfileWeights;
+use crate::message::traces::span_profile::{ProfileWeights, SpanBudget};
 use crate::message::types::Signal;
 use crate::transport::AuthHeaders;
 use rand::Rng;
 use std::collections::HashMap;
 
 const MAX_RETRIES_UPPER_BOUND: u32 = 10;
+/// Hard upper bound on `trace_max_spans`, keeping a single trace's payload bounded.
+const TRACE_SPAN_BUDGET_MAX: u32 = 10_000;
 const DEFAULT_CARDINALITY_LIMITS: &[(&str, usize)] = &[
     ("k8s.pod.name", 32),
     ("host.name", 16),
@@ -181,6 +183,11 @@ pub struct OtelConfig {
     /// Relative weights of LLM call forms, e.g.
     /// `simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1` (signal=traces).
     pub llm_profile_weights: String,
+    /// Lower bound of the per-trace span-count budget (signal=traces). `0` with
+    /// `trace_max_spans == 0` disables budgeting.
+    pub trace_min_spans: u32,
+    /// Upper bound of the per-trace span-count budget (signal=traces).
+    pub trace_max_spans: u32,
     /// Raw vendor auth headers as a CSV map, e.g. `Authorization=Bearer xxx,x-bt-parent=project:foo`.
     /// Applied to every HTTP/gRPC request, independent of the tenant header.
     pub auth_headers: String,
@@ -273,6 +280,26 @@ impl OtelConfig {
         // blocks a logs-only run.
         if self.signal == Signal::Traces {
             ProfileWeights::from_pairs(&parse_profile_weights(&self.llm_profile_weights)?)?;
+
+            let (mn, mx) = (self.trace_min_spans, self.trace_max_spans);
+            if (mn == 0) != (mx == 0) {
+                return Err(GeneratorError::InvalidConfiguration(
+                    "trace_min_spans and trace_max_spans must both be set (>= 1) or both be 0 (disabled)"
+                        .to_string(),
+                ));
+            }
+            if mx > 0 {
+                if mx < mn {
+                    return Err(GeneratorError::InvalidConfiguration(
+                        "trace_max_spans must be >= trace_min_spans".to_string(),
+                    ));
+                }
+                if mx > TRACE_SPAN_BUDGET_MAX {
+                    return Err(GeneratorError::InvalidConfiguration(format!(
+                        "trace_max_spans must be <= {TRACE_SPAN_BUDGET_MAX}"
+                    )));
+                }
+            }
         }
 
         // Auth headers are built only on the live send path, after the dry-run early return, so
@@ -334,6 +361,19 @@ impl OtelConfig {
             self.retry_base_delay_ms,
             self.retry_max_delay_ms,
         )
+    }
+
+    /// The per-trace span-count budget, or `None` when disabled (both bounds zero). Consumed by
+    /// the traces branch of `OtelGenerator::with_transport`; ignored for logs.
+    pub fn span_budget(&self) -> Option<SpanBudget> {
+        if self.trace_min_spans == 0 && self.trace_max_spans == 0 {
+            None
+        } else {
+            Some(SpanBudget {
+                min: self.trace_min_spans,
+                max: self.trace_max_spans,
+            })
+        }
     }
 
     /// Build the vendor auth headers applied to every request. Validated eagerly in
@@ -559,6 +599,8 @@ mod tests {
             llm_capture_content: true,
             llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
                 .to_string(),
+            trace_min_spans: 0,
+            trace_max_spans: 0,
             auth_headers: String::new(),
             auth_bearer: None,
             auth_basic: None,
@@ -590,6 +632,69 @@ mod tests {
         cfg.signal = Signal::Traces;
         cfg.invalid_record_percent = 0.0;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn span_budget_disabled_when_both_zero() {
+        let mut c = base_config();
+        c.trace_min_spans = 0;
+        c.trace_max_spans = 0;
+        assert!(c.span_budget().is_none());
+    }
+
+    #[test]
+    fn span_budget_some_when_set() {
+        let mut c = base_config();
+        c.trace_min_spans = 5;
+        c.trace_max_spans = 10;
+        let b = c.span_budget().expect("budget present");
+        assert_eq!((b.min, b.max), (5, 10));
+    }
+
+    #[test]
+    fn validate_rejects_half_set_budget() {
+        let mut c = base_config();
+        c.signal = Signal::Traces;
+        c.trace_min_spans = 5;
+        c.trace_max_spans = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_max_below_min() {
+        let mut c = base_config();
+        c.signal = Signal::Traces;
+        c.trace_min_spans = 10;
+        c.trace_max_spans = 5;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_budget_over_cap() {
+        let mut c = base_config();
+        c.signal = Signal::Traces;
+        c.trace_min_spans = 1;
+        c.trace_max_spans = TRACE_SPAN_BUDGET_MAX + 1;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_valid_budget() {
+        let mut c = base_config();
+        c.signal = Signal::Traces;
+        c.trace_min_spans = 5;
+        c.trace_max_spans = 40;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_budget_for_logs() {
+        // Budget is a traces-only knob; a half-set budget must not fail a logs run.
+        let mut c = base_config();
+        c.signal = Signal::Logs;
+        c.trace_min_spans = 5;
+        c.trace_max_spans = 0;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

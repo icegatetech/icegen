@@ -189,6 +189,16 @@ pub struct OtelArgs {
     )]
     pub llm_profile_weights: String,
 
+    /// Lower bound of the per-trace span-count budget (signal=traces). 0 with TRACE_MAX_SPANS=0
+    /// disables budgeting (natural per-form shape). Set min == max for a fixed span count.
+    #[arg(long, env = "TRACE_MIN_SPANS", default_value = "0")]
+    pub trace_min_spans: u32,
+
+    /// Upper bound of the per-trace span-count budget (signal=traces). Must be >= TRACE_MIN_SPANS
+    /// when enabled; capped to keep payloads bounded.
+    #[arg(long, env = "TRACE_MAX_SPANS", default_value = "0")]
+    pub trace_max_spans: u32,
+
     /// Raw vendor auth headers as a CSV map (key=value,key2=value2), applied to every request
     #[arg(long, env = "OTEL_EXPORTER_OTLP_HEADERS", default_value = "")]
     pub auth_headers: String,
@@ -240,6 +250,8 @@ impl From<OtelArgs> for OtelConfig {
             llm_max_tool_calls: args.llm_max_tool_calls,
             llm_capture_content: args.llm_capture_content,
             llm_profile_weights: args.llm_profile_weights,
+            trace_min_spans: args.trace_min_spans,
+            trace_max_spans: args.trace_max_spans,
             auth_headers: args.auth_headers,
             auth_bearer: args.auth_bearer,
             auth_basic: args.auth_basic,
@@ -553,6 +565,27 @@ mod tests {
         let config: OtelConfig = args.into();
         assert_eq!(config.auth_basic.as_deref(), Some("user:pass"));
         assert_eq!(config.auth_bearer, None);
+    }
+
+    #[test]
+    fn cli_reads_trace_span_budget() {
+        let cli = Cli::parse_from([
+            "otel-log-generator",
+            "otel",
+            "--endpoint",
+            "http://localhost:4318/v1/traces",
+            "--signal",
+            "traces",
+            "--trace-min-spans",
+            "10",
+            "--trace-max-spans",
+            "50",
+        ]);
+
+        let GeneratorType::Otel(args) = cli.generator;
+        let config: OtelConfig = args.into();
+        assert_eq!(config.trace_min_spans, 10);
+        assert_eq!(config.trace_max_spans, 50);
     }
 
     #[test]
