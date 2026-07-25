@@ -1,10 +1,36 @@
 use serde::{Deserialize, Serialize};
 
 /// Telemetry signal type carried by the message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord`/`Hash` are derived so a `Signal` can key per-signal statistics tables and endpoint
+/// routing maps. The variant order (`Logs` before `Traces`) also gives a stable default ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Signal {
     Logs,
     Traces,
+}
+
+impl Signal {
+    /// Lowercase wire/CLI name of the signal (`"logs"` / `"traces"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Signal::Logs => "logs",
+            Signal::Traces => "traces",
+        }
+    }
+}
+
+/// One shard of a multi-service OTLP request: a single `ResourceLogs` entry for logs and a single
+/// `ResourceSpans` entry for traces, holding the spans of all `num_traces` traces.
+#[derive(Debug, Clone)]
+pub struct ServiceShard {
+    pub service_name: Option<String>,
+    /// Log records emitted for this shard; on the correlated path they are spread over the shard's
+    /// traces and then over each trace's spans.
+    pub num_logs: usize,
+    /// Traces emitted for this shard, each with its own `trace_id` and span tree. Always `>= 1` on
+    /// the traces path; ignored when traces are not generated.
+    pub num_traces: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

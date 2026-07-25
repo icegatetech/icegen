@@ -88,9 +88,8 @@ pub fn layout_span_tree(
             }
         }
     }
-    let root = root.ok_or_else(|| {
-        GeneratorError::MalformedSpanTree("no root (no None parent)".to_string())
-    })?;
+    let root = root
+        .ok_or_else(|| GeneratorError::MalformedSpanTree("no root (no None parent)".to_string()))?;
 
     // Reachability from the root catches cycles and disconnected nodes. Done iteratively so a
     // cyclic graph cannot overflow the stack here the way recursive `layout_node` would.
@@ -278,7 +277,13 @@ mod tests {
     fn cycle_with_valid_root_is_rejected() {
         // root 0 is fine, but 1 and 2 form a cycle unreachable from the root.
         let parents = [None, Some(2), Some(1)];
-        assert_malformed(layout_span_tree(0, &parents, &[0, 0, 0], 10, &no_parallel(3)));
+        assert_malformed(layout_span_tree(
+            0,
+            &parents,
+            &[0, 0, 0],
+            10,
+            &no_parallel(3),
+        ));
     }
 
     #[test]

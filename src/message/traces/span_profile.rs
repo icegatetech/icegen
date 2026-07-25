@@ -1066,7 +1066,10 @@ mod tests {
     fn budget_range_stays_within_bounds() {
         for seed in 0..500 {
             let n = budgeted(5, 40, seed).len();
-            assert!((5..=40).contains(&n), "seed {seed}: span count {n} outside [5,40]");
+            assert!(
+                (5..=40).contains(&n),
+                "seed {seed}: span count {n} outside [5,40]"
+            );
         }
     }
 
@@ -1086,7 +1089,10 @@ mod tests {
         assert_eq!(nodes.iter().filter(|n| n.parent.is_none()).count(), 1);
         for (i, n) in nodes.iter().enumerate() {
             if let Some(p) = n.parent {
-                assert!(p < nodes.len() && p != i, "node {i} parent {p} out of range");
+                assert!(
+                    p < nodes.len() && p != i,
+                    "node {i} parent {p} out of range"
+                );
             }
         }
     }
@@ -1110,13 +1116,17 @@ mod tests {
     fn budget_stamps_one_conversation_id_on_every_span() {
         let nodes = budgeted(30, 30, 5);
         let id_of = |n: &SpanNode| {
-            n.attributes.iter().find_map(|(k, v)| match (k.as_str(), v) {
-                ("gen_ai.conversation.id", AttrValue::Str(s)) => Some(s.clone()),
-                _ => None,
-            })
+            n.attributes
+                .iter()
+                .find_map(|(k, v)| match (k.as_str(), v) {
+                    ("gen_ai.conversation.id", AttrValue::Str(s)) => Some(s.clone()),
+                    _ => None,
+                })
         };
         let first = id_of(&nodes[0]).expect("conversation.id present on root");
-        assert!(nodes.iter().all(|n| id_of(n).as_deref() == Some(first.as_str())));
+        assert!(nodes
+            .iter()
+            .all(|n| id_of(n).as_deref() == Some(first.as_str())));
     }
 
     #[test]

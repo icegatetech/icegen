@@ -6,7 +6,7 @@ services:
       context: .
     env_file:
       - .env
-    command: ["otel", "--endpoint", "${OTEL_LOGS_ENDPOINT}"]
+    command: ["otel"]
     profiles: ["otel"]
     deploy:
       resources:

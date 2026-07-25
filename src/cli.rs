@@ -1,6 +1,63 @@
 use crate::config::OtelConfig;
+use crate::error::GeneratorError;
 use crate::message::types::Signal;
+use crate::transport::{Destination, DestinationFlags};
 use clap::{Args, Parser, Subcommand};
+
+/// Environment variables that no longer exist: the retired name, the variables that replace it
+/// (empty when a setting was dropped outright, several when one name forked), and the guidance
+/// shown when it is still set. clap silently ignores an env var it does not bind, so a stale name
+/// in a shell or `.env` would change the run without a word; [`reject_retired_env_vars`] turns each
+/// into a startup error.
+///
+/// The replacements are a structured field rather than prose because a test walks them to prove
+/// every recommended name is really bound to an argument.
+///
+/// Deprecated *aliases* do not belong here: they still work (see `MESSAGE_DELAY`).
+const RETIRED_ENV_VARS: &[(&str, &[&str], &str)] = &[
+    (
+        "OTEL_SIGNAL",
+        &["OTEL_SIGNALS"],
+        "use OTEL_SIGNALS (e.g. OTEL_SIGNALS=logs,traces)",
+    ),
+    (
+        "RECORDS_PER_MESSAGE",
+        &["LOGS_PER_MESSAGE"],
+        "use LOGS_PER_MESSAGE (e.g. LOGS_PER_MESSAGE=10)",
+    ),
+    (
+        "OTEL_LOGS_ENDPOINT",
+        &["OTEL_HTTP_LOGS_ENDPOINT", "OTEL_GRPC_ENDPOINT"],
+        "endpoints are per transport now: OTEL_HTTP_LOGS_ENDPOINT for OTEL_TRANSPORT=http, \
+         OTEL_GRPC_ENDPOINT for OTEL_TRANSPORT=grpc",
+    ),
+    (
+        "OTEL_TRACES_ENDPOINT",
+        &["OTEL_HTTP_TRACES_ENDPOINT", "OTEL_GRPC_ENDPOINT"],
+        "use OTEL_HTTP_TRACES_ENDPOINT for OTEL_TRANSPORT=http; OTEL_TRANSPORT=grpc carries traces \
+         over OTEL_GRPC_ENDPOINT",
+    ),
+    (
+        "OTEL_HEALTHCHECK_ENDPOINT",
+        &[],
+        "health checking was removed; unset it",
+    ),
+];
+
+/// Fail the run when a retired environment variable is still set. Called once at startup, after the
+/// `.env` file is loaded and before the CLI is parsed, so a `.env` left over from an older build
+/// cannot silently change what the run does.
+#[allow(clippy::result_large_err)]
+pub fn reject_retired_env_vars() -> crate::error::Result<()> {
+    for (name, _replacements, guidance) in RETIRED_ENV_VARS {
+        if std::env::var_os(name).is_some() {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "{name} is no longer used: {guidance}"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Parse boolean values in a case-insensitive way
 fn parse_bool(s: &str) -> Result<bool, String> {
@@ -11,9 +68,10 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
-/// Parse the telemetry signal selector in a case-insensitive way.
+/// Parse a single telemetry signal token in a case-insensitive way. Applied per element of the
+/// comma-separated `--signals` list.
 fn parse_signal(s: &str) -> Result<Signal, String> {
-    match s.to_lowercase().as_str() {
+    match s.trim().to_lowercase().as_str() {
         "logs" => Ok(Signal::Logs),
         "traces" => Ok(Signal::Traces),
         other => Err(format!(
@@ -37,13 +95,19 @@ pub enum GeneratorType {
 
 #[derive(Args)]
 pub struct OtelArgs {
-    /// OTEL logs ingest endpoint (not required with --dry-run)
-    #[arg(long, env = "OTEL_LOGS_ENDPOINT")]
-    pub endpoint: Option<String>,
+    /// OTLP gRPC endpoint (--transport grpc). One channel carries every signal, separated by its
+    /// OTLP service; there is no second endpoint to set.
+    #[arg(long = "grpc-endpoint", env = "OTEL_GRPC_ENDPOINT")]
+    pub grpc_endpoint: Option<String>,
 
-    /// Health check endpoint (optional)
-    #[arg(long, env = "OTEL_HEALTHCHECK_ENDPOINT")]
-    pub healthcheck_endpoint: Option<String>,
+    /// OTLP/HTTP logs URL (--transport http). Required when logs are among --signals.
+    #[arg(long = "http-logs-endpoint", env = "OTEL_HTTP_LOGS_ENDPOINT")]
+    pub http_logs_endpoint: Option<String>,
+
+    /// OTLP/HTTP traces URL (--transport http). Required when traces are among --signals; there is
+    /// no fallback to the logs URL.
+    #[arg(long = "http-traces-endpoint", env = "OTEL_HTTP_TRACES_ENDPOINT")]
+    pub http_traces_endpoint: Option<String>,
 
     /// Use protobuf encoding instead of JSON
     #[arg(long, env = "OTEL_USE_PROTOBUF", default_value = "false", value_parser = parse_bool)]
@@ -73,9 +137,13 @@ pub struct OtelArgs {
     #[arg(long, env = "INVALID_RECORD_PERCENT", default_value = "0.0")]
     pub invalid_record_percent: f32,
 
-    /// Number of records per message
-    #[arg(long, env = "RECORDS_PER_MESSAGE", default_value = "1")]
-    pub records_per_message: usize,
+    /// Number of log records per message (signal=logs)
+    #[arg(long, env = "LOGS_PER_MESSAGE", default_value = "1")]
+    pub logs_per_message: usize,
+
+    /// Number of traces per message (signal=traces), divided evenly across the service shards
+    #[arg(long, env = "TRACES_PER_MESSAGE", default_value = "1")]
+    pub traces_per_message: usize,
 
     /// Print detailed logs for each message
     #[arg(long, env = "PRINT_LOGS", default_value = "false", value_parser = parse_bool)]
@@ -163,15 +231,26 @@ pub struct OtelArgs {
     )]
     pub record_intra_batch_overlap_probability: f32,
 
-    /// Number of ResourceLogs groups (distinct service.name pods) packed into one request,
+    /// Number of service shards (distinct service.name pods) packed into one request,
     /// simulating OTEL Collector batching across services/pods.
-    /// RECORDS_PER_MESSAGE is divided evenly across groups (clamped to <= RECORDS_PER_MESSAGE).
+    /// LOGS_PER_MESSAGE and TRACES_PER_MESSAGE are each divided evenly across the shards; the
+    /// shard count is clamped to the smaller of the two over the configured signals.
     #[arg(long, env = "SERVICE_SHARDS_PER_MESSAGE", default_value = "1")]
     pub service_shards_per_message: usize,
 
-    /// Telemetry signal to generate: logs or traces (one signal per run)
-    #[arg(long, env = "OTEL_SIGNAL", default_value = "logs", value_parser = parse_signal)]
-    pub signal: Signal,
+    /// Telemetry signals to generate, comma-separated (e.g. `logs`, `traces`, `logs,traces`). Order
+    /// is preserved and drives the order messages are built and their `PRINT_LOGS` blocks are
+    /// printed (and the per-signal statistics order); the concurrent network sends complete in an
+    /// unspecified order. Duplicates are rejected. One message per signal is produced per generation
+    /// cycle.
+    #[arg(
+        long = "signals",
+        env = "OTEL_SIGNALS",
+        default_value = "logs",
+        value_delimiter = ',',
+        value_parser = parse_signal
+    )]
+    pub signals: Vec<Signal>,
 
     /// Maximum number of tool-call spans in an LLM trace (signal=traces)
     #[arg(long, env = "LLM_MAX_TOOL_CALLS", default_value = "3")]
@@ -212,19 +291,28 @@ pub struct OtelArgs {
     pub auth_basic: Option<String>,
 }
 
-impl From<OtelArgs> for OtelConfig {
-    fn from(args: OtelArgs) -> Self {
-        let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
+impl TryFrom<OtelArgs> for OtelConfig {
+    type Error = GeneratorError;
 
-        Self {
-            ingest_endpoint: args.endpoint.unwrap_or_default(),
-            healthcheck_endpoint: args.healthcheck_endpoint,
-            use_protobuf: args.use_protobuf,
-            transport: args.transport,
-            invalid_record_percent: args.invalid_record_percent,
-            records_per_message: args.records_per_message,
-            print_logs: args.print_logs || args.dry_run,
+    #[allow(clippy::result_large_err)]
+    fn try_from(args: OtelArgs) -> std::result::Result<Self, Self::Error> {
+        let tenant_id = args.tenant_id.unwrap_or_else(|| "default".to_string());
+        let destination = Destination::from_flags(DestinationFlags {
+            transport: args.transport.trim(),
             dry_run: args.dry_run,
+            protobuf: args.use_protobuf,
+            grpc_endpoint: args.grpc_endpoint.as_deref(),
+            http_logs_endpoint: args.http_logs_endpoint.as_deref(),
+            http_traces_endpoint: args.http_traces_endpoint.as_deref(),
+            signals: &args.signals,
+        })?;
+
+        Ok(Self {
+            destination,
+            invalid_record_percent: args.invalid_record_percent,
+            logs_per_message: args.logs_per_message,
+            traces_per_message: args.traces_per_message,
+            print_logs: args.print_logs || args.dry_run,
             count: args.count,
             message_interval_ms: args
                 .message_interval_ms
@@ -246,7 +334,7 @@ impl From<OtelArgs> for OtelConfig {
             record_intra_batch_timestamp_jitter_ns: args.record_intra_batch_timestamp_jitter_ns,
             record_intra_batch_overlap_probability: args.record_intra_batch_overlap_probability,
             service_shards_per_message: args.service_shards_per_message,
-            signal: args.signal,
+            signals: args.signals,
             llm_max_tool_calls: args.llm_max_tool_calls,
             llm_capture_content: args.llm_capture_content,
             llm_profile_weights: args.llm_profile_weights,
@@ -255,7 +343,7 @@ impl From<OtelArgs> for OtelConfig {
             auth_headers: args.auth_headers,
             auth_bearer: args.auth_bearer,
             auth_basic: args.auth_basic,
-        }
+        })
     }
 }
 
@@ -266,8 +354,83 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::Mutex;
 
-    /// Serializes all tests that touch process-wide env vars.
+    /// Serializes every test that touches process-wide env vars — including the ones that only
+    /// *read* them through clap's `env` bindings.
+    ///
+    /// That reading happens while the `Command` is **built**, not while argv is parsed: clap's
+    /// `Arg::env` snapshots `env::var_os` as the derive wires each binding up. So `Cli::command()`
+    /// needs this lock exactly as much as `Cli::parse_from` does.
     static TEST_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Take [`TEST_ENV_MUTEX`], ignoring poisoning. The mutex serializes access to the process
+    /// environment rather than guarding an invariant, and [`EnvGuard`] restores every variable on
+    /// unwind, so a panicking test leaves nothing behind: propagating the poison would only turn
+    /// one real failure into a cascade of `PoisonError` panics in every later env test.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Parse an `otel` invocation with the environment held still: a parse builds the `Command` and
+    /// so snapshots every `env` binding (see [`TEST_ENV_MUTEX`]), which running alongside another
+    /// test's mutation would pick up. A test that already holds the lock (to install an [`EnvGuard`]) must
+    /// call [`parse_otel_args_under_env_lock`] instead — the lock is not reentrant.
+    fn parse_otel_args<'a>(argv: impl IntoIterator<Item = &'a str>) -> OtelArgs {
+        let _lock = env_lock();
+        parse_otel_args_under_env_lock(argv)
+    }
+
+    /// [`parse_otel_args`] for a caller that already holds [`TEST_ENV_MUTEX`].
+    ///
+    /// Every variable that steers destination resolution is unset for the duration of the parse:
+    /// each test states the transport and the endpoints it cares about in `argv`, and a flag beats
+    /// an env binding — but an *absent* flag does not, so an exported `OTEL_TRANSPORT` or endpoint
+    /// from the developer's shell would otherwise resolve a flow the test never asked for.
+    fn parse_otel_args_under_env_lock<'a>(argv: impl IntoIterator<Item = &'a str>) -> OtelArgs {
+        let _destination_env = clear_destination_env();
+        let cli = Cli::parse_from(argv);
+        let GeneratorType::Otel(args) = cli.generator;
+        args
+    }
+
+    /// [`parse_otel_args`] for an invocation clap is expected to reject. A rejected parse resolves
+    /// the same `env` bindings on its way to the error, so it belongs under the lock too.
+    fn try_parse_otel_args<'a>(
+        argv: impl IntoIterator<Item = &'a str>,
+    ) -> std::result::Result<Cli, clap::Error> {
+        let _lock = env_lock();
+        let _destination_env = clear_destination_env();
+        Cli::try_parse_from(argv)
+    }
+
+    /// Unset every variable [`Destination::from_flags`] reads, until the returned guards drop.
+    fn clear_destination_env() -> Vec<EnvGuard> {
+        [
+            "OTEL_TRANSPORT",
+            "OTEL_GRPC_ENDPOINT",
+            "OTEL_HTTP_LOGS_ENDPOINT",
+            "OTEL_HTTP_TRACES_ENDPOINT",
+        ]
+        .into_iter()
+        .map(EnvGuard::remove)
+        .collect()
+    }
+
+    /// Unset every retired variable, until the returned guards drop. [`reject_retired_env_vars`]
+    /// reports the first name it finds, so a test about one of them must clear the rest.
+    fn clear_retired_env_vars() -> Vec<EnvGuard> {
+        RETIRED_ENV_VARS
+            .iter()
+            .map(|(name, ..)| EnvGuard::remove(name))
+            .collect()
+    }
+
+    /// Resolve args a test expects to be valid; the destination-resolution failures have their own
+    /// tests.
+    fn config_from(args: OtelArgs) -> OtelConfig {
+        OtelConfig::try_from(args).expect("args must resolve to a config")
+    }
 
     /// RAII guard: restores an env var to its prior value on drop.
     struct EnvGuard {
@@ -305,138 +468,125 @@ mod tests {
 
     #[test]
     fn cli_accepts_new_message_interval_flag() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--message-interval-ms",
             "250",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.message_interval_ms, 250);
     }
 
     #[test]
     fn cli_keeps_legacy_delay_flag_as_alias() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--delay-ms",
             "125",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.message_interval_ms, 125);
     }
 
     #[test]
     fn cli_prefers_new_message_interval_over_legacy_alias() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--delay-ms",
             "125",
             "--message-interval-ms",
             "250",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.message_interval_ms, 250);
     }
 
     #[test]
     fn cli_reads_tenant_count_and_tenant_id() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--tenant-id",
             "tenant_custom",
             "--tenant-count",
             "3",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.tenant_id, "tenant_custom");
         assert_eq!(config.tenant_count, 3);
     }
 
     #[test]
     fn cli_reads_tenant_profile_pool_sizes() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--cloud-account-count-per-tenant",
             "5",
             "--service-count-per-tenant",
             "7",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.cloud_account_count_per_tenant, 5);
         assert_eq!(config.service_count_per_tenant, 7);
     }
 
     #[test]
     fn cli_reads_intra_batch_jitter_options() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--record-intra-batch-timestamp-jitter-ns",
             "10",
             "--record-intra-batch-overlap-probability",
             "0.2",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.record_intra_batch_timestamp_jitter_ns, 10);
         assert!((config.record_intra_batch_overlap_probability - 0.2).abs() < 1e-6);
     }
 
     #[test]
     fn cli_accepts_dry_run_without_endpoint() {
-        let cli = Cli::parse_from(["otel-log-generator", "otel", "--dry-run"]);
-        let GeneratorType::Otel(args) = cli.generator;
+        // The absence of an endpoint is the condition under test; `parse_otel_args` unsets the
+        // endpoint variables so an inherited one cannot supply it behind clap's back.
+        let args = parse_otel_args(["otel-log-generator", "otel", "--dry-run"]);
         assert!(args.dry_run);
-        assert!(args.endpoint.is_none());
-        let config: OtelConfig = args.into();
-        assert!(config.dry_run);
-        assert!(config.ingest_endpoint.is_empty());
+        assert!(args.http_logs_endpoint.is_none());
+        let config = config_from(args);
+        assert!(config.is_dry_run());
         assert!(config.print_logs);
     }
 
     #[test]
     fn cli_service_shards_per_message_default_env_and_flag_precedence() {
         // Serializes against any other test touching SERVICE_SHARDS_PER_MESSAGE.
-        let _lock = TEST_ENV_MUTEX.lock().unwrap();
+        let _lock = env_lock();
 
         // 1. No flag, no env -> default_value = "1".
         let _guard = EnvGuard::remove("SERVICE_SHARDS_PER_MESSAGE");
-        let cli = Cli::parse_from([
+        let args = parse_otel_args_under_env_lock([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
         ]);
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(
             config.service_shards_per_message, 1,
             "default when no flag and no env"
@@ -444,87 +594,293 @@ mod tests {
 
         // 2. Env SERVICE_SHARDS_PER_MESSAGE=2 is read via clap's `env = "..."` binding.
         let _guard = EnvGuard::set("SERVICE_SHARDS_PER_MESSAGE", "2");
-        let cli = Cli::parse_from([
+        let args = parse_otel_args_under_env_lock([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
         ]);
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(
             config.service_shards_per_message, 2,
             "env binding must be honoured"
         );
 
         // 3. --service-shards-per-message flag overrides the env value.
-        let cli = Cli::parse_from([
+        let args = parse_otel_args_under_env_lock([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--service-shards-per-message",
             "5",
         ]);
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.service_shards_per_message, 5, "flag must beat env");
     }
 
     #[test]
     fn cli_reads_service_shards_per_message() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--service-shards-per-message",
             "3",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.service_shards_per_message, 3);
     }
 
     #[test]
-    fn cli_parses_signal_traces() {
-        let cli = Cli::parse_from([
+    fn cli_parses_single_signal_traces() {
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-traces-endpoint",
             "http://localhost:4318/v1/traces",
-            "--signal",
+            "--signals",
             "traces",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
-        assert_eq!(config.signal, Signal::Traces);
+        let config = config_from(args);
+        assert_eq!(config.signals, vec![Signal::Traces]);
     }
 
     #[test]
-    fn cli_signal_defaults_to_logs() {
-        let cli = Cli::parse_from([
+    fn cli_signals_default_to_logs() {
+        // Serialize against the OTEL_SIGNALS env test and clear the var so the default applies.
+        let _lock = env_lock();
+        let _guard = EnvGuard::remove("OTEL_SIGNALS");
+        let args = parse_otel_args_under_env_lock([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
         ]);
+        let config = config_from(args);
+        assert_eq!(config.signals, vec![Signal::Logs]);
+    }
 
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
-        assert_eq!(config.signal, Signal::Logs);
+    #[test]
+    fn cli_parses_multi_signal_list_preserving_order() {
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--http-traces-endpoint",
+            "http://localhost:4318/v1/traces",
+            "--signals",
+            "logs,traces",
+        ]);
+        let config = config_from(args);
+        assert_eq!(config.signals, vec![Signal::Logs, Signal::Traces]);
+    }
+
+    #[test]
+    fn cli_preserves_reverse_signal_order() {
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--http-traces-endpoint",
+            "http://localhost:4318/v1/traces",
+            "--signals",
+            "traces,logs",
+        ]);
+        let config = config_from(args);
+        assert_eq!(config.signals, vec![Signal::Traces, Signal::Logs]);
+    }
+
+    #[test]
+    fn cli_reads_signals_from_env() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("OTEL_SIGNALS", "logs,traces");
+        let args = parse_otel_args_under_env_lock([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--http-traces-endpoint",
+            "http://localhost:4318/v1/traces",
+        ]);
+        let config = config_from(args);
+        assert_eq!(config.signals, vec![Signal::Logs, Signal::Traces]);
+    }
+
+    #[test]
+    fn cli_rejects_unknown_signal() {
+        let result = try_parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--signals",
+            "metrics",
+        ]);
+        assert!(result.is_err(), "unknown signal must be rejected");
+    }
+
+    #[test]
+    fn cli_rejects_legacy_signal_flag() {
+        let result = try_parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--signal",
+            "traces",
+        ]);
+        assert!(result.is_err(), "old --signal flag must no longer parse");
+    }
+
+    #[test]
+    fn env_rejects_legacy_signal_var() {
+        // The CLI half of this migration is covered by `cli_rejects_legacy_signal_flag`; clap
+        // ignores an unbound env var instead, so the rename needs its own guard.
+        let _lock = env_lock();
+        let _retired = clear_retired_env_vars();
+        let _guard = EnvGuard::set("OTEL_SIGNAL", "traces");
+        assert!(matches!(
+            reject_retired_env_vars(),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn env_accepts_current_signals_var() {
+        let _lock = env_lock();
+        let _retired = clear_retired_env_vars();
+        let _current = EnvGuard::set("OTEL_SIGNALS", "logs,traces");
+        assert!(reject_retired_env_vars().is_ok());
+    }
+
+    #[test]
+    fn retired_endpoint_env_vars_fail_the_run() {
+        let _lock = env_lock();
+        // Only the variable under test may be set: the check reports the first retired name it
+        // finds, so an inherited one would make every iteration pass without ever reaching it.
+        let _retired = clear_retired_env_vars();
+        for name in [
+            "OTEL_LOGS_ENDPOINT",
+            "OTEL_TRACES_ENDPOINT",
+            "OTEL_HEALTHCHECK_ENDPOINT",
+        ] {
+            let _guard = EnvGuard::set(name, "http://localhost:4318/v1/logs");
+            assert!(
+                matches!(
+                    reject_retired_env_vars(),
+                    Err(GeneratorError::InvalidConfiguration(_))
+                ),
+                "{name} must be rejected at startup"
+            );
+        }
+    }
+
+    #[test]
+    fn env_rejects_legacy_records_per_message_var() {
+        // RECORDS_PER_MESSAGE became LOGS_PER_MESSAGE when traces got their own budget; a stale
+        // `.env` would otherwise silently fall back to the default of one record per message.
+        let _lock = env_lock();
+        let _retired = clear_retired_env_vars();
+        let _guard = EnvGuard::set("RECORDS_PER_MESSAGE", "10");
+        assert!(matches!(
+            reject_retired_env_vars(),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn cli_reads_logs_and_traces_per_message() {
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--logs-per-message",
+            "30",
+            "--traces-per-message",
+            "12",
+        ]);
+        let config = config_from(args);
+        assert_eq!(config.logs_per_message, 30);
+        assert_eq!(config.traces_per_message, 12);
+    }
+
+    #[test]
+    fn cli_http_flow_reads_both_signal_endpoints() {
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--signals",
+            "logs,traces",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--http-traces-endpoint",
+            "http://localhost:4318/v1/traces",
+        ]);
+        let config = config_from(args);
+        let Destination::Http { endpoints, .. } = &config.destination else {
+            panic!("expected the HTTP flow");
+        };
+        assert_eq!(
+            endpoints.get(&Signal::Traces).map(String::as_str),
+            Some("http://localhost:4318/v1/traces")
+        );
+    }
+
+    /// Regression: one `.env` carrying the HTTP URLs must not break a gRPC run.
+    #[test]
+    fn cli_grpc_flow_resolves_with_http_endpoint_flags_present() {
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--transport",
+            "grpc",
+            "--signals",
+            "logs,traces",
+            "--grpc-endpoint",
+            "http://localhost:4317",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--http-traces-endpoint",
+            "http://localhost:4318/v1/traces",
+        ]);
+        let config = config_from(args);
+        assert!(matches!(
+            &config.destination,
+            Destination::Grpc { endpoint } if endpoint == "http://localhost:4317"
+        ));
+    }
+
+    #[test]
+    fn cli_http_flow_without_traces_endpoint_fails_to_build_a_config() {
+        // The absence of the traces URL is the condition under test; `parse_otel_args` unsets the
+        // endpoint variables so an inherited environment cannot supply one behind clap's back.
+        let args = parse_otel_args([
+            "otel-log-generator",
+            "otel",
+            "--signals",
+            "logs,traces",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+        ]);
+        assert!(matches!(
+            OtelConfig::try_from(args),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
     fn cli_reads_llm_trace_knobs() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-traces-endpoint",
             "http://localhost:4318/v1/traces",
-            "--signal",
+            "--signals",
             "traces",
             "--llm-max-tool-calls",
             "5",
@@ -532,9 +888,7 @@ mod tests {
             "--llm-profile-weights",
             "simple_chat:2,rag:1",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.llm_max_tool_calls, 5);
         assert!(config.llm_capture_content);
         assert_eq!(config.llm_profile_weights, "simple_chat:2,rag:1");
@@ -542,17 +896,22 @@ mod tests {
 
     #[test]
     fn cli_reads_auth_flags() {
-        let cli = Cli::parse_from([
+        // Each half asserts that the shortcut it did *not* pass stays unset, so an exported
+        // credential must not reach clap's `env` bindings.
+        let _lock = env_lock();
+        let _bearer = EnvGuard::remove("OTEL_AUTH_BEARER");
+        let _basic = EnvGuard::remove("OTEL_AUTH_BASIC");
+        let args = parse_otel_args_under_env_lock([
             "otel-log-generator",
             "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
             "--auth-headers",
             "x-api-key=secret,x-bt-parent=project:foo",
             "--auth-bearer",
             "token123",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(
             config.auth_headers,
             "x-api-key=secret,x-bt-parent=project:foo"
@@ -560,36 +919,66 @@ mod tests {
         assert_eq!(config.auth_bearer.as_deref(), Some("token123"));
         assert_eq!(config.auth_basic, None);
 
-        let cli = Cli::parse_from(["otel-log-generator", "otel", "--auth-basic", "user:pass"]);
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let args = parse_otel_args_under_env_lock([
+            "otel-log-generator",
+            "otel",
+            "--http-logs-endpoint",
+            "http://localhost:4318/v1/logs",
+            "--auth-basic",
+            "user:pass",
+        ]);
+        let config = config_from(args);
         assert_eq!(config.auth_basic.as_deref(), Some("user:pass"));
         assert_eq!(config.auth_bearer, None);
     }
 
     #[test]
     fn cli_reads_trace_span_budget() {
-        let cli = Cli::parse_from([
+        let args = parse_otel_args([
             "otel-log-generator",
             "otel",
-            "--endpoint",
+            "--http-traces-endpoint",
             "http://localhost:4318/v1/traces",
-            "--signal",
+            "--signals",
             "traces",
             "--trace-min-spans",
             "10",
             "--trace-max-spans",
             "50",
         ]);
-
-        let GeneratorType::Otel(args) = cli.generator;
-        let config: OtelConfig = args.into();
+        let config = config_from(args);
         assert_eq!(config.trace_min_spans, 10);
         assert_eq!(config.trace_max_spans, 50);
     }
 
     #[test]
+    fn retirement_replacements_are_bound_in_clap() {
+        // Every replacement a retirement points at must be a live clap `env` binding on `OtelArgs`.
+        // Without this, a retirement could reject the old name while nothing reads the name it
+        // recommends — a silent config break. Walk the actual clap bindings so the invariant tracks
+        // the declaration, not a hand-kept copy. `OTEL_HEALTHCHECK_ENDPOINT` names no replacement.
+        let _lock = env_lock();
+        let mut command = Cli::command();
+        let otel = command.find_subcommand_mut("otel").unwrap();
+        let bound: std::collections::HashSet<String> = otel
+            .get_arguments()
+            .filter_map(|arg| arg.get_env())
+            .map(|env| env.to_string_lossy().into_owned())
+            .collect();
+
+        for (retired, replacements, _guidance) in RETIRED_ENV_VARS {
+            for name in *replacements {
+                assert!(
+                    bound.contains(*name),
+                    "{name}, the replacement for {retired}, is not bound to any otel arg via clap `env`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cli_help_documents_tenant_routing_inputs() {
+        let _lock = env_lock();
         let mut command = Cli::command();
         let otel = command.find_subcommand_mut("otel").unwrap();
         let mut help = Vec::new();

@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::message::attrs::{pairs_to_json_attrs, pairs_to_proto_kv};
-use crate::message::plan::{PlannedRecord, PlannedRequest, PlannedShard};
+use crate::message::logs::log_plan::{PlannedRecord, PlannedRequest, PlannedShard};
 use crate::message::types::MessagePayload;
 use crate::pb::opentelemetry::proto::common::v1::{any_value, AnyValue};
 use serde_json::{json, Value};
@@ -8,26 +8,24 @@ use serde_json::{json, Value};
 /// Serializes a [`PlannedRequest`] into a wire-format [`MessagePayload`].
 ///
 /// The encoder is chosen once at generator construction time and never changes, following the same
-/// pattern as [`crate::transport::Transport`] in [`crate::generator::OtelLogGenerator`].
+/// pattern as [`crate::transport::Transport`] in [`crate::generator::OtelGenerator`] and mirroring
+/// [`crate::message::traces::TraceEncoder`] on the traces side.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::GeneratorError::ProtobufEncodeError`] from [`ProtobufEncoder`] if
-/// protobuf serialization fails. [`JsonEncoder`] is infallible for well-formed plans.
-pub trait OtlpEncoder: Send + Sync {
+/// Returns [`crate::error::GeneratorError::ProtobufEncodeError`] from [`LogProtobufEncoder`] if
+/// protobuf serialization fails. [`LogJsonEncoder`] is infallible for well-formed plans.
+pub trait LogEncoder: Send + Sync {
     #[allow(clippy::result_large_err)]
     fn encode(&self, request: &PlannedRequest) -> Result<MessagePayload>;
 }
 
 /// Serializes a planned request to OTLP JSON format.
-pub struct JsonEncoder;
+pub struct LogJsonEncoder;
 
-/// Serializes a planned request to OTLP protobuf binary format.
-pub struct ProtobufEncoder;
-
-impl OtlpEncoder for JsonEncoder {
+impl LogEncoder for LogJsonEncoder {
     // Always returns Ok — serde_json::json! and string formatting are infallible for well-formed
-    // plans. Result is required by the trait contract shared with ProtobufEncoder.
+    // plans. Result is required by the trait contract shared with LogProtobufEncoder.
     #[allow(clippy::result_large_err)]
     fn encode(&self, request: &PlannedRequest) -> Result<MessagePayload> {
         let resource_logs: Vec<Value> = request.shards.iter().map(encode_shard_json).collect();
@@ -37,43 +35,10 @@ impl OtlpEncoder for JsonEncoder {
     }
 }
 
-fn encode_shard_json(shard: &PlannedShard) -> Value {
-    let log_records: Vec<Value> = shard.records.iter().map(encode_record_json).collect();
-    json!({
-        "resource": {
-            "attributes": pairs_to_json_attrs(&shard.resource_attrs),
-            "droppedAttributesCount": shard.resource_dropped_attributes_count
-        },
-        "scopeLogs": [{
-            "scope": {
-                "name": shard.scope_name,
-                "version": shard.scope_version,
-                "attributes": pairs_to_json_attrs(&shard.scope_attrs),
-                "droppedAttributesCount": shard.scope_dropped_attributes_count
-            },
-            "logRecords": log_records,
-            "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
-        }],
-        "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
-    })
-}
+/// Serializes a planned request to OTLP protobuf binary format.
+pub struct LogProtobufEncoder;
 
-fn encode_record_json(record: &PlannedRecord) -> Value {
-    let ts = record.timestamp_ns.max(0).to_string();
-    json!({
-        "timeUnixNano": ts,
-        "observedTimeUnixNano": ts,
-        "severityNumber": record.severity_number,
-        "severityText": record.severity_text,
-        "body": { "stringValue": record.body },
-        "attributes": pairs_to_json_attrs(&record.attributes),
-        "traceId": hex::encode(record.trace_id),
-        "spanId": hex::encode(record.span_id),
-        "flags": record.flags,
-    })
-}
-
-impl OtlpEncoder for ProtobufEncoder {
+impl LogEncoder for LogProtobufEncoder {
     #[allow(clippy::result_large_err)]
     fn encode(&self, request: &PlannedRequest) -> Result<MessagePayload> {
         use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
@@ -134,6 +99,42 @@ impl OtlpEncoder for ProtobufEncoder {
     }
 }
 
+fn encode_shard_json(shard: &PlannedShard) -> Value {
+    let log_records: Vec<Value> = shard.records.iter().map(encode_record_json).collect();
+    json!({
+        "resource": {
+            "attributes": pairs_to_json_attrs(&shard.resource_attrs),
+            "droppedAttributesCount": shard.resource_dropped_attributes_count
+        },
+        "scopeLogs": [{
+            "scope": {
+                "name": shard.scope_name,
+                "version": shard.scope_version,
+                "attributes": pairs_to_json_attrs(&shard.scope_attrs),
+                "droppedAttributesCount": shard.scope_dropped_attributes_count
+            },
+            "logRecords": log_records,
+            "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
+        }],
+        "schemaUrl": "https://opentelemetry.io/schemas/1.21.0"
+    })
+}
+
+fn encode_record_json(record: &PlannedRecord) -> Value {
+    let ts = record.timestamp_ns.max(0).to_string();
+    json!({
+        "timeUnixNano": ts,
+        "observedTimeUnixNano": ts,
+        "severityNumber": record.severity_number,
+        "severityText": record.severity_text,
+        "body": { "stringValue": record.body },
+        "attributes": pairs_to_json_attrs(&record.attributes),
+        "traceId": hex::encode(record.trace_id),
+        "spanId": hex::encode(record.span_id),
+        "flags": record.flags,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +187,7 @@ mod tests {
             ),
             make_shard("svc-b", vec![make_record(300, 0xEF)]),
         ]);
-        let payload = JsonEncoder.encode(&request).unwrap();
+        let payload = LogJsonEncoder.encode(&request).unwrap();
         let MessagePayload::Json(json) = payload else {
             panic!("expected JSON payload");
         };
@@ -225,7 +226,7 @@ mod tests {
             ),
             make_shard("svc-b", vec![make_record(3_000, 0x33)]),
         ]);
-        let payload = ProtobufEncoder.encode(&request).unwrap();
+        let payload = LogProtobufEncoder.encode(&request).unwrap();
         let MessagePayload::Protobuf(bytes) = payload else {
             panic!("expected Protobuf payload");
         };
@@ -257,7 +258,7 @@ mod tests {
                 make_record(42, 0x03),
             ],
         )]);
-        let payload = ProtobufEncoder.encode(&request).unwrap();
+        let payload = LogProtobufEncoder.encode(&request).unwrap();
         let MessagePayload::Protobuf(bytes) = payload else {
             panic!("expected Protobuf payload");
         };

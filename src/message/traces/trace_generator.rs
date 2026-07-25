@@ -1,14 +1,15 @@
-//! Trace message generator: builds one trace per service shard (one trace_id, a span tree from
-//! `SpanProfile`), assigns time via `trace_time::layout_span_tree`, and encodes with
-//! `TraceEncoder`.
+//! Trace message generator: builds `shard.num_traces` traces per service shard (each with its own
+//! trace_id and a span tree from `SpanProfile`), assigns time via `trace_time::layout_span_tree`,
+//! collects a shard's traces into a single `ResourceSpans` group, and encodes with `TraceEncoder`.
 
 use crate::error::{GeneratorError, Result};
 use crate::message::fake_data::FakeDataGenerator;
-use crate::message::resource_attrs::{build_resource_attribute_pairs, DEFAULT_SERVICE_NAME};
+use crate::message::resource_attrs::{ShardResourceAttrs, DEFAULT_SERVICE_NAME};
 use crate::message::traces::span_profile::SpanProfile;
 use crate::message::traces::trace_encoder::TraceEncoder;
 use crate::message::traces::trace_plan::{
-    PlannedEvent, PlannedResourceSpans, PlannedScopeSpans, PlannedSpan, PlannedTraces,
+    PlannedEvent, PlannedResourceSpans, PlannedScopeSpans, PlannedSpan, PlannedTraces, SpanAnchor,
+    TraceCorrelation,
 };
 use crate::message::traces::trace_time::{layout_span_tree, resolve_event_time};
 use crate::message::types::{OTLPMessage, OTLPMessageType, Signal};
@@ -40,12 +41,17 @@ impl TraceMessageGenerator {
         }
     }
 
-    /// One request = one trace per service shard.
+    /// One request = `shard.num_traces` traces per service shard.
+    ///
+    /// Self-samples `project_id` and `now_ns`; used by the logs-agnostic (traces-only) callers and
+    /// unit tests. The multi-signal factory instead calls the crate-internal `plan_traces` with a
+    /// shared `project_id`/`now_ns` so logs and traces of one generation cycle agree on identity
+    /// and time.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::GeneratorError::ProtobufEncodeError`] if the configured encoder
-    /// fails to serialize (only possible with [`crate::message::TraceProtobufEncoder`]), or
+    /// fails to serialize (only possible with [`crate::TraceProtobufEncoder`]), or
     /// [`crate::error::GeneratorError::EmptySpanTree`] if a span profile yields no nodes.
     #[allow(clippy::result_large_err)]
     pub fn generate_message(
@@ -57,47 +63,146 @@ impl TraceMessageGenerator {
         let project_id = FakeDataGenerator::generate_project_id();
         let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-        // One rng per message, threaded through every trace plan: keeps the structural draws
-        // (span shuffle, conversation pick) on a single, seedable source instead of a fresh
-        // `thread_rng` per shard.
-        let mut rng = rand::thread_rng();
-        let resource_spans = shards
-            .iter()
-            .map(|shard| {
-                self.plan_one_trace(
-                    &project_id,
-                    cloud_account_id.as_deref(),
-                    shard.service_name.as_deref(),
-                    now_ns,
-                    &mut rng,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Traces-only path: cardinality is a logs-only feature, so the shard attributes are carried
+        // through raw (`None`). The shared normalization only kicks in when logs are co-configured.
+        let resource_attrs = ShardResourceAttrs::for_shards(
+            &project_id,
+            cloud_account_id.as_deref(),
+            &shards,
+            &self.source,
+            None,
+        );
+        let (planned, _correlations) = self.plan(
+            &project_id,
+            &shards,
+            now_ns,
+            &resource_attrs,
+            &mut rand::thread_rng(),
+        )?;
+        self.encode_message(&planned, tenant_id)
+    }
 
-        let planned = PlannedTraces {
-            project_id: project_id.clone(),
-            resource_spans,
-        };
-        let payload = self.encoder.encode(&planned)?;
+    /// Plan `shard.num_traces` traces per service shard from a shared `project_id`/`now_ns`,
+    /// returning both the format-neutral plan and, per shard (in shard order), one
+    /// [`TraceCorrelation`] per trace of that shard. The log planner consumes the correlations to
+    /// attach a shard's log records to the spans of that shard's traces.
+    ///
+    /// A shard is emitted as exactly one `ResourceSpans` group — as an OTEL Collector batches a
+    /// pod's traces — so the request holds `shards.len()` groups. The group's resource attributes
+    /// are built once per shard, and the spans of all its traces are interleaved inside it; each
+    /// span carries its own `trace_id`, so a shard's traces share a service and a pod but never a
+    /// `trace_id`.
+    ///
+    /// `resource_attrs` carries one shard's complete resource-attribute set per index (built once by
+    /// the caller); the trace reuses it verbatim, so a correlated log and its trace agree on the
+    /// whole resource — identity keys and the pod-describing variable keys alike.
+    ///
+    /// `rng` drives every structural draw of the request (span shuffle, conversation pick, scope
+    /// version), so a caller can seed the whole plan from one source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::GeneratorError::EmptySpanTree`] if a span profile yields no nodes, or
+    /// [`crate::error::GeneratorError::InvalidConfiguration`] if
+    /// `resource_attrs.len() != shards.len()` or a shard has `num_traces == 0`.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn plan(
+        &self,
+        project_id: &str,
+        shards: &[ServiceShard],
+        now_ns: i64,
+        resource_attrs: &[ShardResourceAttrs],
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<(PlannedTraces, Vec<Vec<TraceCorrelation>>)> {
+        if resource_attrs.len() != shards.len() {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "shard resource attributes ({}) must match shard count ({})",
+                resource_attrs.len(),
+                shards.len()
+            )));
+        }
+        if let Some(i) = shards.iter().position(|s| s.num_traces == 0) {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "shard at index {i} has num_traces=0; every shard must have num_traces >= 1"
+            )));
+        }
+        let mut resource_spans = Vec::with_capacity(shards.len());
+        let mut correlations = Vec::with_capacity(shards.len());
+        for (shard, shard_attrs) in shards.iter().zip(resource_attrs) {
+            let service_name = shard.service_name.as_deref();
+            let mut shard_correlations = Vec::with_capacity(shard.num_traces);
+            let mut spans: Vec<PlannedSpan> = Vec::new();
+            for _ in 0..shard.num_traces {
+                let (trace_spans, correlation) = self.plan_trace_spans(now_ns, rng)?;
+                spans.extend(trace_spans);
+                shard_correlations.push(correlation);
+            }
+            correlations.push(shard_correlations);
+
+            // Emit the shard's spans in random order: parent/child links travel on span ids and
+            // each span carries its own `trace_id`, so the wire order is free. Shuffling the whole
+            // group interleaves the shard's traces, the way a collector batch arrives — a
+            // root-first, trace-by-trace stream is not what a backend receives.
+            spans.shuffle(rng);
+
+            let svc = service_name.unwrap_or(DEFAULT_SERVICE_NAME);
+            let scope_name = format!("io.trihub.{}", svc.replace('-', "."));
+            let scope_version = format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10));
+            resource_spans.push(PlannedResourceSpans {
+                // TODO(high): extend cardinality to the span attributes; the resource attributes are
+                // already normalized once per shard and shared with the log path.
+                resource_attrs: shard_attrs.pairs().to_vec(),
+                resource_dropped_attributes_count: rng.gen_range(0..4),
+                scope: PlannedScopeSpans {
+                    scope_name,
+                    scope_version,
+                    scope_attrs: vec![],
+                    spans,
+                },
+            });
+        }
+
+        Ok((
+            PlannedTraces {
+                project_id: project_id.to_string(),
+                resource_spans,
+            },
+            correlations,
+        ))
+    }
+
+    /// Encode a planned trace request into a wire-format [`OTLPMessage`] tagged [`Signal::Traces`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::GeneratorError::ProtobufEncodeError`] if the configured encoder
+    /// fails to serialize (only possible with [`crate::TraceProtobufEncoder`]).
+    #[allow(clippy::result_large_err)]
+    pub fn encode_message(
+        &self,
+        planned: &PlannedTraces,
+        tenant_id: Option<String>,
+    ) -> Result<OTLPMessage> {
+        let payload = self.encoder.encode(planned)?;
         Ok(OTLPMessage::new(
             payload,
             Signal::Traces,
             tenant_id,
-            project_id,
+            planned.project_id.clone(),
             self.source.clone(),
             OTLPMessageType::Valid,
         ))
     }
 
+    /// Plan the spans of a single trace: a fresh `trace_id`, a span tree from the profile, and the
+    /// laid-out time windows. The spans are returned in layout order (index 0 is the root) for the
+    /// caller to merge into its shard's group; the shard owns the resource and scope of that group.
     #[allow(clippy::result_large_err)]
-    fn plan_one_trace(
+    fn plan_trace_spans(
         &self,
-        project_id: &str,
-        cloud_account_id: Option<&str>,
-        service_name: Option<&str>,
         now_ns: i64,
         rng: &mut dyn rand::RngCore,
-    ) -> Result<PlannedResourceSpans> {
+    ) -> Result<(Vec<PlannedSpan>, TraceCorrelation)> {
         let trace_id = FakeDataGenerator::generate_trace_id();
         // The profile owns all span semantics, including the per-trace `gen_ai.conversation.id`
         // it stamps on every node — this generator stays signal-agnostic.
@@ -132,6 +237,21 @@ impl TraceMessageGenerator {
             .map(|(s, e)| (s + shift, e + shift))
             .collect();
 
+        // Capture one anchor per span so the log planner can spread a shard's records across the
+        // whole tree instead of pinning them all to the root. Built from `span_ids`/`windows`,
+        // which are indexed by node — unaffected by the wire-order shuffle of `spans` below — and
+        // kept in layout order, so index 0 stays the root.
+        let anchors: Arc<[SpanAnchor]> = span_ids
+            .iter()
+            .zip(&windows)
+            .map(|(&span_id, &(start_ns, end_ns))| SpanAnchor {
+                span_id,
+                start_ns,
+                end_ns,
+            })
+            .collect();
+        let correlation = TraceCorrelation { trace_id, anchors };
+
         let mut spans: Vec<PlannedSpan> = Vec::with_capacity(nodes.len());
         for (i, node) in nodes.iter().enumerate() {
             let (start_ns, end_ns) = windows[i];
@@ -147,6 +267,7 @@ impl TraceMessageGenerator {
                 })
                 .collect();
             spans.push(PlannedSpan {
+                trace_id,
                 span_id: span_ids[i],
                 parent_span_id: node.parent.map(|p| span_ids[p]),
                 name: node.name.clone(),
@@ -160,30 +281,7 @@ impl TraceMessageGenerator {
             });
         }
 
-        // Emit spans in random order: parent/child links are carried by span ids, so the wire
-        // order is free. Real collectors do not receive a root-first stream.
-        spans.shuffle(rng);
-
-        let svc = service_name.unwrap_or(DEFAULT_SERVICE_NAME);
-        let scope_name = format!("io.trihub.{}", svc.replace('-', "."));
-        let scope_version = format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10));
-
-        Ok(PlannedResourceSpans {
-            resource_attrs: build_resource_attribute_pairs(
-                project_id,
-                cloud_account_id,
-                service_name,
-                &self.source,
-            ),
-            resource_dropped_attributes_count: rng.gen_range(0..4),
-            trace_id,
-            scope: PlannedScopeSpans {
-                scope_name,
-                scope_version,
-                scope_attrs: vec![],
-                spans,
-            },
-        })
+        Ok((spans, correlation))
     }
 }
 
@@ -201,7 +299,7 @@ mod tests {
     use crate::message::ServiceShard;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     /// Fixed anchor for plan-level tests that inspect structure, not wall-clock time.
@@ -279,23 +377,29 @@ mod tests {
                 None,
                 vec![ServiceShard {
                     service_name: Some("svc-a".to_string()),
-                    num_records: 1,
+                    num_logs: 1,
+                    num_traces: 1,
                 }],
             )
             .unwrap_err();
         assert!(matches!(err, GeneratorError::EmptySpanTree));
     }
 
+    /// A service shard is a single `ResourceSpans` group no matter how many traces it carries —
+    /// the shape an OTEL Collector batches for one pod. Each trace inside the group keeps its own
+    /// `trace_id` and its own single root, and its spans stay inside that root's window.
     #[test]
-    fn generates_one_resource_spans_per_shard_with_shared_trace_id_per_tree() {
+    fn shard_emits_one_resource_spans_group_holding_all_its_traces() {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 3,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 3,
             },
         ];
         let msg = gen()
@@ -309,29 +413,89 @@ mod tests {
         let MessagePayload::Json(json) = msg.message else {
             panic!("expected json")
         };
-        let rs = json["resourceSpans"].as_array().unwrap();
-        assert_eq!(rs.len(), 2);
-        // within each ResourceSpans all spans share one traceId
-        for r in rs {
-            let spans = r["scopeSpans"][0]["spans"].as_array().unwrap();
-            let first = spans[0]["traceId"].as_str().unwrap();
-            assert!(spans.iter().all(|s| s["traceId"].as_str() == Some(first)));
-            // the root is the single parent-less span; spans may arrive in any order.
-            let root = spans
-                .iter()
-                .find(|s| s["parentSpanId"].as_str().is_none())
-                .expect("exactly one root span");
-            let root_start: i64 = root["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
-            let root_end: i64 = root["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
-            // every other span is enclosed by the root window
-            for s in spans
-                .iter()
-                .filter(|s| s["parentSpanId"].as_str().is_some())
-            {
-                let cs: i64 = s["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
-                let ce: i64 = s["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
-                assert!(cs >= root_start && ce <= root_end, "child within root");
+        let groups = json["resourceSpans"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "one ResourceSpans group per shard");
+
+        let mut all_trace_ids: HashSet<String> = HashSet::new();
+        for group in groups {
+            let spans = group["scopeSpans"][0]["spans"].as_array().unwrap();
+            // Spans arrive interleaved, so regroup them by the trace they belong to.
+            let mut by_trace: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
+            for span in spans {
+                by_trace
+                    .entry(span["traceId"].as_str().unwrap().to_string())
+                    .or_default()
+                    .push(span);
             }
+            assert_eq!(by_trace.len(), 3, "three traces per shard");
+            all_trace_ids.extend(by_trace.keys().cloned());
+
+            for trace_spans in by_trace.values() {
+                let roots: Vec<_> = trace_spans
+                    .iter()
+                    .filter(|s| s["parentSpanId"].as_str().is_none())
+                    .collect();
+                assert_eq!(roots.len(), 1, "exactly one root span per trace");
+                let root_start: i64 = roots[0]["startTimeUnixNano"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let root_end: i64 = roots[0]["endTimeUnixNano"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                for s in trace_spans
+                    .iter()
+                    .filter(|s| s["parentSpanId"].as_str().is_some())
+                {
+                    let cs: i64 = s["startTimeUnixNano"].as_str().unwrap().parse().unwrap();
+                    let ce: i64 = s["endTimeUnixNano"].as_str().unwrap().parse().unwrap();
+                    assert!(cs >= root_start && ce <= root_end, "child within root");
+                }
+            }
+        }
+        assert_eq!(
+            all_trace_ids.len(),
+            6,
+            "every trace of every shard has its own trace_id"
+        );
+    }
+
+    /// Regression: the resource attributes are built once per shard, so all traces of a shard
+    /// report the same pod. Emitting one group per trace rebuilt them per trace, turning a single
+    /// shard into several hosts/pods that shared one `service.name`.
+    #[test]
+    fn traces_of_one_shard_share_identical_resource_attributes() {
+        const VARIABLE_KEYS: [&str; 5] = [
+            "host.name",
+            "k8s.pod.name",
+            "service.version",
+            "deployment.environment",
+            "k8s.namespace.name",
+        ];
+
+        let shards = vec![ServiceShard {
+            service_name: Some("svc-a".to_string()),
+            num_logs: 1,
+            num_traces: 5,
+        }];
+        let msg = gen().generate_message(None, None, shards).unwrap();
+        let MessagePayload::Json(json) = msg.message else {
+            panic!("expected json")
+        };
+        let groups = json["resourceSpans"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+
+        let attrs = groups[0]["resource"]["attributes"].as_array().unwrap();
+        for key in VARIABLE_KEYS {
+            let values: Vec<&str> = attrs
+                .iter()
+                .filter(|a| a["key"].as_str() == Some(key))
+                .map(|a| a["value"]["stringValue"].as_str().unwrap())
+                .collect();
+            assert_eq!(values.len(), 1, "{key} must appear exactly once per shard");
         }
     }
 
@@ -347,7 +511,8 @@ mod tests {
         );
         let shards = vec![ServiceShard {
             service_name: Some("svc-a".to_string()),
-            num_records: 1,
+            num_logs: 1,
+            num_traces: 1,
         }];
         let msg = generator.generate_message(None, None, shards).unwrap();
         let MessagePayload::Json(json) = msg.message else {
@@ -429,7 +594,8 @@ mod tests {
         );
         let shards = vec![ServiceShard {
             service_name: Some("svc-a".to_string()),
-            num_records: 1,
+            num_logs: 1,
+            num_traces: 1,
         }];
         let msg = generator.generate_message(None, None, shards).unwrap();
         let MessagePayload::Json(json) = msg.message else {
@@ -480,7 +646,8 @@ mod tests {
     fn all_spans_in_trace_share_one_conversation_id() {
         let shards = vec![ServiceShard {
             service_name: Some("svc-a".to_string()),
-            num_records: 1,
+            num_logs: 1,
+            num_traces: 1,
         }];
         let msg = gen().generate_message(None, None, shards).unwrap();
         let spans = encoded_spans(msg);
@@ -518,12 +685,10 @@ mod tests {
                 budget: None,
             }),
         );
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut counts: HashMap<String, usize> = HashMap::new();
         for _ in 0..200 {
-            let rs = generator
-                .plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng)
-                .unwrap();
-            let id = planned_conversation_id(&rs.scope.spans[0]).expect("conversation.id present");
+            let (spans, _corr) = generator.plan_trace_spans(TEST_NOW_NS, &mut rng).unwrap();
+            let id = planned_conversation_id(&spans[0]).expect("conversation.id present");
             *counts.entry(id.to_string()).or_insert(0) += 1;
         }
         // Reuse happened: fewer distinct ids than traces.
@@ -540,28 +705,75 @@ mod tests {
         );
     }
 
-    /// Spans are emitted in random order, so the root is not always first. `FixedNestedTree` has
-    /// 3 spans, so a root-first stream has probability ~1/3 per trace; across many seeded traces
-    /// at least one must place the root elsewhere.
+    /// A shard's spans are emitted in random order, so its first span is not always a root.
+    /// `FixedNestedTree` has 3 spans, so a root-first group has probability ~1/3 per plan; the
+    /// seeded rng makes the run reproducible, and 20 plans leave no seed-dependent doubt.
     #[test]
-    fn root_span_is_not_always_first() {
+    fn first_span_of_a_shard_is_not_always_the_root() {
         let mut rng = StdRng::seed_from_u64(20);
         let generator = TraceMessageGenerator::new(
             "test-src".to_string(),
             Arc::new(TraceJsonEncoder),
             Arc::new(FixedNestedTree),
         );
-        let root_first = (0..40)
+        let shards = vec![ServiceShard {
+            service_name: Some("svc-a".to_string()),
+            num_logs: 1,
+            num_traces: 1,
+        }];
+        let resource_attrs =
+            ShardResourceAttrs::for_shards("proj", None, &shards, "test-src", None);
+        let root_first = (0..20)
             .filter(|_| {
-                let rs = generator
-                    .plan_one_trace("proj", None, Some("svc-a"), TEST_NOW_NS, &mut rng)
+                let (planned, _corr) = generator
+                    .plan("proj", &shards, TEST_NOW_NS, &resource_attrs, &mut rng)
                     .unwrap();
-                rs.scope.spans[0].parent_span_id.is_none()
+                planned.resource_spans[0].scope.spans[0]
+                    .parent_span_id
+                    .is_none()
             })
             .count();
         assert!(
-            root_first < 40,
+            root_first < 20,
             "spans never reordered: root was always first"
+        );
+    }
+
+    /// The shuffle is per shard, not per trace: with several traces in one group their spans
+    /// interleave instead of arriving trace-by-trace. `FixedNestedTree` gives 3 spans per trace, so
+    /// a trace-by-trace stream has probability `1/C(6,3) = 1/20` per plan for 2 traces; 20 seeded
+    /// plans make an interleaving certain for this seed.
+    #[test]
+    fn spans_of_a_shards_traces_are_interleaved() {
+        let mut rng = StdRng::seed_from_u64(20);
+        let generator = TraceMessageGenerator::new(
+            "test-src".to_string(),
+            Arc::new(TraceJsonEncoder),
+            Arc::new(FixedNestedTree),
+        );
+        let shards = vec![ServiceShard {
+            service_name: Some("svc-a".to_string()),
+            num_logs: 1,
+            num_traces: 2,
+        }];
+        let resource_attrs =
+            ShardResourceAttrs::for_shards("proj", None, &shards, "test-src", None);
+        let interleaved = (0..20).any(|_| {
+            let (planned, _corr) = generator
+                .plan("proj", &shards, TEST_NOW_NS, &resource_attrs, &mut rng)
+                .unwrap();
+            let trace_ids: Vec<[u8; 16]> = planned.resource_spans[0]
+                .scope
+                .spans
+                .iter()
+                .map(|span| span.trace_id)
+                .collect();
+            // Contiguous per trace means exactly one switch between the two traces.
+            trace_ids.windows(2).filter(|w| w[0] != w[1]).count() > 1
+        });
+        assert!(
+            interleaved,
+            "a shard's traces were never interleaved: the shuffle is still per trace"
         );
     }
 }

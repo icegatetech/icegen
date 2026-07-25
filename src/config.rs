@@ -1,9 +1,9 @@
 use crate::error::{GeneratorError, Result};
 use crate::message::traces::span_profile::{ProfileWeights, SpanBudget};
 use crate::message::types::Signal;
-use crate::transport::AuthHeaders;
+use crate::transport::{AuthHeaders, Destination};
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_RETRIES_UPPER_BOUND: u32 = 10;
 /// Hard upper bound on `trace_max_spans`, keeping a single trace's payload bounded.
@@ -18,15 +18,15 @@ const DEFAULT_CARDINALITY_LIMITS: &[(&str, usize)] = &[
 ];
 
 #[derive(Debug, Clone)]
-pub struct LabelCardinalityConfig {
+pub struct AttributesCardinalityConfig {
     pub enabled: bool,
     pub default_limit: Option<usize>,
-    pub limits: HashMap<String, usize>,
+    pub limit_by_attr: HashMap<String, usize>,
 }
 
-impl LabelCardinalityConfig {
+impl AttributesCardinalityConfig {
     pub fn limit_for(&self, key: &str) -> Option<usize> {
-        self.limits
+        self.limit_by_attr
             .get(key)
             .copied()
             .or(self.default_limit)
@@ -34,12 +34,12 @@ impl LabelCardinalityConfig {
     }
 }
 
-impl Default for LabelCardinalityConfig {
+impl Default for AttributesCardinalityConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             default_limit: None,
-            limits: default_cardinality_limits(),
+            limit_by_attr: default_cardinality_limits(),
         }
     }
 }
@@ -146,16 +146,53 @@ impl Default for TimestampJitterConfig {
     }
 }
 
+/// The resolved, validated subset of [`OtelConfig`] a [`crate::message::factory::SignalFactory`]
+/// needs. Introduced so the `message` layer depends only on this spec, not on the whole
+/// `OtelConfig`: [`OtelConfig::signal_factory_spec`] performs every config-level decision (encoding
+/// choice, cardinality resolution, profile-weight parsing) once, and the factory just wires up
+/// generators from it.
+#[derive(Debug, Clone)]
+pub struct SignalFactorySpec {
+    /// Configured signals, in request order; drives which generators are built and their output order.
+    pub signals: Vec<Signal>,
+    /// `generator.source` stamped on every signal, so a correlated log and trace agree on it.
+    pub source: String,
+    /// Whether the protobuf encoders are selected (gRPC is always protobuf; HTTP honours `use_protobuf`).
+    pub want_protobuf: bool,
+    /// Cardinality policy for log records and the shared resource attributes. `Some` exactly when
+    /// logs are among the signals (cardinality is a logs feature; a correlated trace adopts the
+    /// bucketed resource). Resolved once here instead of twice as it used to be.
+    pub log_cardinality: Option<AttributesCardinalityConfig>,
+    /// Timestamp jitter for the log planner.
+    pub timestamp_jitter: TimestampJitterConfig,
+    /// LLM trace profile spec. `Some` exactly when traces are among the signals.
+    pub llm: Option<LlmProfileSpec>,
+}
+
+/// The LLM span-profile inputs, present exactly when the traces signal is selected. Nested in
+/// [`SignalFactorySpec`] so a logs-only spec carries no trace knobs at all.
+#[derive(Debug, Clone)]
+pub struct LlmProfileSpec {
+    pub max_tool_calls: u32,
+    pub capture_content: bool,
+    pub weights: ProfileWeights,
+    pub budget: Option<SpanBudget>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
-    pub ingest_endpoint: String,
-    pub healthcheck_endpoint: Option<String>,
-    pub use_protobuf: bool,
-    pub transport: String,
+    /// Where this run sends its signals: the gRPC flow (one endpoint), the HTTP flow (one URL per
+    /// signal), or a dry run (nothing). Resolved once at the CLI boundary by
+    /// [`Destination::from_flags`], so no transport-conditional validation exists below this point.
+    pub destination: Destination,
     pub invalid_record_percent: f32,
-    pub records_per_message: usize,
+    /// Number of log records per message (signal=logs), divided evenly across the service shards.
+    pub logs_per_message: usize,
+    /// Number of traces per message (signal=traces), divided evenly across the service shards.
+    /// Independent of `logs_per_message`: a shard's log records are spread over that shard's
+    /// traces, so the two knobs scale each signal's volume separately.
+    pub traces_per_message: usize,
     pub print_logs: bool,
-    pub dry_run: bool,
     pub count: usize,
     pub message_interval_ms: u64,
     pub concurrency: usize,
@@ -174,8 +211,10 @@ pub struct OtelConfig {
     pub record_intra_batch_timestamp_jitter_ns: u64,
     pub record_intra_batch_overlap_probability: f32,
     pub service_shards_per_message: usize,
-    /// Telemetry signal to generate: logs (default) or traces. One signal per run.
-    pub signal: Signal,
+    /// Telemetry signals to generate, in request order (e.g. `[Logs, Traces]`). Non-empty and
+    /// duplicate-free (enforced by [`Self::validate`]). One message per signal is produced per
+    /// generation cycle.
+    pub signals: Vec<Signal>,
     /// Maximum number of `execute_tool` spans in an LLM trace (signal=traces).
     pub llm_max_tool_calls: u32,
     /// Capture prompt/completion content into span attributes (PII risk; signal=traces).
@@ -198,25 +237,90 @@ pub struct OtelConfig {
 }
 
 impl OtelConfig {
+    /// Whether `signal` is one of the configured signals.
+    pub fn has_signal(&self, signal: Signal) -> bool {
+        self.signals.contains(&signal)
+    }
+
+    /// Whether this run generates without sending. Derived from [`Self::destination`] so the run
+    /// mode has exactly one source of truth.
+    pub fn is_dry_run(&self) -> bool {
+        self.destination.is_dry_run()
+    }
+
+    /// Upper bound on the number of service shards one message may be split into.
+    ///
+    /// A shard carries at least one unit of every configured signal — one log record for logs, one
+    /// trace for traces — so the count is capped by the smallest per-message budget among them. A
+    /// logs-only run is bounded by `logs_per_message` alone, a traces-only run by
+    /// `traces_per_message` alone, and a `logs,traces` run by the smaller of the two. Never `0`.
+    pub fn service_shard_limit(&self) -> usize {
+        let mut limit = usize::MAX;
+        if self.has_signal(Signal::Logs) {
+            limit = limit.min(self.logs_per_message);
+        }
+        if self.has_signal(Signal::Traces) {
+            limit = limit.min(self.traces_per_message);
+        }
+        limit.max(1)
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn validate(&self) -> Result<()> {
+        if self.signals.is_empty() {
+            return Err(GeneratorError::InvalidConfiguration(
+                "at least one signal must be selected (--signals logs,traces)".to_string(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        for signal in &self.signals {
+            if !seen.insert(*signal) {
+                return Err(GeneratorError::InvalidConfiguration(format!(
+                    "duplicate signal '{}' in --signals",
+                    signal.as_str()
+                )));
+            }
+        }
+
+        // `signals` and `destination` are resolved together at the CLI boundary, but both are
+        // public fields of this struct, so nothing keeps a caller from assembling a pair that does
+        // not agree. Catch it here: without this, the run starts, the banner has no URL to print
+        // for the uncovered signal, and every one of its requests fails in the transport instead.
+        if let Destination::Http { endpoints, .. } = &self.destination {
+            for signal in &self.signals {
+                if !endpoints.contains_key(signal) {
+                    return Err(GeneratorError::InvalidConfiguration(format!(
+                        "no HTTP endpoint resolved for signal '{}'",
+                        signal.as_str()
+                    )));
+                }
+            }
+        }
+
         if self.invalid_record_percent < 0.0 || self.invalid_record_percent > 100.0 {
             return Err(GeneratorError::InvalidConfiguration(
                 "invalid_record_percent must be between 0 and 100".to_string(),
             ));
         }
 
-        // Invalid-record generation is implemented for logs only; the trace factory always builds
-        // valid messages. Fail loud instead of silently ignoring an explicitly requested percentage.
-        if self.signal == Signal::Traces && self.invalid_record_percent > 0.0 {
+        // Invalid-record generation is implemented for logs only, and an invalid log may omit
+        // `resourceLogs` entirely, so it cannot be correlated. Allow it exclusively for a run whose
+        // signals are exactly `[logs]`.
+        if self.invalid_record_percent > 0.0 && self.signals != [Signal::Logs] {
             return Err(GeneratorError::InvalidConfiguration(
-                "invalid_record_percent is not supported for signal=traces (must be 0)".to_string(),
+                "invalid_record_percent > 0 is only supported for signals=[logs]".to_string(),
             ));
         }
 
-        if self.records_per_message < 1 {
+        if self.logs_per_message < 1 {
             return Err(GeneratorError::InvalidConfiguration(
-                "records_per_message must be >= 1".to_string(),
+                "logs_per_message must be >= 1".to_string(),
+            ));
+        }
+
+        if self.traces_per_message < 1 {
+            return Err(GeneratorError::InvalidConfiguration(
+                "traces_per_message must be >= 1".to_string(),
             ));
         }
 
@@ -224,21 +328,6 @@ impl OtelConfig {
             return Err(GeneratorError::InvalidConfiguration(
                 "concurrency must be >= 1".to_string(),
             ));
-        }
-
-        if !self.dry_run {
-            if self.ingest_endpoint.trim().is_empty() {
-                return Err(GeneratorError::InvalidConfiguration(
-                    "ingest_endpoint must not be empty (unless --dry-run)".to_string(),
-                ));
-            }
-
-            if self.transport != "http" && self.transport != "grpc" {
-                return Err(GeneratorError::InvalidTransport(format!(
-                    "Invalid transport '{}', must be 'http' or 'grpc'",
-                    self.transport
-                )));
-            }
         }
 
         if self.retry_max_retries > MAX_RETRIES_UPPER_BOUND {
@@ -278,7 +367,7 @@ impl OtelConfig {
         // OtelGenerator::with_transport), including on the dry-run path. Run the full domain
         // validation here so a malformed trace-only setting fails fast on a traces run and never
         // blocks a logs-only run.
-        if self.signal == Signal::Traces {
+        if self.has_signal(Signal::Traces) {
             ProfileWeights::from_pairs(&parse_profile_weights(&self.llm_profile_weights)?)?;
 
             let (mn, mx) = (self.trace_min_spans, self.trace_max_spans);
@@ -304,7 +393,7 @@ impl OtelConfig {
 
         // Auth headers are built only on the live send path, after the dry-run early return, so
         // skip parsing them on a dry-run that will never send a request.
-        if !self.dry_run {
+        if !self.is_dry_run() {
             self.auth_headers()?;
         }
 
@@ -330,7 +419,7 @@ impl OtelConfig {
         // When service_shards_per_message > service_count_per_tenant, service names are picked with
         // replacement from the pool, producing duplicate names across shards. This is intentional:
         // it simulates multiple pods running the same service. No error is raised; select_service_shards
-        // normalises the count to min(requested, records_per_message) >= 1.
+        // normalises the count to min(requested, logs_per_message) >= 1.
         if self.service_shards_per_message < 1 {
             return Err(GeneratorError::InvalidConfiguration(
                 "service_shards_per_message must be >= 1".to_string(),
@@ -363,8 +452,48 @@ impl OtelConfig {
         )
     }
 
-    /// The per-trace span-count budget, or `None` when disabled (both bounds zero). Consumed by
-    /// the traces branch of `OtelGenerator::with_transport`; ignored for logs.
+    /// Resolve and validate the [`SignalFactorySpec`] for this run: the encoding choice, the
+    /// per-signal cardinality and LLM-profile inputs, all computed once. Keeps the `message` layer
+    /// off the full `OtelConfig`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates cardinality and profile-weight parsing/validation, which
+    /// [`Self::validate`] already ran, so a valid config never fails here.
+    #[allow(clippy::result_large_err)]
+    pub fn signal_factory_spec(&self) -> Result<SignalFactorySpec> {
+        let log_cardinality = if self.has_signal(Signal::Logs) {
+            Some(self.label_cardinality_config()?)
+        } else {
+            None
+        };
+
+        let llm = if self.has_signal(Signal::Traces) {
+            Some(LlmProfileSpec {
+                max_tool_calls: self.llm_max_tool_calls,
+                capture_content: self.llm_capture_content,
+                weights: ProfileWeights::from_pairs(&parse_profile_weights(
+                    &self.llm_profile_weights,
+                )?)?,
+                budget: self.span_budget(),
+            })
+        } else {
+            None
+        };
+
+        Ok(SignalFactorySpec {
+            signals: self.signals.clone(),
+            // One `generator.source` for every signal so a correlated log and trace agree on it.
+            source: "rust-generator".to_string(),
+            want_protobuf: self.destination.want_protobuf(),
+            log_cardinality,
+            timestamp_jitter: self.timestamp_jitter_config(),
+            llm,
+        })
+    }
+
+    /// The per-trace span-count budget, or `None` when disabled (both bounds zero). Consumed by the
+    /// traces branch of [`crate::message::factory::SignalFactory::from_spec`]; ignored for logs.
     pub fn span_budget(&self) -> Option<SpanBudget> {
         if self.trace_min_spans == 0 && self.trace_max_spans == 0 {
             None
@@ -388,16 +517,159 @@ impl OtelConfig {
         )
     }
 
+    /// Build the startup banner as ordered `label -> value` rows. Pure (no I/O): the actual
+    /// printing is [`crate::report::report_startup_summary`]'s job, which is what makes the banner
+    /// testable. The row set adapts to the configured signals, transport, and tenant pools.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::retry_config`] validation so a bad retry setting fails at startup.
     #[allow(clippy::result_large_err)]
-    pub fn label_cardinality_config(&self) -> Result<LabelCardinalityConfig> {
+    pub fn startup_summary(&self) -> Result<Vec<(String, String)>> {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut push = |label: &str, value: String| rows.push((label.to_string(), value));
+
+        let signals_str = self
+            .signals
+            .iter()
+            .map(Signal::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        push("Signals", signals_str);
+
+        match &self.destination {
+            // The flow is still reported: it decides the encoding of the printed payload, so a
+            // gRPC preview and a JSON HTTP preview are different output from the same run.
+            Destination::DryRun { flow, protobuf } => {
+                push(
+                    "Dry-run",
+                    format!(
+                        "no network transport, stdout only (would use {}, protobuf={})",
+                        flow.as_str(),
+                        protobuf
+                    ),
+                );
+            }
+            Destination::Grpc { endpoint } => {
+                push("Transport", "grpc".to_string());
+                push("Endpoint", endpoint.clone());
+                push("Use Protobuf", "true (gRPC wire format)".to_string());
+            }
+            Destination::Http {
+                endpoints,
+                protobuf,
+            } => {
+                push("Transport", "http".to_string());
+                // Rows follow the configured signal order, not the map's iteration order.
+                // [`Self::validate`] has already proven every configured signal has a URL here.
+                for signal in &self.signals {
+                    if let Some(endpoint) = endpoints.get(signal) {
+                        push(&format!("Endpoint ({})", signal.as_str()), endpoint.clone());
+                    }
+                }
+                push("Use Protobuf", protobuf.to_string());
+            }
+        }
+
+        if self.has_signal(Signal::Logs) {
+            push("Log records per message", self.logs_per_message.to_string());
+        }
+        if self.has_signal(Signal::Traces) {
+            push("Traces per message", self.traces_per_message.to_string());
+        }
+
+        let effective_shards = self
+            .service_shards_per_message
+            .min(self.service_shard_limit())
+            .max(1);
+        push(
+            "Services per message",
+            format!(
+                "{} (effective: {})",
+                self.service_shards_per_message, effective_shards
+            ),
+        );
+        push("Invalid record %", self.invalid_record_percent.to_string());
+        push("Concurrency", self.concurrency.to_string());
+
+        let tenant_routing = if self.tenant_count == 0 {
+            "no tenant header".to_string()
+        } else if self.tenant_count == 1 {
+            format!("single tenant '{}'", self.tenant_id)
+        } else {
+            format!(
+                "{} tenants, random tenant1..tenant{}",
+                self.tenant_count, self.tenant_count
+            )
+        };
+        push("Tenant routing", tenant_routing);
+
+        let cloud_pool_str = if self.cloud_account_count_per_tenant == 0 {
+            "omitted".to_string()
+        } else {
+            self.cloud_account_count_per_tenant.to_string()
+        };
+        let service_pool_str = if self.service_count_per_tenant == 0 {
+            "omitted".to_string()
+        } else {
+            self.service_count_per_tenant.to_string()
+        };
+        let tenant_pools = if self.tenant_count == 0 {
+            format!(
+                "{} cloud accounts, {} services (tenantless)",
+                cloud_pool_str, service_pool_str
+            )
+        } else {
+            format!(
+                "{} cloud accounts/tenant, {} services/tenant",
+                cloud_pool_str, service_pool_str
+            )
+        };
+        push("Tenant profile pools", tenant_pools);
+
+        let retry_config = self.retry_config()?;
+        push(
+            "Retry",
+            format!(
+                "max_retries={}, base_delay={}ms, max_delay={}ms",
+                retry_config.max_retries, retry_config.base_delay_ms, retry_config.max_delay_ms
+            ),
+        );
+
+        // Cardinality bounds log record attributes and the shard's shared resource attributes. When
+        // logs and traces run together, the trace adopts the same bucketed resource; a traces-only
+        // run does not normalize anything. Report that honestly per signal.
+        if self.has_signal(Signal::Logs) {
+            push(
+                "Label cardinality limiting (logs)",
+                self.label_cardinality_enabled.to_string(),
+            );
+        }
+        if self.has_signal(Signal::Traces) {
+            let value = if self.has_signal(Signal::Logs) {
+                format!(
+                    "shared resource attributes only ({})",
+                    self.label_cardinality_enabled
+                )
+            } else {
+                "n/a".to_string()
+            };
+            push("Label cardinality limiting (traces)", value);
+        }
+
+        Ok(rows)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn label_cardinality_config(&self) -> Result<AttributesCardinalityConfig> {
         let mut limits = default_cardinality_limits();
         let custom_limits = parse_cardinality_limits(&self.label_cardinality_limits)?;
         limits.extend(custom_limits);
 
-        Ok(LabelCardinalityConfig {
+        Ok(AttributesCardinalityConfig {
             enabled: self.label_cardinality_enabled,
             default_limit: self.label_cardinality_default_limit,
-            limits,
+            limit_by_attr: limits,
         })
     }
 }
@@ -523,59 +795,119 @@ pub fn parse_profile_weights(raw: &str) -> Result<HashMap<String, u32>> {
     Ok(parsed)
 }
 
-#[derive(Debug, Clone)]
-pub struct BatchResult {
+/// `total`/`success`/`failed` counters for one level of the statistics (generation cycles or a
+/// single signal).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignalCounters {
+    /// Number of units recorded at this level (generation cycles, or requests for one signal).
     pub total: usize,
+    /// Subset of `total` that succeeded.
     pub success: usize,
+    /// Subset of `total` that failed; `success + failed == total`.
     pub failed: usize,
 }
 
-impl BatchResult {
-    pub fn new() -> Self {
-        Self {
-            total: 0,
-            success: 0,
-            failed: 0,
+impl SignalCounters {
+    fn record(&mut self, success: bool) {
+        self.total += 1;
+        if success {
+            self.success += 1;
+        } else {
+            self.failed += 1;
         }
     }
 
-    pub fn add_success(&mut self) {
-        self.total += 1;
-        self.success += 1;
-    }
-
-    pub fn add_failure(&mut self) {
-        self.total += 1;
-        self.failed += 1;
-    }
-
-    pub fn merge(&mut self, other: Self) {
+    fn merge(&mut self, other: &Self) {
         self.total += other.total;
         self.success += other.success;
         self.failed += other.failed;
     }
 }
 
-impl Default for BatchResult {
-    fn default() -> Self {
-        Self::new()
+/// Statistics for a run. A generation cycle emits one signal message per configured signal, so the
+/// two levels are tracked separately: `cycles` counts generation cycles (a cycle succeeds only when
+/// every signal message of that cycle succeeds), while `per_signal` keeps an independent
+/// `total/success/failed` for each signal's network requests.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationStats {
+    /// Generation-cycle counters. A cycle is counted successful only when every signal message of
+    /// that cycle was delivered.
+    pub cycles: SignalCounters,
+    /// Per-signal network-request counters, keyed by [`Signal`]; each tracks that signal's own
+    /// `total/success/failed` independently of the others.
+    pub per_signal: BTreeMap<Signal, SignalCounters>,
+}
+
+impl GenerationStats {
+    /// Create an empty statistics accumulator (all counters zero, no signals recorded yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the outcome of one signal message (one network request).
+    pub fn record_signal(&mut self, signal: Signal, success: bool) {
+        self.per_signal.entry(signal).or_default().record(success);
+    }
+
+    /// Record the completion of one generation cycle. `all_success` must be `true` only when every
+    /// signal message of the cycle succeeded.
+    pub fn record_cycle(&mut self, all_success: bool) {
+        self.cycles.record(all_success);
+    }
+
+    /// Fold another [`GenerationStats`] into this one, summing the cycle counters and each signal's
+    /// counters (matched by [`Signal`]). Used to combine per-worker results into a run total.
+    pub fn merge(&mut self, other: Self) {
+        self.cycles.merge(&other.cycles);
+        for (signal, counters) in other.per_signal {
+            self.per_signal.entry(signal).or_default().merge(&counters);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TransportFlow;
+
+    fn http_logs_destination(protobuf: bool) -> Destination {
+        Destination::Http {
+            endpoints: HashMap::from([(Signal::Logs, "http://localhost:4318/v1/logs".to_string())]),
+            protobuf,
+        }
+    }
+
+    fn http_traces_destination() -> Destination {
+        Destination::Http {
+            endpoints: HashMap::from([(
+                Signal::Traces,
+                "http://localhost:4318/v1/traces".to_string(),
+            )]),
+            protobuf: false,
+        }
+    }
+
+    /// The HTTP flow carrying both signals, each on its own URL.
+    fn http_logs_and_traces_destination() -> Destination {
+        Destination::Http {
+            endpoints: HashMap::from([
+                (Signal::Logs, "http://localhost:4318/v1/logs".to_string()),
+                (
+                    Signal::Traces,
+                    "http://localhost:4318/v1/traces".to_string(),
+                ),
+            ]),
+            protobuf: false,
+        }
+    }
 
     fn base_config() -> OtelConfig {
         OtelConfig {
-            ingest_endpoint: "http://localhost:4318/v1/logs".to_string(),
-            healthcheck_endpoint: None,
-            use_protobuf: false,
-            transport: "http".to_string(),
+            destination: http_logs_destination(false),
             invalid_record_percent: 0.0,
-            records_per_message: 1,
+            logs_per_message: 1,
+            traces_per_message: 1,
             print_logs: false,
-            dry_run: false,
             count: 1,
             message_interval_ms: 0,
             concurrency: 1,
@@ -594,7 +926,7 @@ mod tests {
             record_intra_batch_timestamp_jitter_ns: 5,
             record_intra_batch_overlap_probability: 0.05,
             service_shards_per_message: 1,
-            signal: Signal::Logs,
+            signals: vec![Signal::Logs],
             llm_max_tool_calls: 3,
             llm_capture_content: true,
             llm_profile_weights: "simple_chat:1,tool_loop:3,plan_execute_reflect:2,rag:1"
@@ -608,17 +940,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_missing_endpoint_with_dry_run() {
-        let mut cfg = base_config();
-        cfg.ingest_endpoint = String::new();
-        cfg.dry_run = true;
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
     fn validate_rejects_invalid_record_percent_for_traces() {
         let mut cfg = base_config();
-        cfg.signal = Signal::Traces;
+        cfg.signals = vec![Signal::Traces];
+        cfg.destination = http_traces_destination();
         cfg.invalid_record_percent = 50.0;
         assert!(matches!(
             cfg.validate(),
@@ -627,9 +952,74 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_empty_signals() {
+        let mut cfg = base_config();
+        cfg.signals = vec![];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_signals() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Logs];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_record_for_multi_signal() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = http_logs_and_traces_destination();
+        cfg.invalid_record_percent = 10.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_invalid_record_for_logs_only() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs];
+        cfg.invalid_record_percent = 10.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn generation_stats_track_cycles_and_signals_independently() {
+        let mut stats = GenerationStats::new();
+        // Cycle 1: both signals succeed.
+        stats.record_signal(Signal::Logs, true);
+        stats.record_signal(Signal::Traces, true);
+        stats.record_cycle(true);
+        // Cycle 2: logs succeed, traces fail -> failed cycle, but logs stays successful.
+        stats.record_signal(Signal::Logs, true);
+        stats.record_signal(Signal::Traces, false);
+        stats.record_cycle(false);
+
+        assert_eq!(stats.cycles.total, 2);
+        assert_eq!(stats.cycles.success, 1);
+        assert_eq!(stats.cycles.failed, 1);
+        assert_eq!(
+            stats.per_signal[&Signal::Logs],
+            SignalCounters {
+                total: 2,
+                success: 2,
+                failed: 0
+            }
+        );
+        assert_eq!(
+            stats.per_signal[&Signal::Traces],
+            SignalCounters {
+                total: 2,
+                success: 1,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
     fn validate_allows_zero_invalid_record_percent_for_traces() {
         let mut cfg = base_config();
-        cfg.signal = Signal::Traces;
+        cfg.signals = vec![Signal::Traces];
+        cfg.destination = http_traces_destination();
         cfg.invalid_record_percent = 0.0;
         assert!(cfg.validate().is_ok());
     }
@@ -654,7 +1044,8 @@ mod tests {
     #[test]
     fn validate_rejects_half_set_budget() {
         let mut c = base_config();
-        c.signal = Signal::Traces;
+        c.signals = vec![Signal::Traces];
+        c.destination = http_traces_destination();
         c.trace_min_spans = 5;
         c.trace_max_spans = 0;
         assert!(c.validate().is_err());
@@ -663,7 +1054,8 @@ mod tests {
     #[test]
     fn validate_rejects_max_below_min() {
         let mut c = base_config();
-        c.signal = Signal::Traces;
+        c.signals = vec![Signal::Traces];
+        c.destination = http_traces_destination();
         c.trace_min_spans = 10;
         c.trace_max_spans = 5;
         assert!(c.validate().is_err());
@@ -672,7 +1064,8 @@ mod tests {
     #[test]
     fn validate_rejects_budget_over_cap() {
         let mut c = base_config();
-        c.signal = Signal::Traces;
+        c.signals = vec![Signal::Traces];
+        c.destination = http_traces_destination();
         c.trace_min_spans = 1;
         c.trace_max_spans = TRACE_SPAN_BUDGET_MAX + 1;
         assert!(c.validate().is_err());
@@ -681,7 +1074,8 @@ mod tests {
     #[test]
     fn validate_accepts_valid_budget() {
         let mut c = base_config();
-        c.signal = Signal::Traces;
+        c.signals = vec![Signal::Traces];
+        c.destination = http_traces_destination();
         c.trace_min_spans = 5;
         c.trace_max_spans = 40;
         assert!(c.validate().is_ok());
@@ -691,7 +1085,7 @@ mod tests {
     fn validate_ignores_budget_for_logs() {
         // Budget is a traces-only knob; a half-set budget must not fail a logs run.
         let mut c = base_config();
-        c.signal = Signal::Logs;
+        c.signals = vec![Signal::Logs];
         c.trace_min_spans = 5;
         c.trace_max_spans = 0;
         assert!(c.validate().is_ok());
@@ -847,8 +1241,36 @@ mod tests {
     }
 
     #[test]
+    fn test_traces_per_message_must_be_at_least_one() {
+        let mut cfg = base_config();
+        cfg.traces_per_message = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn test_service_shard_limit_uses_only_configured_signals() {
+        // Logs-only: the traces budget must not cap the shard count, and vice versa; a run with
+        // both signals is bounded by the smaller of the two.
+        let mut cfg = base_config();
+        cfg.logs_per_message = 10;
+        cfg.traces_per_message = 3;
+
+        cfg.signals = vec![Signal::Logs];
+        assert_eq!(cfg.service_shard_limit(), 10);
+
+        cfg.signals = vec![Signal::Traces];
+        assert_eq!(cfg.service_shard_limit(), 3);
+
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        assert_eq!(cfg.service_shard_limit(), 3);
+    }
+
+    #[test]
     fn test_service_shards_per_message_has_no_upper_bound() {
-        // No upper bound is intentional: select_service_shards clamps to records_per_message at
+        // No upper bound is intentional: select_service_shards clamps to the per-signal budgets at
         // runtime, and large values simulate "every record is its own pod". This test pins down
         // the missing upper-bound contract so a future regression that adds one fails loudly.
         let mut cfg = base_config();
@@ -860,6 +1282,200 @@ mod tests {
     fn test_service_shards_per_message_accepts_typical_value() {
         let mut cfg = base_config();
         cfg.service_shards_per_message = 4;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Row lookups against the ordered `label -> value` startup summary.
+    fn summary_has_label(rows: &[(String, String)], label: &str) -> bool {
+        rows.iter().any(|(l, _)| l == label)
+    }
+
+    fn summary_value<'a>(rows: &'a [(String, String)], label: &str) -> Option<&'a str> {
+        rows.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn startup_summary_logs_only_omits_traces_per_message() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs];
+        let rows = cfg.startup_summary().unwrap();
+        assert!(summary_has_label(&rows, "Log records per message"));
+        assert!(!summary_has_label(&rows, "Traces per message"));
+        // Cardinality is a logs feature; the traces row must not appear for a logs-only run.
+        assert!(summary_has_label(
+            &rows,
+            "Label cardinality limiting (logs)"
+        ));
+        assert!(!summary_has_label(
+            &rows,
+            "Label cardinality limiting (traces)"
+        ));
+    }
+
+    #[test]
+    fn startup_summary_traces_only_omits_log_records_per_message() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Traces];
+        cfg.destination = http_traces_destination();
+        let rows = cfg.startup_summary().unwrap();
+        assert!(summary_has_label(&rows, "Traces per message"));
+        assert!(!summary_has_label(&rows, "Log records per message"));
+        // Traces-only normalizes nothing, so the traces cardinality row reports n/a.
+        assert_eq!(
+            summary_value(&rows, "Label cardinality limiting (traces)"),
+            Some("n/a")
+        );
+    }
+
+    #[test]
+    fn startup_summary_reports_one_endpoint_row_per_signal_for_the_http_flow() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = http_logs_and_traces_destination();
+        let rows = cfg.startup_summary().unwrap();
+        assert_eq!(summary_value(&rows, "Transport"), Some("http"));
+        assert_eq!(
+            summary_value(&rows, "Endpoint (logs)"),
+            Some("http://localhost:4318/v1/logs")
+        );
+        assert_eq!(
+            summary_value(&rows, "Endpoint (traces)"),
+            Some("http://localhost:4318/v1/traces")
+        );
+        // http keeps per-signal endpoints, so the single-endpoint grpc row is absent.
+        assert!(!summary_has_label(&rows, "Endpoint"));
+    }
+
+    #[test]
+    fn startup_summary_reports_a_single_endpoint_row_for_the_grpc_flow() {
+        let mut cfg = base_config();
+        cfg.destination = Destination::Grpc {
+            endpoint: "http://localhost:4317".to_string(),
+        };
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        let rows = cfg.startup_summary().unwrap();
+        assert_eq!(summary_value(&rows, "Transport"), Some("grpc"));
+        assert_eq!(
+            summary_value(&rows, "Endpoint"),
+            Some("http://localhost:4317")
+        );
+        assert!(!summary_has_label(&rows, "Endpoint (logs)"));
+        assert!(!summary_has_label(&rows, "Endpoint (traces)"));
+    }
+
+    #[test]
+    fn signal_factory_spec_logs_only_has_cardinality_and_no_llm() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs];
+        let spec = cfg.signal_factory_spec().unwrap();
+        assert_eq!(spec.signals, vec![Signal::Logs]);
+        assert!(spec.log_cardinality.is_some());
+        assert!(spec.llm.is_none());
+    }
+
+    #[test]
+    fn signal_factory_spec_traces_only_has_llm_and_no_cardinality() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Traces];
+        cfg.trace_min_spans = 5;
+        cfg.trace_max_spans = 10;
+        let spec = cfg.signal_factory_spec().unwrap();
+        assert!(spec.log_cardinality.is_none());
+        let llm = spec.llm.expect("traces spec carries an llm profile");
+        assert_eq!(llm.budget.map(|b| (b.min, b.max)), Some((5, 10)));
+    }
+
+    #[test]
+    fn signal_factory_spec_both_signals_carry_both_inputs() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = http_logs_and_traces_destination();
+        let spec = cfg.signal_factory_spec().unwrap();
+        assert!(spec.log_cardinality.is_some());
+        assert!(spec.llm.is_some());
+    }
+
+    #[test]
+    fn signal_factory_spec_wants_protobuf_for_grpc_regardless_of_flag() {
+        // The gRPC flow has no protobuf flag to unset: its wire format is protobuf either way.
+        let mut cfg = base_config();
+        cfg.destination = Destination::Grpc {
+            endpoint: "http://localhost:4317".to_string(),
+        };
+        assert!(cfg.signal_factory_spec().unwrap().want_protobuf);
+    }
+
+    #[test]
+    fn dry_run_config_reports_no_transport_and_is_dry_run() {
+        let mut cfg = base_config();
+        cfg.destination = Destination::DryRun {
+            flow: TransportFlow::Http,
+            protobuf: false,
+        };
+
+        assert!(cfg.is_dry_run());
+        assert!(cfg.validate().is_ok());
+        let rows = cfg.startup_summary().unwrap();
+        assert!(summary_has_label(&rows, "Dry-run"));
+        assert!(!summary_has_label(&rows, "Transport"));
+        assert!(!summary_has_label(&rows, "Use Protobuf"));
+    }
+
+    /// A gRPC dry run and an HTTP dry run print different payloads, so the banner must say which
+    /// one is being previewed instead of the single opaque "dry-run" line it used to print.
+    #[test]
+    fn dry_run_banner_names_the_previewed_flow_and_encoding() {
+        let mut cfg = base_config();
+        cfg.destination = Destination::DryRun {
+            flow: TransportFlow::Grpc,
+            protobuf: true,
+        };
+        let grpc_row = cfg.startup_summary().unwrap();
+        let grpc_row = summary_value(&grpc_row, "Dry-run").expect("the dry-run row is present");
+        assert!(grpc_row.contains("grpc"), "got: {grpc_row}");
+        assert!(grpc_row.contains("protobuf=true"), "got: {grpc_row}");
+
+        cfg.destination = Destination::DryRun {
+            flow: TransportFlow::Http,
+            protobuf: false,
+        };
+        let http_row = cfg.startup_summary().unwrap();
+        let http_row = summary_value(&http_row, "Dry-run").expect("the dry-run row is present");
+        assert!(http_row.contains("http"), "got: {http_row}");
+        assert!(http_row.contains("protobuf=false"), "got: {http_row}");
+    }
+
+    /// The two fields are resolved together at the CLI boundary but are both public, so an
+    /// assembled-by-hand config can disagree; the run must fail at startup rather than per request.
+    #[test]
+    fn validate_rejects_http_destination_missing_a_selected_signal() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = http_logs_destination(false);
+        assert!(matches!(
+            cfg.validate(),
+            Err(GeneratorError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_http_destination_covering_every_signal() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = http_logs_and_traces_destination();
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// The gRPC flow carries every signal over one channel, so signal coverage is not its concern.
+    #[test]
+    fn validate_accepts_grpc_destination_for_every_signal() {
+        let mut cfg = base_config();
+        cfg.signals = vec![Signal::Logs, Signal::Traces];
+        cfg.destination = Destination::Grpc {
+            endpoint: "http://localhost:4317".to_string(),
+        };
         assert!(cfg.validate().is_ok());
     }
 }

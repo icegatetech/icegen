@@ -13,9 +13,6 @@ pub enum GeneratorError {
     #[error("Connection error: {0}")]
     ConnectionError(String),
 
-    #[error("Health check failed with status {0}")]
-    HealthCheckFailed(u16),
-
     #[error("gRPC error: {0}")]
     GrpcError(#[from] tonic::Status),
 
