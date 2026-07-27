@@ -146,7 +146,7 @@ impl Default for TimestampJitterConfig {
     }
 }
 
-/// The resolved, validated subset of [`OtelConfig`] a [`crate::message::factory::SignalFactory`]
+/// The resolved, validated subset of [`OtelConfig`] the crate-internal `SignalFactory`
 /// needs. Introduced so the `message` layer depends only on this spec, not on the whole
 /// `OtelConfig`: [`OtelConfig::signal_factory_spec`] performs every config-level decision (encoding
 /// choice, cardinality resolution, profile-weight parsing) once, and the factory just wires up
@@ -418,8 +418,10 @@ impl OtelConfig {
 
         // When service_shards_per_message > service_count_per_tenant, service names are picked with
         // replacement from the pool, producing duplicate names across shards. This is intentional:
-        // it simulates multiple pods running the same service. No error is raised; select_service_shards
-        // normalises the count to min(requested, logs_per_message) >= 1.
+        // it simulates multiple pods running the same service. No error is raised;
+        // select_service_shards normalises the count to min(requested, service_shard_limit()) >= 1,
+        // where the limit is the smallest per-message budget among the configured signals
+        // (traces_per_message for a traces-only run, or the smaller of the two when both run).
         if self.service_shards_per_message < 1 {
             return Err(GeneratorError::InvalidConfiguration(
                 "service_shards_per_message must be >= 1".to_string(),
@@ -493,7 +495,7 @@ impl OtelConfig {
     }
 
     /// The per-trace span-count budget, or `None` when disabled (both bounds zero). Consumed by the
-    /// traces branch of [`crate::message::factory::SignalFactory::from_spec`]; ignored for logs.
+    /// traces branch of the crate-internal `SignalFactory::from_spec`; ignored for logs.
     pub fn span_budget(&self) -> Option<SpanBudget> {
         if self.trace_min_spans == 0 && self.trace_max_spans == 0 {
             None

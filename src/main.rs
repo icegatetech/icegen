@@ -12,10 +12,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_output();
-
-    // Load environment variables from .env file if present
+    // Load environment variables from .env file first, so a `RUST_LOG` defined there is honoured by
+    // the diagnostics subscriber installed in `init_output`.
     dotenvy::dotenv().ok();
+
+    init_output();
 
     // A retired variable left in the shell or in `.env` would be ignored by clap and silently
     // change the run, so reject it before anything reads the configuration.

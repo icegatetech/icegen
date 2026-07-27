@@ -332,10 +332,10 @@ mod tests {
             );
         }
         // Identity keys keep their own single bucketing pass, not a second one over a bucket label.
-        assert_eq!(
-            map.get("service.name").map(String::as_str),
-            Some(normalize_by_cardinality(&cfg, "service.name", "svc-a").as_str())
-        );
+        // The expected value is the literal one FNV-1a pass over "svc-a" yields at limit=2; a second
+        // pass over that label would land in "bucket_1", so this literal fails on double
+        // normalization instead of being computed by the algorithm under test.
+        assert_eq!(map.get("service.name").map(String::as_str), Some("bucket_0"));
     }
 
     #[test]

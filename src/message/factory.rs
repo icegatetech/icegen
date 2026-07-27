@@ -705,7 +705,6 @@ mod tests {
 
     /// Cardinality config that buckets the identity keys, so a regression that normalized only the
     /// log path (and left traces raw) would make logs and traces disagree.
-    #[cfg(test)]
     fn bucketing_cardinality() -> crate::config::AttributesCardinalityConfig {
         use std::collections::HashMap;
         crate::config::AttributesCardinalityConfig {

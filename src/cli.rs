@@ -408,6 +408,7 @@ mod tests {
     fn clear_destination_env() -> Vec<EnvGuard> {
         [
             "OTEL_TRANSPORT",
+            "OTEL_SIGNALS",
             "OTEL_GRPC_ENDPOINT",
             "OTEL_HTTP_LOGS_ENDPOINT",
             "OTEL_HTTP_TRACES_ENDPOINT",
@@ -697,15 +698,20 @@ mod tests {
     #[test]
     fn cli_reads_signals_from_env() {
         let _lock = env_lock();
+        // Clear the destination env first (it now includes OTEL_SIGNALS), then set OTEL_SIGNALS on
+        // top so the value under test survives the parse; parse directly rather than through
+        // `parse_otel_args_under_env_lock`, whose own clear would otherwise wipe it mid-parse.
+        let _destination_env = clear_destination_env();
         let _guard = EnvGuard::set("OTEL_SIGNALS", "logs,traces");
-        let args = parse_otel_args_under_env_lock([
+        let GeneratorType::Otel(args) = Cli::parse_from([
             "otel-log-generator",
             "otel",
             "--http-logs-endpoint",
             "http://localhost:4318/v1/logs",
             "--http-traces-endpoint",
             "http://localhost:4318/v1/traces",
-        ]);
+        ])
+        .generator;
         let config = config_from(args);
         assert_eq!(config.signals, vec![Signal::Logs, Signal::Traces]);
     }

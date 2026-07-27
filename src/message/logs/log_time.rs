@@ -115,6 +115,12 @@ pub(crate) fn distribute_records_across_spans(
     num_records: usize,
     rng: &mut impl Rng,
 ) -> Vec<usize> {
+    // The non-empty invariant is enforced upstream in `OTLPLogMessageGenerator::plan`, but this is
+    // a `pub(crate)` helper: guard the divisor so a future caller gets an empty result, not a
+    // divide-by-zero panic.
+    if anchors.is_empty() {
+        return Vec::new();
+    }
     let mut counts = vec![num_records / anchors.len(); anchors.len()];
     let remainder = num_records % anchors.len();
     if remainder == 0 {
@@ -176,6 +182,11 @@ pub(crate) fn plan_correlated_slots(
     num_records: usize,
     rng: &mut impl Rng,
 ) -> Vec<RecordSlot> {
+    // As in `distribute_records_across_spans`, guard the divisor: the upstream planner rejects an
+    // empty correlation set, but this crate-internal helper must not panic if a caller passes one.
+    if correlations.is_empty() {
+        return Vec::new();
+    }
     let base = num_records / correlations.len();
     let remainder = num_records % correlations.len();
     let mut slots: Vec<RecordSlot> = Vec::with_capacity(num_records);

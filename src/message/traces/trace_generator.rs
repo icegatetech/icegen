@@ -44,7 +44,7 @@ impl TraceMessageGenerator {
     /// One request = `shard.num_traces` traces per service shard.
     ///
     /// Self-samples `project_id` and `now_ns`; used by the logs-agnostic (traces-only) callers and
-    /// unit tests. The multi-signal factory instead calls the crate-internal `plan_traces` with a
+    /// unit tests. The multi-signal factory instead calls the crate-internal [`Self::plan`] with a
     /// shared `project_id`/`now_ns` so logs and traces of one generation cycle agree on identity
     /// and time.
     ///

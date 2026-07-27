@@ -623,6 +623,10 @@ async fn logs_and_traces_reach_their_own_http_endpoints_in_one_cycle() {
         !logs_request.contains("\"resourceSpans\""),
         "traces payload leaked into the logs endpoint"
     );
+    assert!(
+        !traces_request.contains("\"resourceLogs\""),
+        "logs payload leaked into the traces endpoint"
+    );
     for request in [&logs_request, &traces_request] {
         assert!(
             request

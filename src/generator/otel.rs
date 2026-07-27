@@ -187,9 +187,14 @@ impl RunMetrics {
     }
 
     /// Return a [`ProgressSnapshot`] when this `processed` count crosses a reporting step (every 10
-    /// cycles), or `None` otherwise. The CAS on `last_reported_step` dedups concurrent callers so
+    /// cycles), or `None` otherwise. Advancing `last_reported_step` dedups concurrent callers so
     /// exactly one worker produces the snapshot for a given step — that is concurrency control, not
     /// output, so it stays here; formatting the snapshot is [`crate::report`]'s job.
+    ///
+    /// `processed` values arrive out of order across workers (each is a distinct `fetch_add`
+    /// result), so the advance is a `fetch_max`-style CAS loop rather than an exact `step - 1`
+    /// swap: a worker that races ahead to a higher step still reports it, instead of the strict
+    /// predecessor check dropping that tick and wedging every later one.
     // `is_multiple_of` was stabilised in Rust 1.87; use `%` to stay within the declared MSRV.
     #[allow(clippy::manual_is_multiple_of)]
     fn progress_snapshot_if_due(&self, processed: usize) -> Option<ProgressSnapshot> {
@@ -198,12 +203,20 @@ impl RunMetrics {
         }
 
         let step = processed / 10;
-        if self
-            .last_reported_step
-            .compare_exchange(step - 1, step, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return None;
+        let mut last = self.last_reported_step.load(Ordering::SeqCst);
+        loop {
+            if step <= last {
+                return None;
+            }
+            match self.last_reported_step.compare_exchange_weak(
+                last,
+                step,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => last = actual,
+            }
         }
 
         let total_elapsed_secs = self.started_at.elapsed().as_secs_f64().max(f64::EPSILON);
@@ -480,6 +493,20 @@ impl OtelGenerator {
                         break;
                     }
 
+                    // Back off before retrying: a persistent deterministic failure (planning or
+                    // encoding) would otherwise bypass the success-path pacing below and spin the
+                    // worker at full CPU. Honour the configured interval, with a floor so a zero
+                    // interval still throttles the error loop.
+                    let backoff = Duration::from_millis(message_interval_ms.max(100));
+                    tokio::select! {
+                        _ = sleep(backoff) => {}
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_ok() && *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+
                     continue;
                 }
             };
@@ -624,7 +651,11 @@ impl SignalGenerator for OtelGenerator {
         let should_be_invalid = rng.gen::<f32>() * 100.0 < self.config.invalid_record_percent;
         // Shared identity/time for every signal of this cycle, drawn once so logs and traces agree.
         let project_id = FakeDataGenerator::generate_project_id();
-        let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let now_ns = Utc::now().timestamp_nanos_opt().ok_or_else(|| {
+            crate::error::GeneratorError::InvalidConfiguration(
+                "current time is outside the representable nanosecond range".to_string(),
+            )
+        })?;
 
         self.factory.build(&GenContext {
             tenant_id,

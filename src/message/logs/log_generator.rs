@@ -70,7 +70,7 @@ impl OTLPLogMessageGenerator {
     /// # Errors
     ///
     /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty, any shard has
-    /// `num_records == 0`, `resource_attrs.len() != shards.len()`, or `correlations` is `Some` with
+    /// `num_logs == 0`, `resource_attrs.len() != shards.len()`, or `correlations` is `Some` with
     /// a length other than `shards.len()`, holding a shard without traces, or a correlation without
     /// spans.
     #[allow(clippy::result_large_err)]
@@ -89,7 +89,7 @@ impl OTLPLogMessageGenerator {
         }
         if let Some(i) = shards.iter().position(|s| s.num_logs == 0) {
             return Err(GeneratorError::InvalidConfiguration(format!(
-                "shard at index {i} has num_records=0; every shard must have num_records >= 1"
+                "shard at index {i} has num_logs=0; every shard must have num_logs >= 1"
             )));
         }
         if resource_attrs.len() != shards.len() {

@@ -53,37 +53,25 @@ pub(crate) fn report_progress(snapshot: &ProgressSnapshot) {
 }
 
 fn format_progress(s: &ProgressSnapshot) -> String {
-    match s.total_target {
-        Some(total_target) => format!(
-            "Progress: {}/{} generation cycles processed; requests sent: {}; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms, max: {:.2} ms; timeouts: {}; retries total: {}; retries/cycle: {:.3}",
-            s.processed,
-            total_target,
-            s.sent,
-            s.total_sent_mib,
-            s.avg_speed_mib_s,
-            s.current_speed_mib_s,
-            s.avg_rps,
-            s.avg_response_time_ms,
-            s.max_response_time_ms,
-            s.total_timeouts,
-            s.total_retries,
-            s.retries_per_cycle
-        ),
-        None => format!(
-            "Progress: {} generation cycles processed; requests sent: {}; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms, max: {:.2} ms; timeouts: {}; retries total: {}; retries/cycle: {:.3}",
-            s.processed,
-            s.sent,
-            s.total_sent_mib,
-            s.avg_speed_mib_s,
-            s.current_speed_mib_s,
-            s.avg_rps,
-            s.avg_response_time_ms,
-            s.max_response_time_ms,
-            s.total_timeouts,
-            s.total_retries,
-            s.retries_per_cycle
-        ),
-    }
+    // Only the cycle counter differs between a bounded (batch) and unbounded (continuous) run; the
+    // remaining fields are identical, so keep one format string and vary just the counter.
+    let cycles = match s.total_target {
+        Some(total_target) => format!("{}/{}", s.processed, total_target),
+        None => s.processed.to_string(),
+    };
+    format!(
+        "Progress: {cycles} generation cycles processed; requests sent: {}; payload sent: {:.4} MiB; throughput: avg {:.4} MiB/s, current {:.4} MiB/s; avg rps: {:.2}; avg response time: {:.2} ms, max: {:.2} ms; timeouts: {}; retries total: {}; retries/cycle: {:.3}",
+        s.sent,
+        s.total_sent_mib,
+        s.avg_speed_mib_s,
+        s.current_speed_mib_s,
+        s.avg_rps,
+        s.avg_response_time_ms,
+        s.max_response_time_ms,
+        s.total_timeouts,
+        s.total_retries,
+        s.retries_per_cycle
+    )
 }
 
 /// Emit the run summary: generation cycles plus a per-signal request breakdown, in the order the
