@@ -1,6 +1,6 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
-use crate::message::{MessagePayload, OTLPMessage};
+use crate::message::{MessagePayload, OTLPMessage, Signal};
 use crate::pb::opentelemetry::proto::collector::logs::v1::logs_service_client::LogsServiceClient;
 use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
 use crate::pb::opentelemetry::proto::collector::trace::v1::trace_service_client::TraceServiceClient;
@@ -76,32 +76,76 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
     Ok(channel)
 }
 
-/// gRPC transport for the logs signal.
-pub struct LogGrpcTransport {
-    client: LogsServiceClient<Channel>,
+/// Extract the per-message tenant into gRPC `x-scope-orgid` metadata, if present.
+#[allow(clippy::result_large_err)]
+fn tenant_metadata(
+    message: &OTLPMessage,
+) -> Result<Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>> {
+    message
+        .tenant_id
+        .as_deref()
+        .map(|tid| {
+            tonic::metadata::MetadataValue::try_from(tid).map_err(|_| {
+                GeneratorError::InvalidConfiguration(format!(
+                    "invalid tenant_id for gRPC metadata: {}",
+                    tid
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Unified gRPC transport. A single `Channel` carries both OTLP services; the logs and/or traces
+/// client is created depending on the configured signals, and [`Transport::send`] routes by
+/// `message.signal`. Retries of the two clients are independent.
+pub struct GrpcTransport {
+    logs_client: Option<LogsServiceClient<Channel>>,
+    trace_client: Option<TraceServiceClient<Channel>>,
     retry_config: RetryConfig,
     auth_meta: AuthMetadata,
 }
 
-impl LogGrpcTransport {
+impl GrpcTransport {
+    /// Connect one channel to `endpoint` and instantiate the OTLP service clients required by
+    /// `signals` on top of it.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` — gRPC target URL shared by both OTLP services.
+    /// * `signals` — signals to serve; a client is created only for [`Signal::Logs`] and/or
+    ///   [`Signal::Traces`] present here.
+    /// * `retry_config` — backoff/retry policy applied per send.
+    /// * `auth` — vendor auth headers compiled into gRPC metadata attached to every request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeneratorError::InvalidConfiguration`] if an auth header is not valid gRPC
+    /// metadata, or a connection error if the channel to `endpoint` cannot be established.
     pub async fn new(
         endpoint: String,
+        signals: &[Signal],
         retry_config: RetryConfig,
         auth: AuthHeaders,
     ) -> Result<Self> {
         let auth_meta = compile_grpc_auth_metadata(&auth)?;
         let channel = connect_channel(&endpoint).await?;
-        let client = LogsServiceClient::new(channel);
+        let logs_client = signals
+            .contains(&Signal::Logs)
+            .then(|| LogsServiceClient::new(channel.clone()));
+        let trace_client = signals
+            .contains(&Signal::Traces)
+            .then(|| TraceServiceClient::new(channel.clone()));
 
         Ok(Self {
-            client,
+            logs_client,
+            trace_client,
             retry_config,
             auth_meta,
         })
     }
 
     #[allow(clippy::result_large_err)]
-    fn prepare_export_parts(
+    fn prepare_log_export_parts(
         message: &OTLPMessage,
     ) -> Result<(
         ExportLogsServiceRequest,
@@ -115,24 +159,10 @@ impl LogGrpcTransport {
                 ));
             }
         };
-
-        let tenant = message
-            .tenant_id
-            .as_deref()
-            .map(|tid| {
-                tonic::metadata::MetadataValue::try_from(tid).map_err(|_| {
-                    GeneratorError::InvalidConfiguration(format!(
-                        "invalid tenant_id for gRPC metadata: {}",
-                        tid
-                    ))
-                })
-            })
-            .transpose()?;
-
-        Ok((proto_request, tenant))
+        Ok((proto_request, tenant_metadata(message)?))
     }
 
-    fn build_export_request(
+    fn build_log_export_request(
         proto_request: ExportLogsServiceRequest,
         tenant: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
         auth_meta: &AuthMetadata,
@@ -144,60 +174,9 @@ impl LogGrpcTransport {
         insert_auth_metadata(&mut request, auth_meta);
         request
     }
-}
-
-#[async_trait]
-impl Transport for LogGrpcTransport {
-    async fn send(
-        &self,
-        message: &OTLPMessage,
-        shutdown_rx: &watch::Receiver<bool>,
-    ) -> SendOutcome {
-        let (proto_request, tenant) = match Self::prepare_export_parts(message) {
-            Ok(parts) => parts,
-            Err(e) => {
-                return SendOutcome::Failure {
-                    retries: 0,
-                    error: e,
-                }
-            }
-        };
-        let client = self.client.clone();
-        let auth_meta = &self.auth_meta;
-        run_with_retry(&self.retry_config, shutdown_rx, || {
-            let mut client = client.clone();
-            let request =
-                Self::build_export_request(proto_request.clone(), tenant.clone(), auth_meta);
-            async move { client.export(request).await.map(|_| ()) }
-        })
-        .await
-    }
-}
-
-/// gRPC transport for the traces signal.
-pub struct TraceGrpcTransport {
-    client: TraceServiceClient<Channel>,
-    retry_config: RetryConfig,
-    auth_meta: AuthMetadata,
-}
-
-impl TraceGrpcTransport {
-    pub async fn new(
-        endpoint: String,
-        retry_config: RetryConfig,
-        auth: AuthHeaders,
-    ) -> Result<Self> {
-        let auth_meta = compile_grpc_auth_metadata(&auth)?;
-        let channel = connect_channel(&endpoint).await?;
-        Ok(Self {
-            client: TraceServiceClient::new(channel),
-            retry_config,
-            auth_meta,
-        })
-    }
 
     #[allow(clippy::result_large_err)]
-    fn prepare_export_parts(
+    fn prepare_trace_export_parts(
         message: &OTLPMessage,
     ) -> Result<(
         ExportTraceServiceRequest,
@@ -211,24 +190,10 @@ impl TraceGrpcTransport {
                 ));
             }
         };
-
-        let tenant = message
-            .tenant_id
-            .as_deref()
-            .map(|tid| {
-                tonic::metadata::MetadataValue::try_from(tid).map_err(|_| {
-                    GeneratorError::InvalidConfiguration(format!(
-                        "invalid tenant_id for gRPC metadata: {}",
-                        tid
-                    ))
-                })
-            })
-            .transpose()?;
-
-        Ok((proto_request, tenant))
+        Ok((proto_request, tenant_metadata(message)?))
     }
 
-    fn build_export_request(
+    fn build_trace_export_request(
         proto_request: ExportTraceServiceRequest,
         tenant: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
         auth_meta: &AuthMetadata,
@@ -240,16 +205,21 @@ impl TraceGrpcTransport {
         insert_auth_metadata(&mut request, auth_meta);
         request
     }
-}
 
-#[async_trait]
-impl Transport for TraceGrpcTransport {
-    async fn send(
+    async fn send_logs(
         &self,
         message: &OTLPMessage,
         shutdown_rx: &watch::Receiver<bool>,
     ) -> SendOutcome {
-        let (proto_request, tenant) = match Self::prepare_export_parts(message) {
+        let Some(client) = self.logs_client.as_ref() else {
+            return SendOutcome::Failure {
+                retries: 0,
+                error: GeneratorError::InvalidConfiguration(
+                    "gRPC logs client not configured for this run".to_string(),
+                ),
+            };
+        };
+        let (proto_request, tenant) = match Self::prepare_log_export_parts(message) {
             Ok(parts) => parts,
             Err(e) => {
                 return SendOutcome::Failure {
@@ -258,15 +228,79 @@ impl Transport for TraceGrpcTransport {
                 }
             }
         };
-        let client = self.client.clone();
         let auth_meta = &self.auth_meta;
         run_with_retry(&self.retry_config, shutdown_rx, || {
             let mut client = client.clone();
             let request =
-                Self::build_export_request(proto_request.clone(), tenant.clone(), auth_meta);
+                Self::build_log_export_request(proto_request.clone(), tenant.clone(), auth_meta);
             async move { client.export(request).await.map(|_| ()) }
         })
         .await
+    }
+
+    async fn send_traces(
+        &self,
+        message: &OTLPMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> SendOutcome {
+        let Some(client) = self.trace_client.as_ref() else {
+            return SendOutcome::Failure {
+                retries: 0,
+                error: GeneratorError::InvalidConfiguration(
+                    "gRPC traces client not configured for this run".to_string(),
+                ),
+            };
+        };
+        let (proto_request, tenant) = match Self::prepare_trace_export_parts(message) {
+            Ok(parts) => parts,
+            Err(e) => {
+                return SendOutcome::Failure {
+                    retries: 0,
+                    error: e,
+                }
+            }
+        };
+        let auth_meta = &self.auth_meta;
+        run_with_retry(&self.retry_config, shutdown_rx, || {
+            let mut client = client.clone();
+            let request =
+                Self::build_trace_export_request(proto_request.clone(), tenant.clone(), auth_meta);
+            async move { client.export(request).await.map(|_| ()) }
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl Transport for GrpcTransport {
+    async fn send(
+        &self,
+        message: &OTLPMessage,
+        shutdown_rx: &watch::Receiver<bool>,
+    ) -> SendOutcome {
+        match message.signal {
+            Signal::Logs => self.send_logs(message, shutdown_rx).await,
+            Signal::Traces => self.send_traces(message, shutdown_rx).await,
+        }
+    }
+}
+
+/// OTLP server stubs generated into `OUT_DIR` by `build.rs`, used to stand up a real collector for
+/// the transport contract test. The message types come from [`crate::pb`]; only the service
+/// scaffolding lives here, and only in test builds.
+#[cfg(test)]
+mod pb_server {
+    pub mod logs {
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/opentelemetry.proto.collector.logs.v1.rs"
+        ));
+    }
+    pub mod trace {
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/opentelemetry.proto.collector.trace.v1.rs"
+        ));
     }
 }
 
@@ -297,18 +331,18 @@ mod tests {
     #[test]
     fn grpc_metadata_uses_message_tenant_id() {
         let (proto_request, tenant) =
-            LogGrpcTransport::prepare_export_parts(&protobuf_message(Some("tenant2"))).unwrap();
+            GrpcTransport::prepare_log_export_parts(&protobuf_message(Some("tenant2"))).unwrap();
         let request =
-            LogGrpcTransport::build_export_request(proto_request, tenant, &AuthMetadata::new());
+            GrpcTransport::build_log_export_request(proto_request, tenant, &AuthMetadata::new());
         assert_eq!(request.metadata().get("x-scope-orgid").unwrap(), "tenant2");
     }
 
     #[test]
     fn grpc_omits_scope_metadata_when_tenant_id_none() {
         let (proto_request, tenant) =
-            LogGrpcTransport::prepare_export_parts(&protobuf_message(None)).unwrap();
+            GrpcTransport::prepare_log_export_parts(&protobuf_message(None)).unwrap();
         let request =
-            LogGrpcTransport::build_export_request(proto_request, tenant, &AuthMetadata::new());
+            GrpcTransport::build_log_export_request(proto_request, tenant, &AuthMetadata::new());
         assert!(request.metadata().get("x-scope-orgid").is_none());
     }
 
@@ -323,23 +357,23 @@ mod tests {
             OTLPMessageType::Valid,
         );
 
-        let error =
-            LogGrpcTransport::prepare_export_parts(&message).expect_err("expected invalid payload");
+        let error = GrpcTransport::prepare_log_export_parts(&message)
+            .expect_err("expected invalid payload");
         assert!(matches!(error, GeneratorError::InvalidMessageType(_)));
     }
 
     #[test]
     fn grpc_prepared_parts_can_build_multiple_requests_without_redecode() {
         let message = protobuf_message(Some("tenant2"));
-        let (proto_request, tenant) = LogGrpcTransport::prepare_export_parts(&message).unwrap();
+        let (proto_request, tenant) = GrpcTransport::prepare_log_export_parts(&message).unwrap();
 
-        let request1 = LogGrpcTransport::build_export_request(
+        let request1 = GrpcTransport::build_log_export_request(
             proto_request.clone(),
             tenant.clone(),
             &AuthMetadata::new(),
         );
         let request2 =
-            LogGrpcTransport::build_export_request(proto_request, tenant, &AuthMetadata::new());
+            GrpcTransport::build_log_export_request(proto_request, tenant, &AuthMetadata::new());
 
         assert_eq!(request1.metadata().get("x-scope-orgid").unwrap(), "tenant2");
         assert_eq!(request2.metadata().get("x-scope-orgid").unwrap(), "tenant2");
@@ -369,19 +403,19 @@ mod tests {
     #[test]
     fn trace_grpc_metadata_uses_message_tenant_id() {
         let (proto_request, tenant) =
-            TraceGrpcTransport::prepare_export_parts(&trace_protobuf_message(Some("tenant2")))
+            GrpcTransport::prepare_trace_export_parts(&trace_protobuf_message(Some("tenant2")))
                 .unwrap();
         let request =
-            TraceGrpcTransport::build_export_request(proto_request, tenant, &AuthMetadata::new());
+            GrpcTransport::build_trace_export_request(proto_request, tenant, &AuthMetadata::new());
         assert_eq!(request.metadata().get("x-scope-orgid").unwrap(), "tenant2");
     }
 
     #[test]
     fn trace_grpc_omits_scope_metadata_when_tenant_id_none() {
         let (proto_request, tenant) =
-            TraceGrpcTransport::prepare_export_parts(&trace_protobuf_message(None)).unwrap();
+            GrpcTransport::prepare_trace_export_parts(&trace_protobuf_message(None)).unwrap();
         let request =
-            TraceGrpcTransport::build_export_request(proto_request, tenant, &AuthMetadata::new());
+            GrpcTransport::build_trace_export_request(proto_request, tenant, &AuthMetadata::new());
         assert!(request.metadata().get("x-scope-orgid").is_none());
     }
 
@@ -396,7 +430,7 @@ mod tests {
             OTLPMessageType::Valid,
         );
 
-        let error = TraceGrpcTransport::prepare_export_parts(&message)
+        let error = GrpcTransport::prepare_trace_export_parts(&message)
             .expect_err("expected invalid payload");
         assert!(matches!(error, GeneratorError::InvalidMessageType(_)));
     }
@@ -406,8 +440,8 @@ mod tests {
         let auth = AuthHeaders::build("x-api-key=secret", Some("xyz"), None).unwrap();
         let auth_meta = compile_grpc_auth_metadata(&auth).unwrap();
         let (proto_request, tenant) =
-            LogGrpcTransport::prepare_export_parts(&protobuf_message(Some("tenant2"))).unwrap();
-        let request = LogGrpcTransport::build_export_request(proto_request, tenant, &auth_meta);
+            GrpcTransport::prepare_log_export_parts(&protobuf_message(Some("tenant2"))).unwrap();
+        let request = GrpcTransport::build_log_export_request(proto_request, tenant, &auth_meta);
 
         assert_eq!(request.metadata().get("x-api-key").unwrap(), "secret");
         assert_eq!(
@@ -432,5 +466,206 @@ mod tests {
         let auth = AuthHeaders::build("bad key=value", None, None).unwrap();
         let error = compile_grpc_auth_metadata(&auth).expect_err("invalid key must fail");
         assert!(matches!(error, GeneratorError::InvalidConfiguration(_)));
+    }
+
+    /// The OTLP service a request landed on, plus the tenant metadata it carried.
+    type ExportCall = (&'static str, Option<String>);
+
+    /// A real OTLP collector serving both services on one port, recording which service each
+    /// export reached.
+    #[derive(Clone)]
+    struct RecordingCollector {
+        calls: tokio::sync::mpsc::UnboundedSender<ExportCall>,
+    }
+
+    impl RecordingCollector {
+        fn record<T>(&self, service: &'static str, request: &tonic::Request<T>) {
+            let tenant = request
+                .metadata()
+                .get("x-scope-orgid")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string);
+            self.calls.send((service, tenant)).expect("record export");
+        }
+    }
+
+    #[async_trait]
+    impl pb_server::logs::logs_service_server::LogsService for RecordingCollector {
+        async fn export(
+            &self,
+            request: tonic::Request<ExportLogsServiceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<
+                crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceResponse,
+            >,
+            tonic::Status,
+        > {
+            self.record("logs", &request);
+            Ok(tonic::Response::new(Default::default()))
+        }
+    }
+
+    #[async_trait]
+    impl pb_server::trace::trace_service_server::TraceService for RecordingCollector {
+        async fn export(
+            &self,
+            request: tonic::Request<ExportTraceServiceRequest>,
+        ) -> std::result::Result<
+            tonic::Response<
+                crate::pb::opentelemetry::proto::collector::trace::v1::ExportTraceServiceResponse,
+            >,
+            tonic::Status,
+        > {
+            self.record("traces", &request);
+            Ok(tonic::Response::new(Default::default()))
+        }
+    }
+
+    /// A running [`RecordingCollector`] on an ephemeral port, owning its server task and aborting it
+    /// on drop so a failing or panicking test cannot leak it.
+    struct CollectorHarness {
+        endpoint: String,
+        calls: tokio::sync::mpsc::UnboundedReceiver<ExportCall>,
+        server: tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
+    }
+
+    impl CollectorHarness {
+        async fn start() -> Self {
+            use pb_server::logs::logs_service_server::LogsServiceServer;
+            use pb_server::trace::trace_service_server::TraceServiceServer;
+            use tonic::transport::server::TcpIncoming;
+
+            let (calls_tx, calls_rx) = tokio::sync::mpsc::unbounded_channel();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // The listener is already bound, so the endpoint is reachable before the first send.
+            let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+            let collector = RecordingCollector { calls: calls_tx };
+            let server = tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(LogsServiceServer::new(collector.clone()))
+                    .add_service(TraceServiceServer::new(collector))
+                    .serve_with_incoming(incoming),
+            );
+
+            Self {
+                endpoint: format!("http://{addr}"),
+                calls: calls_rx,
+                server,
+            }
+        }
+
+        /// Next export the collector received, bounded so a lost request fails instead of hanging.
+        async fn next_call(&mut self) -> ExportCall {
+            tokio::time::timeout(Duration::from_secs(5), self.calls.recv())
+                .await
+                .expect("collector received an export")
+                .expect("collector channel open")
+        }
+
+        fn received_nothing(&mut self) -> bool {
+            matches!(
+                self.calls.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            )
+        }
+    }
+
+    impl Drop for CollectorHarness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// `Transport::send` must reach the OTLP service that matches the message's signal, on the real
+    /// gRPC boundary: building a `tonic::Request` proves nothing about which method is invoked.
+    #[tokio::test]
+    async fn send_routes_each_signal_to_its_own_otlp_service() {
+        let mut collector = CollectorHarness::start().await;
+
+        let transport = GrpcTransport::new(
+            collector.endpoint.clone(),
+            &[Signal::Logs, Signal::Traces],
+            RetryConfig::new(0, 100, 100).unwrap(),
+            AuthHeaders::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let traces_outcome = transport
+            .send(&trace_protobuf_message(Some("tenant2")), &shutdown_rx)
+            .await;
+        assert!(matches!(traces_outcome, SendOutcome::Success { .. }));
+        let logs_outcome = transport
+            .send(&protobuf_message(Some("tenant2")), &shutdown_rx)
+            .await;
+        assert!(matches!(logs_outcome, SendOutcome::Success { .. }));
+
+        // Order is the send order, not the signal order: a misrouted traces message would surface
+        // here as ("logs", _) first.
+        let first = collector.next_call().await;
+        let second = collector.next_call().await;
+        assert_eq!(first, ("traces", Some("tenant2".to_string())));
+        assert_eq!(second, ("logs", Some("tenant2".to_string())));
+    }
+
+    #[tokio::test]
+    async fn send_fails_when_traces_client_not_configured() {
+        // A traces message on a logs-only run must fail explicitly instead of being misrouted to
+        // the logs service; the guard fires before any network call, so nothing reaches the
+        // collector even though the channel is connected.
+        let mut collector = CollectorHarness::start().await;
+        let transport = GrpcTransport::new(
+            collector.endpoint.clone(),
+            &[Signal::Logs],
+            RetryConfig::new(0, 100, 100).unwrap(),
+            AuthHeaders::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = transport
+            .send(&trace_protobuf_message(Some("tenant2")), &shutdown_rx)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failure {
+                error: GeneratorError::InvalidConfiguration(_),
+                ..
+            }
+        ));
+        assert!(collector.received_nothing());
+    }
+
+    #[tokio::test]
+    async fn send_fails_when_logs_client_not_configured() {
+        // Symmetric guard: a logs message on a traces-only run must fail rather than reach the
+        // trace service.
+        let mut collector = CollectorHarness::start().await;
+        let transport = GrpcTransport::new(
+            collector.endpoint.clone(),
+            &[Signal::Traces],
+            RetryConfig::new(0, 100, 100).unwrap(),
+            AuthHeaders::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = transport
+            .send(&protobuf_message(Some("tenant2")), &shutdown_rx)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failure {
+                error: GeneratorError::InvalidConfiguration(_),
+                ..
+            }
+        ));
+        assert!(collector.received_nothing());
     }
 }

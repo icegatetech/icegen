@@ -1,29 +1,25 @@
-use crate::config::{LabelCardinalityConfig, TimestampJitterConfig};
+use crate::config::{AttributesCardinalityConfig, TimestampJitterConfig};
 use crate::error::{GeneratorError, Result};
-use crate::message::encoder::OtlpEncoder;
 use crate::message::fake_data::FakeDataGenerator;
-use crate::message::plan::{PlannedRecord, PlannedRequest, PlannedShard};
-use crate::message::resource_attrs::DEFAULT_SERVICE_NAME;
-use crate::message::types::{MessagePayload, OTLPMessage, OTLPMessageType, Signal};
+use crate::message::logs::log_attrs;
+use crate::message::logs::log_encoder::LogEncoder;
+use crate::message::logs::log_plan::{PlannedRecord, PlannedRequest, PlannedShard};
+use crate::message::logs::log_time::{self, RecordSlot};
+use crate::message::resource_attrs::{ShardResourceAttrs, DEFAULT_SERVICE_NAME};
+use crate::message::traces::TraceCorrelation;
+use crate::message::types::{MessagePayload, OTLPMessage, OTLPMessageType, ServiceShard, Signal};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::json;
 use std::sync::Arc;
 
-/// One shard of a multi-service OTLP request, mapping to a single `ResourceLogs` entry.
-#[derive(Debug, Clone)]
-pub struct ServiceShard {
-    pub service_name: Option<String>,
-    pub num_records: usize,
-}
-
 #[derive(Clone)]
 pub struct OTLPLogMessageGenerator {
     source: String,
-    label_cardinality: LabelCardinalityConfig,
+    attr_cardinality: AttributesCardinalityConfig,
     jitter: TimestampJitterConfig,
-    encoder: Arc<dyn OtlpEncoder>,
+    encoder: Arc<dyn LogEncoder>,
 }
 
 impl OTLPLogMessageGenerator {
@@ -35,231 +31,21 @@ impl OTLPLogMessageGenerator {
     /// the emitted timestamp for a record is moved backwards relative to the previous record.
     ///
     /// The `encoder` is chosen once at construction time and determines the wire format of every
-    /// [`Self::generate_message`] call. Use [`crate::message::JsonEncoder`] for HTTP JSON
-    /// transport and [`crate::message::ProtobufEncoder`] for HTTP Protobuf or gRPC transport.
+    /// [`Self::generate_message`] call. Use [`crate::message::logs::LogJsonEncoder`] for HTTP JSON
+    /// transport and [`crate::message::logs::LogProtobufEncoder`] for HTTP Protobuf or gRPC
+    /// transport.
     pub fn new(
         source: String,
-        label_cardinality: LabelCardinalityConfig,
+        attr_cardinality: AttributesCardinalityConfig,
         jitter: TimestampJitterConfig,
-        encoder: Arc<dyn OtlpEncoder>,
+        encoder: Arc<dyn LogEncoder>,
     ) -> Self {
         Self {
             source,
-            label_cardinality,
+            attr_cardinality,
             jitter,
             encoder,
         }
-    }
-
-    fn generate_resource_attributes_pairs(
-        &self,
-        project_id: &str,
-        cloud_account_id: Option<&str>,
-        service_name: Option<&str>,
-    ) -> Vec<(String, String)> {
-        let pairs = crate::message::resource_attrs::build_resource_attribute_pairs(
-            project_id,
-            cloud_account_id,
-            service_name,
-            &self.source,
-        );
-        self.normalize_attribute_pairs(pairs)
-    }
-
-    fn generate_scope_attributes_pairs(&self, service_name: Option<&str>) -> Vec<(String, String)> {
-        let mut rng = rand::thread_rng();
-        let mut attrs = Vec::new();
-        if let Some(svc) = service_name {
-            attrs.push(("library.name".to_string(), format!("trihub-{}", svc)));
-        }
-        attrs.push((
-            "library.version".to_string(),
-            format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10)),
-        ));
-        attrs
-    }
-
-    fn generate_log_attributes_pairs(
-        &self,
-        request_id: &str,
-        thread_id: &str,
-    ) -> Vec<(String, String)> {
-        let mut rng = rand::thread_rng();
-        let mut log_attributes = Vec::new();
-
-        if rng.gen::<f32>() > 0.5 {
-            log_attributes.push((
-                "http.method".to_string(),
-                FakeDataGenerator::generate_http_method(),
-            ));
-        }
-
-        if rng.gen::<f32>() > 0.6 {
-            log_attributes.push((
-                "http.status_code".to_string(),
-                FakeDataGenerator::generate_http_status_code().to_string(),
-            ));
-        }
-
-        if rng.gen::<f32>() > 0.7 {
-            log_attributes.push(("user.id".to_string(), FakeDataGenerator::generate_uuid()));
-        }
-
-        log_attributes.push(("request.id".to_string(), request_id.to_string()));
-        log_attributes.push(("thread.id".to_string(), thread_id.to_string()));
-
-        self.normalize_attribute_pairs(log_attributes)
-    }
-
-    fn normalize_attribute_pairs(&self, pairs: Vec<(String, String)>) -> Vec<(String, String)> {
-        pairs
-            .into_iter()
-            .map(|(key, value)| {
-                let normalized = self.normalize_by_cardinality(&key, &value);
-                (key, normalized)
-            })
-            .collect()
-    }
-
-    fn normalize_by_cardinality(&self, key: &str, value: &str) -> String {
-        if !self.label_cardinality.enabled {
-            return value.to_string();
-        }
-
-        let Some(limit) = self.label_cardinality.limit_for(key) else {
-            return value.to_string();
-        };
-
-        if limit <= 1 {
-            return "bucket_00".to_string();
-        }
-
-        let index = stable_bucket_index(key, value, limit);
-        let width = num_digits(limit.saturating_sub(1));
-        format!("bucket_{index:0width$}")
-    }
-
-    fn generate_log_body(severity_text: &str, service_name: Option<&str>) -> String {
-        let mut rng = rand::thread_rng();
-
-        let bodies = match severity_text {
-            "INFO" => vec![
-                format!(
-                    "Request processed successfully in {}ms",
-                    rng.gen_range(10..500)
-                ),
-                format!(
-                    "User {} authenticated successfully",
-                    FakeDataGenerator::generate_uuid()
-                ),
-                format!(
-                    "Database connection established to {}",
-                    FakeDataGenerator::generate_host_name()
-                ),
-                format!(
-                    "Cache hit for key {}",
-                    &FakeDataGenerator::generate_uuid()[..8]
-                ),
-                format!(
-                    "Health check passed for service {}",
-                    service_name.unwrap_or(DEFAULT_SERVICE_NAME)
-                ),
-            ],
-            "WARN" => vec![
-                format!("High memory usage detected: {}%", rng.gen_range(70..96)),
-                format!("Slow query detected: {}ms", rng.gen_range(1000..5000)),
-                format!(
-                    "Connection pool near capacity: {}/100",
-                    rng.gen_range(80..100)
-                ),
-                format!(
-                    "Rate limit approaching for user {}",
-                    FakeDataGenerator::generate_uuid()
-                ),
-                format!(
-                    "Deprecated API endpoint accessed: /api/v1/{}",
-                    FakeDataGenerator::generate_sentence()
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("endpoint")
-                ),
-            ],
-            "ERROR" => vec![
-                format!(
-                    "Database connection failed: {}",
-                    FakeDataGenerator::generate_sentence()
-                ),
-                format!(
-                    "Failed to process request: {}",
-                    FakeDataGenerator::generate_sentence()
-                ),
-                format!(
-                    "Authentication failed for user {}",
-                    FakeDataGenerator::generate_email()
-                ),
-                format!(
-                    "External API call failed: HTTP {}",
-                    [500, 502, 503, 504].choose(&mut rng).unwrap()
-                ),
-                format!(
-                    "Queue processing error: {}",
-                    FakeDataGenerator::generate_sentence()
-                ),
-            ],
-            _ => vec!["Generic log message".to_string()],
-        };
-
-        bodies.choose(&mut rng).unwrap().clone()
-    }
-
-    fn sample_batch_offset_ns(&self) -> i64 {
-        if self.jitter.across_batch_timestamp_jitter_ns > 0 {
-            rand::thread_rng().gen_range(0..self.jitter.across_batch_timestamp_jitter_ns)
-        } else {
-            0
-        }
-    }
-
-    fn plan_timestamps_with_offset(
-        &self,
-        request_now_ns: i64,
-        batch_offset_ns: i64,
-        num_records: usize,
-    ) -> Vec<i64> {
-        if num_records == 0 {
-            return vec![];
-        }
-
-        let mut rng = rand::thread_rng();
-
-        let intra = self.jitter.intra_batch_timestamp_jitter_ns;
-        let overlap_prob = self.jitter.intra_batch_overlap_probability;
-
-        let mut result: Vec<i64> = Vec::with_capacity(num_records);
-        let mut total_span_ns: i64 = 0;
-        for _ in 0..num_records {
-            let step = if intra > 0 {
-                rng.gen_range(0..intra)
-            } else {
-                0
-            };
-            total_span_ns += step;
-            result.push(step);
-        }
-
-        let mut prev_ns = request_now_ns - batch_offset_ns - total_span_ns;
-        for (i, step_slot) in result.iter_mut().enumerate() {
-            let step = *step_slot;
-            let candidate = prev_ns + step;
-            *step_slot = if i > 0 && intra > 0 && rng.gen::<f32>() < overlap_prob {
-                prev_ns - rng.gen_range(0..intra)
-            } else {
-                candidate
-            };
-            prev_ns = candidate;
-        }
-
-        result
     }
 
     fn build_message(
@@ -283,64 +69,132 @@ impl OTLPLogMessageGenerator {
     ///
     /// # Errors
     ///
-    /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty or any shard has
-    /// `num_records == 0`.
+    /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty, any shard has
+    /// `num_logs == 0`, `resource_attrs.len() != shards.len()`, or `correlations` is `Some` with
+    /// a length other than `shards.len()`, holding a shard without traces, or a correlation without
+    /// spans.
     #[allow(clippy::result_large_err)]
-    fn plan_shards(
+    pub(crate) fn plan(
         &self,
-        cloud_account_id: Option<&str>,
         shards: &[ServiceShard],
+        project_id: &str,
+        now_ns: i64,
+        correlations: Option<&[Vec<TraceCorrelation>]>,
+        resource_attrs: &[ShardResourceAttrs],
     ) -> Result<PlannedRequest> {
         if shards.is_empty() {
             return Err(GeneratorError::InvalidConfiguration(
                 "shards must not be empty".to_string(),
             ));
         }
-        if let Some(i) = shards.iter().position(|s| s.num_records == 0) {
+        if let Some(i) = shards.iter().position(|s| s.num_logs == 0) {
             return Err(GeneratorError::InvalidConfiguration(format!(
-                "shard at index {i} has num_records=0; every shard must have num_records >= 1"
+                "shard at index {i} has num_logs=0; every shard must have num_logs >= 1"
             )));
         }
+        if resource_attrs.len() != shards.len() {
+            return Err(GeneratorError::InvalidConfiguration(format!(
+                "shard resource attributes ({}) must match shard count ({})",
+                resource_attrs.len(),
+                shards.len()
+            )));
+        }
+        if let Some(correlations) = correlations {
+            if correlations.len() != shards.len() {
+                return Err(GeneratorError::InvalidConfiguration(format!(
+                    "trace correlations ({}) must match shard count ({})",
+                    correlations.len(),
+                    shards.len()
+                )));
+            }
+            // Records are distributed over a shard's traces and then over their anchors, so an
+            // empty set has nothing to attach to. The trace planner rejects an empty span tree and
+            // plans at least one trace per shard upstream; fail explicitly rather than divide by or
+            // index into nothing.
+            if let Some(i) = correlations.iter().position(|c| c.is_empty()) {
+                return Err(GeneratorError::InvalidConfiguration(format!(
+                    "shard at index {i} has no traces to correlate log records with"
+                )));
+            }
+            if let Some(i) = correlations
+                .iter()
+                .position(|c| c.iter().any(|corr| corr.anchors.is_empty()))
+            {
+                return Err(GeneratorError::InvalidConfiguration(format!(
+                    "shard at index {i} carries a trace without spans to correlate log records with"
+                )));
+            }
+        }
 
-        let project_id = FakeDataGenerator::generate_project_id();
-        let batch_offset_ns = self.sample_batch_offset_ns();
-        // Anchor every shard in this request to the same `now` so the documented
-        // "all shards share one batch window" invariant holds; otherwise each shard
-        // would re-sample `Utc::now()` and drift forward by the time spent planning
-        // the previous shards.
-        let request_now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let batch_offset_ns =
+            log_time::sample_batch_offset_ns(&self.jitter, &mut rand::thread_rng());
 
         let planned_shards: Vec<PlannedShard> = shards
             .iter()
-            .map(|shard| {
+            .enumerate()
+            .map(|(shard_index, shard)| {
                 let mut rng = rand::thread_rng();
                 let svc = shard.service_name.as_deref();
-                let ts_list = self.plan_timestamps_with_offset(
-                    request_now_ns,
-                    batch_offset_ns,
-                    shard.num_records,
-                );
-                let resource_attrs =
-                    self.generate_resource_attributes_pairs(&project_id, cloud_account_id, svc);
-                let scope_attrs = self.generate_scope_attributes_pairs(svc);
+                let shard_correlations = correlations.map(|c| c[shard_index].as_slice());
+                let slots: Vec<RecordSlot> = match shard_correlations {
+                    Some(corrs) => log_time::plan_correlated_slots(
+                        &self.jitter,
+                        corrs,
+                        shard.num_logs,
+                        &mut rng,
+                    ),
+                    // Anchor every uncorrelated shard to the same `now_ns` so the documented
+                    // "all shards share one batch window" invariant holds.
+                    None => log_time::plan_timestamps_with_offset(
+                        &self.jitter,
+                        now_ns,
+                        batch_offset_ns,
+                        shard.num_logs,
+                        &mut rng,
+                    )
+                    .into_iter()
+                    .map(|timestamp_ns| RecordSlot {
+                        timestamp_ns,
+                        trace_id: None,
+                        anchor: None,
+                    })
+                    .collect(),
+                };
+                // The shard's resource attributes are built (and normalized) once per cycle by the
+                // caller, so this signal reports the same pod its correlated trace does.
+                let shard_resource_attrs = resource_attrs[shard_index].pairs().to_vec();
+                let scope_attrs = log_attrs::generate_scope_attributes_pairs(svc);
                 let scope_name_src = svc.unwrap_or(DEFAULT_SERVICE_NAME);
                 let scope_name = format!("io.trihub.{}", scope_name_src.replace('-', "."));
                 let scope_version = format!("1.{}.{}", rng.gen_range(0..10), rng.gen_range(0..10));
                 let resource_dropped_attributes_count = rng.gen_range(0..4);
                 let scope_dropped_attributes_count = rng.gen_range(0..3);
 
-                let records: Vec<PlannedRecord> = ts_list
+                let records: Vec<PlannedRecord> = slots
                     .into_iter()
-                    .map(|timestamp_ns| {
+                    .map(|slot| {
                         let mut rng = rand::thread_rng();
                         let (sev_num, sev_text) = FakeDataGenerator::generate_severity();
-                        let body = Self::generate_log_body(&sev_text, svc);
-                        let trace_id = FakeDataGenerator::generate_trace_id();
-                        let span_id = FakeDataGenerator::generate_span_id();
+                        let body = log_attrs::generate_log_body(&sev_text, svc);
+                        // Correlated records adopt the id of the trace they were split into and the
+                        // id of the span they were planned into; the trace flags are encoded as 0,
+                        // so use 0 here instead of a random log flags byte.
+                        let (trace_id, span_id, flags) = match (slot.trace_id, slot.anchor) {
+                            (Some(trace_id), Some(anchor)) => (trace_id, anchor.span_id, 0),
+                            _ => (
+                                FakeDataGenerator::generate_trace_id(),
+                                FakeDataGenerator::generate_span_id(),
+                                rng.gen_range(0..256),
+                            ),
+                        };
+                        let timestamp_ns = slot.timestamp_ns;
                         let request_id = FakeDataGenerator::generate_uuid();
                         let thread_id = FakeDataGenerator::generate_thread_id();
-                        let attributes =
-                            self.generate_log_attributes_pairs(&request_id, &thread_id);
+                        let attributes = log_attrs::generate_log_attributes_pairs(
+                            &self.attr_cardinality,
+                            &request_id,
+                            &thread_id,
+                        );
                         PlannedRecord {
                             timestamp_ns,
                             severity_number: sev_num as i32,
@@ -348,14 +202,14 @@ impl OTLPLogMessageGenerator {
                             body,
                             trace_id,
                             span_id,
-                            flags: rng.gen_range(0..256),
+                            flags,
                             attributes,
                         }
                     })
                     .collect();
 
                 PlannedShard {
-                    resource_attrs,
+                    resource_attrs: shard_resource_attrs,
                     resource_dropped_attributes_count,
                     scope_name,
                     scope_version,
@@ -367,13 +221,38 @@ impl OTLPLogMessageGenerator {
             .collect();
 
         Ok(PlannedRequest {
-            project_id,
+            project_id: project_id.to_string(),
             shards: planned_shards,
             message_type: OTLPMessageType::Valid,
         })
     }
 
+    /// Encode a planned log request into a wire-format [`OTLPMessage`] tagged [`Signal::Logs`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeneratorError::ProtobufEncodeError`] if the configured encoder fails to serialize
+    /// (only possible with [`crate::message::logs::LogProtobufEncoder`]).
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn encode_message(
+        &self,
+        planned: &PlannedRequest,
+        tenant_id: Option<String>,
+    ) -> Result<OTLPMessage> {
+        let payload = self.encoder.encode(planned)?;
+        Ok(self.build_message(
+            payload,
+            tenant_id,
+            planned.project_id.clone(),
+            OTLPMessageType::Valid,
+        ))
+    }
+
     /// Generate a multi-shard OTLP payload with one `ResourceLogs` entry per shard.
+    ///
+    /// Self-samples `project_id` and `now_ns` and plans without trace correlation; used by the
+    /// logs-only callers and unit tests. The multi-signal factory instead calls the crate-internal
+    /// `plan` (optionally with correlations) followed by `encode_message`.
     ///
     /// The wire format is determined by the encoder provided at construction. All shards share
     /// a single anchor time (`Utc::now()` sampled once per request) and a single
@@ -385,7 +264,7 @@ impl OTLPLogMessageGenerator {
     ///
     /// Returns [`GeneratorError::InvalidConfiguration`] if `shards` is empty.
     /// Returns [`GeneratorError::ProtobufEncodeError`] if the configured encoder fails to
-    /// serialize (only possible with [`crate::message::ProtobufEncoder`]).
+    /// serialize (only possible with [`crate::message::logs::LogProtobufEncoder`]).
     #[allow(clippy::result_large_err)]
     pub fn generate_message(
         &self,
@@ -393,17 +272,22 @@ impl OTLPLogMessageGenerator {
         cloud_account_id: Option<String>,
         shards: Vec<ServiceShard>,
     ) -> Result<OTLPMessage> {
-        let planned = self.plan_shards(cloud_account_id.as_deref(), &shards)?;
-        let payload = self.encoder.encode(&planned)?;
-        Ok(self.build_message(
-            payload,
-            tenant_id,
-            planned.project_id,
-            OTLPMessageType::Valid,
-        ))
+        let project_id = FakeDataGenerator::generate_project_id();
+        let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        // Logs-only path: apply this generator's cardinality to the shard attributes, matching what
+        // the multi-signal factory does when logs are among the signals.
+        let resource_attrs = ShardResourceAttrs::for_shards(
+            &project_id,
+            cloud_account_id.as_deref(),
+            &shards,
+            &self.source,
+            Some(&self.attr_cardinality),
+        );
+        let planned = self.plan(&shards, &project_id, now_ns, None, &resource_attrs)?;
+        self.encode_message(&planned, tenant_id)
     }
 
-    // TODO: align with OtlpEncoder abstraction. Currently hardcoded to emit JSON/malformed-JSON
+    // TODO: align with LogEncoder abstraction. Currently hardcoded to emit JSON/malformed-JSON
     // regardless of the configured encoder. A protobuf-mode invalid-message variant (malformed
     // protobuf, truncated message, invalid field tags) should live as a separate encoder-specific
     // "invalid" path once we decide the contract with the receiver tests.
@@ -481,47 +365,12 @@ impl OTLPLogMessageGenerator {
     }
 }
 
-fn stable_bucket_index(key: &str, value: &str, limit: usize) -> usize {
-    if limit == 0 {
-        return 0;
-    }
-
-    // FNV-1a 64-bit for deterministic, stable bucket assignment across runs.
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET_BASIS;
-    for byte in key
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0xff))
-        .chain(value.as_bytes().iter())
-    {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-
-    (hash as usize) % limit
-}
-
-fn num_digits(mut number: usize) -> usize {
-    if number == 0 {
-        return 1;
-    }
-
-    let mut digits = 0;
-    while number > 0 {
-        number /= 10;
-        digits += 1;
-    }
-    digits
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::TimestampJitterConfig;
-    use crate::message::encoder::{JsonEncoder, ProtobufEncoder};
+    use crate::message::logs::log_encoder::{LogJsonEncoder, LogProtobufEncoder};
+    use crate::message::traces::SpanAnchor;
     use crate::pb::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
     use crate::pb::opentelemetry::proto::common::v1::{any_value, KeyValue};
     use chrono::Utc;
@@ -547,13 +396,13 @@ mod tests {
     ) -> OTLPLogMessageGenerator {
         OTLPLogMessageGenerator::new(
             "test".to_string(),
-            LabelCardinalityConfig::default(),
+            AttributesCardinalityConfig::default(),
             TimestampJitterConfig {
                 across_batch_timestamp_jitter_ns: batch_jitter_ns,
                 intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
                 intra_batch_overlap_probability,
             },
-            Arc::new(JsonEncoder),
+            Arc::new(LogJsonEncoder),
         )
     }
 
@@ -564,20 +413,21 @@ mod tests {
     ) -> OTLPLogMessageGenerator {
         OTLPLogMessageGenerator::new(
             "test".to_string(),
-            LabelCardinalityConfig::default(),
+            AttributesCardinalityConfig::default(),
             TimestampJitterConfig {
                 across_batch_timestamp_jitter_ns: batch_jitter_ns,
                 intra_batch_timestamp_jitter_ns: intra_batch_jitter_ns,
                 intra_batch_overlap_probability,
             },
-            Arc::new(ProtobufEncoder),
+            Arc::new(LogProtobufEncoder),
         )
     }
 
     fn single_shard(service_name: Option<&str>, num_records: usize) -> Vec<ServiceShard> {
         vec![ServiceShard {
             service_name: service_name.map(ToString::to_string),
-            num_records,
+            num_logs: num_records,
+            num_traces: 1,
         }]
     }
 
@@ -738,15 +588,18 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 2,
+                num_logs: 2,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 3,
+                num_logs: 3,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-c".to_string()),
-                num_records: 4,
+                num_logs: 4,
+                num_traces: 1,
             },
         ];
         let message = gen.generate_message(None, None, shards).unwrap();
@@ -787,15 +640,18 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-c".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
         ];
         let message = gen
@@ -852,15 +708,18 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-c".to_string()),
-                num_records: 1,
+                num_logs: 1,
+                num_traces: 1,
             },
         ];
         let message = gen
@@ -908,11 +767,13 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 10,
+                num_logs: 10,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 10,
+                num_logs: 10,
+                num_traces: 1,
             },
         ];
         let message = gen.generate_message(None, None, shards).unwrap();
@@ -933,15 +794,25 @@ mod tests {
     #[test]
     fn generate_message_json_keeps_all_timestamps_within_single_batch_window() {
         let batch_jitter_ns = 2_000_000_000_i64;
-        let gen = gen_json_with_jitter(batch_jitter_ns, 5_000_000, 0.0);
+        let intra_jitter_ns = 5_000_000_i64;
+        // A shard's plan starts at `now - batch_offset - total_span`, where `total_span` is the sum
+        // of the per-record forward steps (each `< intra_jitter_ns`). The oldest timestamp is
+        // therefore `batch_jitter_ns + records * intra_jitter_ns` behind `now`, not just
+        // `batch_jitter_ns` — leaving the span out makes this assertion fail whenever the sampled
+        // offset lands near its maximum.
+        let records_per_shard = 5_i64;
+        let oldest_allowed_offset_ns = batch_jitter_ns + records_per_shard * intra_jitter_ns;
+        let gen = gen_json_with_jitter(batch_jitter_ns, intra_jitter_ns, 0.0);
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 5,
+                num_logs: 5,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 5,
+                num_logs: 5,
+                num_traces: 1,
             },
         ];
         let now_before = Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -953,7 +824,7 @@ mod tests {
             for &t in &ts {
                 assert!(t <= now_after, "shard {shard_idx}: timestamp in future");
                 assert!(
-                    t >= now_before - batch_jitter_ns,
+                    t >= now_before - oldest_allowed_offset_ns,
                     "shard {shard_idx}: timestamp too old"
                 );
             }
@@ -966,11 +837,13 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 3,
+                num_logs: 3,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 4,
+                num_logs: 4,
+                num_traces: 1,
             },
         ];
         let message = gen.generate_message(None, None, shards).unwrap();
@@ -1006,6 +879,234 @@ mod tests {
         );
     }
 
+    /// Trace correlation over `count` back-to-back 1 ms spans starting at `start_ns`, mimicking the
+    /// layout the trace planner produces (index 0 is the root).
+    fn correlation_with(start_ns: i64, count: usize) -> TraceCorrelation {
+        const SPAN_LEN_NS: i64 = 1_000_000;
+        let anchors: Vec<SpanAnchor> = (0..count)
+            .map(|i| SpanAnchor {
+                span_id: [i as u8 + 1; 8],
+                start_ns: start_ns + i as i64 * SPAN_LEN_NS,
+                end_ns: start_ns + (i as i64 + 1) * SPAN_LEN_NS,
+            })
+            .collect();
+        TraceCorrelation {
+            trace_id: [7u8; 16],
+            anchors: anchors.into(),
+        }
+    }
+
+    fn correlated_plan(
+        gen: &OTLPLogMessageGenerator,
+        correlation: &TraceCorrelation,
+        num_records: usize,
+    ) -> PlannedRequest {
+        let shards = single_shard(Some("svc-a"), num_records);
+        let resource_attrs = ShardResourceAttrs::for_shards(
+            "proj",
+            None,
+            &shards,
+            "test",
+            Some(&AttributesCardinalityConfig::default()),
+        );
+        let correlations = vec![vec![correlation.clone()]];
+        gen.plan(
+            &shards,
+            "proj",
+            1_700_000_000_000_000_000,
+            Some(&correlations),
+            &resource_attrs,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_anchor_gets_records_when_records_outnumber_spans() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.05);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 4);
+        let planned = correlated_plan(&gen, &correlation, 20);
+
+        let used: std::collections::HashSet<[u8; 8]> = planned.shards[0]
+            .records
+            .iter()
+            .map(|record| record.span_id)
+            .collect();
+        assert_eq!(used.len(), 4, "records must reach every span of the trace");
+    }
+
+    #[test]
+    fn correlated_records_land_inside_their_own_span_window() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.05);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 4);
+        let planned = correlated_plan(&gen, &correlation, 37);
+
+        for record in &planned.shards[0].records {
+            let anchor = correlation
+                .anchors
+                .iter()
+                .find(|anchor| anchor.span_id == record.span_id)
+                .expect("record points at a span of the trace");
+            assert_eq!(record.trace_id, correlation.trace_id);
+            assert!(
+                record.timestamp_ns >= anchor.start_ns && record.timestamp_ns <= anchor.end_ns,
+                "record ts {} outside its span window [{},{}]",
+                record.timestamp_ns,
+                anchor.start_ns,
+                anchor.end_ns
+            );
+        }
+    }
+
+    #[test]
+    fn single_span_trace_pins_every_record_to_the_root() {
+        let gen = gen_json_with_jitter(1_000_000_000, 5_000_000, 0.05);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 1);
+        let planned = correlated_plan(&gen, &correlation, 10);
+
+        // Layout contract: anchor 0 is the root, and a one-span trace has nothing else.
+        let root = correlation.anchors[0];
+        for record in &planned.shards[0].records {
+            assert_eq!(record.span_id, root.span_id);
+            assert!(record.timestamp_ns >= root.start_ns && record.timestamp_ns <= root.end_ns);
+        }
+    }
+
+    /// The window each record must stay inside, looked up by the span it points at.
+    fn window_of(correlation: &TraceCorrelation, span_id: [u8; 8]) -> (i64, i64) {
+        let anchor = correlation
+            .anchors
+            .iter()
+            .find(|anchor| anchor.span_id == span_id)
+            .expect("record points at a span of the trace");
+        (anchor.start_ns, anchor.end_ns)
+    }
+
+    #[test]
+    fn correlated_records_are_non_decreasing_when_overlap_disabled() {
+        // Merging per-span timestamps is time-ordered, and with overlap off nothing reintroduces
+        // inversions — the same contract the log-only path has.
+        let gen = gen_json_with_jitter(1_000_000_000, 50_000, 0.0);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 4);
+        let planned = correlated_plan(&gen, &correlation, 100);
+
+        let ts: Vec<i64> = planned.shards[0]
+            .records
+            .iter()
+            .map(|record| record.timestamp_ns)
+            .collect();
+        for i in 1..ts.len() {
+            assert!(
+                ts[i - 1] <= ts[i],
+                "non-monotonic at i={i}: {} > {}",
+                ts[i - 1],
+                ts[i]
+            );
+        }
+    }
+
+    /// Correlation must not silently disable `RECORD_INTRA_BATCH_OVERLAP_PROBABILITY`: sorting the
+    /// merged slots by time erases the per-span inversions, so the nudge is re-applied afterwards.
+    #[test]
+    fn correlated_records_still_go_out_of_order_when_overlap_enabled() {
+        // Isolate the overlap knob: the across-batch offset is capped by the span window, so a
+        // large one would push most records onto the window start, where they collapse to one
+        // timestamp and no nudge can reorder them. Intra jitter stays well inside the 1 ms window.
+        let gen = gen_json_with_jitter(0, 20_000, 1.0);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 4);
+        let planned = correlated_plan(&gen, &correlation, 40);
+
+        let records = &planned.shards[0].records;
+        let inversions = records
+            .windows(2)
+            .filter(|pair| pair[1].timestamp_ns < pair[0].timestamp_ns)
+            .count();
+        assert!(
+            inversions > 0,
+            "overlap_probability=1.0 must still produce out-of-order records when correlated"
+        );
+        // The nudge stays inside the span each record points at.
+        for record in records {
+            let (start_ns, end_ns) = window_of(&correlation, record.span_id);
+            assert!(
+                record.timestamp_ns >= start_ns && record.timestamp_ns <= end_ns,
+                "nudged record ts {} outside its span window [{start_ns},{end_ns}]",
+                record.timestamp_ns
+            );
+        }
+    }
+
+    /// A one-span trace must follow the same route as a big tree: same knobs, same emitted shape.
+    #[test]
+    fn single_span_trace_also_honours_overlap() {
+        // Same isolation as the multi-span case; here all 40 records share the single 1 ms window.
+        let gen = gen_json_with_jitter(0, 20_000, 1.0);
+        let correlation = correlation_with(1_700_000_000_000_000_000, 1);
+        let planned = correlated_plan(&gen, &correlation, 40);
+
+        let records = &planned.shards[0].records;
+        let inversions = records
+            .windows(2)
+            .filter(|pair| pair[1].timestamp_ns < pair[0].timestamp_ns)
+            .count();
+        assert!(
+            inversions > 0,
+            "a single-span trace must honour overlap_probability like any other"
+        );
+        let root = correlation.anchors[0];
+        for record in records {
+            assert!(record.timestamp_ns >= root.start_ns && record.timestamp_ns <= root.end_ns);
+        }
+    }
+
+    #[test]
+    fn correlation_without_spans_is_rejected() {
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let shards = single_shard(Some("svc-a"), 2);
+        let resource_attrs = ShardResourceAttrs::for_shards("proj", None, &shards, "test", None);
+        let correlation = TraceCorrelation {
+            trace_id: [7u8; 16],
+            anchors: Vec::new().into(),
+        };
+        let result = gen.plan(
+            &shards,
+            "proj",
+            1_700_000_000_000_000_000,
+            Some(&[vec![correlation]]),
+            &resource_attrs,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
+            "expected InvalidConfiguration for a correlation carrying no spans"
+        );
+    }
+
+    #[test]
+    fn shard_without_traces_is_rejected() {
+        // A shard with no correlation has nothing to split its records over; the trace planner
+        // guarantees at least one trace per shard, so this must fail loudly rather than divide by
+        // zero.
+        let gen = gen_json_with_jitter(0, 0, 0.0);
+        let shards = single_shard(Some("svc-a"), 2);
+        let resource_attrs = ShardResourceAttrs::for_shards("proj", None, &shards, "test", None);
+        let result = gen.plan(
+            &shards,
+            "proj",
+            1_700_000_000_000_000_000,
+            Some(&[Vec::new()]),
+            &resource_attrs,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::GeneratorError::InvalidConfiguration(_))
+            ),
+            "expected InvalidConfiguration for a shard carrying no traces"
+        );
+    }
+
     #[test]
     fn generate_message_returns_error_for_empty_shards_json() {
         let gen = gen_json_with_jitter(0, 0, 0.0);
@@ -1024,7 +1125,8 @@ mod tests {
         let gen = gen_json_with_jitter(0, 0, 0.0);
         let shards = vec![ServiceShard {
             service_name: None,
-            num_records: 0,
+            num_logs: 0,
+            num_traces: 1,
         }];
         let result = gen.generate_message(None, None, shards);
         assert!(
@@ -1042,11 +1144,13 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 2,
+                num_logs: 2,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 0,
+                num_logs: 0,
+                num_traces: 1,
             },
         ];
         let result = gen.generate_message(None, None, shards);
@@ -1067,15 +1171,18 @@ mod tests {
         let shards = vec![
             ServiceShard {
                 service_name: Some("svc-a".to_string()),
-                num_records: 0,
+                num_logs: 0,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-b".to_string()),
-                num_records: 2,
+                num_logs: 2,
+                num_traces: 1,
             },
             ServiceShard {
                 service_name: Some("svc-c".to_string()),
-                num_records: 3,
+                num_logs: 3,
+                num_traces: 1,
             },
         ];
         let result = gen.generate_message(None, None, shards);

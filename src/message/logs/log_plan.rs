@@ -10,9 +10,9 @@ pub struct PlannedRecord {
     pub severity_number: i32,
     pub severity_text: String,
     pub body: String,
-    /// 16 raw bytes; `JsonEncoder` hex-encodes, `ProtobufEncoder` takes `.to_vec()` directly.
+    /// 16 raw bytes; `LogJsonEncoder` hex-encodes, `LogProtobufEncoder` takes `.to_vec()` directly.
     pub trace_id: [u8; 16],
-    /// 8 raw bytes; `JsonEncoder` hex-encodes, `ProtobufEncoder` takes `.to_vec()` directly.
+    /// 8 raw bytes; `LogJsonEncoder` hex-encodes, `LogProtobufEncoder` takes `.to_vec()` directly.
     pub span_id: [u8; 8],
     pub flags: u32,
     pub attributes: Vec<(String, String)>,

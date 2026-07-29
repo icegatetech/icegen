@@ -34,7 +34,7 @@ where
         match attempt().await {
             Ok(()) => {
                 if attempt_idx > 0 {
-                    eprintln!("  \u{2713} Request succeeded after {} retries", attempt_idx);
+                    tracing::info!("  [ok] Request succeeded after {} retries", attempt_idx);
                 }
                 return SendOutcome::Success {
                     retries: attempt_idx as usize,
@@ -55,8 +55,8 @@ where
                     };
                 }
                 let delay = retry_config.compute_delay(attempt_idx, None);
-                eprintln!(
-                    " \u{26a0} Retry[grpc]: {}, attempt {}/{}, waiting {}ms, error: {}",
+                tracing::warn!(
+                    " [warn] Retry[grpc]: {}, attempt {}/{}, waiting {}ms, error: {}",
                     status.code(),
                     attempt_idx + 1,
                     max_retries + 1,

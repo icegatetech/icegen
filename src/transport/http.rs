@@ -1,26 +1,33 @@
 use crate::config::RetryConfig;
 use crate::error::{GeneratorError, Result};
-use crate::message::{MessagePayload, OTLPMessage};
+use crate::message::{MessagePayload, OTLPMessage, Signal};
 use crate::transport::{AuthHeaders, SendOutcome, Transport};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
+/// OTLP-over-HTTP transport. One `reqwest` client (shared connection pool and default auth
+/// headers) serves every signal; [`Transport::send`] routes each message to its per-signal
+/// endpoint and applies the retry policy.
 pub struct HttpTransport {
     client: Client,
-    endpoint: String,
+    /// Per-signal target URLs; a message is routed by its [`Signal`] so logs and traces reach their
+    /// own paths (`/v1/logs`, `/v1/traces`) while sharing one connection pool and auth headers.
+    endpoints: HashMap<Signal, String>,
     #[allow(dead_code)]
     use_protobuf: bool,
     retry_config: RetryConfig,
 }
 
 impl HttpTransport {
+    /// Build an HTTP transport with a per-signal endpoint map and a shared connection pool.
     #[allow(clippy::result_large_err)]
     pub fn new(
-        endpoint: String,
+        endpoints: HashMap<Signal, String>,
         use_protobuf: bool,
         retry_config: RetryConfig,
         auth: AuthHeaders,
@@ -49,35 +56,18 @@ impl HttpTransport {
 
         Ok(Self {
             client,
-            endpoint,
+            endpoints,
             use_protobuf,
             retry_config,
         })
     }
 
-    pub async fn health_check(&self, health_endpoint: &str) -> Result<()> {
-        let response = self
-            .client
-            .get(health_endpoint)
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(GeneratorError::HealthCheckFailed(
-                response.status().as_u16(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn build_request(&self, message: &OTLPMessage) -> reqwest::RequestBuilder {
+    fn build_request(&self, message: &OTLPMessage, endpoint: &str) -> reqwest::RequestBuilder {
         match &message.message {
             MessagePayload::Json(json_value) => {
                 let mut req = self
                     .client
-                    .post(&self.endpoint)
+                    .post(endpoint)
                     .header("Content-Type", "application/json")
                     .header("User-Agent", "trihub-log-generator/1.0");
                 if let Some(tid) = &message.tenant_id {
@@ -88,7 +78,7 @@ impl HttpTransport {
             MessagePayload::Protobuf(bytes) => {
                 let mut req = self
                     .client
-                    .post(&self.endpoint)
+                    .post(endpoint)
                     .header("Content-Type", "application/x-protobuf")
                     .header("User-Agent", "trihub-log-generator/1.0");
                 if let Some(tid) = &message.tenant_id {
@@ -99,7 +89,7 @@ impl HttpTransport {
             MessagePayload::MalformedJson(malformed_string) => {
                 let mut req = self
                     .client
-                    .post(&self.endpoint)
+                    .post(endpoint)
                     .header("Content-Type", "application/json")
                     .header("User-Agent", "trihub-log-generator/1.0");
                 if let Some(tid) = &message.tenant_id {
@@ -121,15 +111,31 @@ impl Transport for HttpTransport {
         let max_retries = self.retry_config.max_retries;
         let mut shutdown_rx = shutdown_rx.clone();
 
+        // Route by signal. Config validation guarantees an endpoint per configured signal; this is
+        // an explicit guard rather than a silent misroute if that ever fails to hold. The URL is
+        // borrowed straight from the map for the lifetime of this send — no per-request allocation.
+        let endpoint: &str = match self.endpoints.get(&message.signal) {
+            Some(endpoint) => endpoint.as_str(),
+            None => {
+                return SendOutcome::Failure {
+                    retries: 0,
+                    error: GeneratorError::InvalidConfiguration(format!(
+                        "no HTTP endpoint configured for signal '{}'",
+                        message.signal.as_str()
+                    )),
+                }
+            }
+        };
+
         for attempt in 0..=max_retries {
-            let request = self.build_request(message);
+            let request = self.build_request(message, endpoint);
 
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) if attempt < max_retries && is_transient_reqwest_error(&e) => {
                     let delay = self.retry_config.compute_delay(attempt, None);
-                    eprintln!(
-                        "  \u{26a0} Retry[http]: transient network error, attempt {}/{}, waiting {}ms, error: {}",
+                    tracing::warn!(
+                        "  [warn] Retry[http]: transient network error, attempt {}/{}, waiting {}ms, error: {}",
                         attempt + 1,
                         max_retries + 1,
                         delay,
@@ -184,8 +190,8 @@ impl Transport for HttpTransport {
 
             if status.is_success() {
                 if attempt > 0 {
-                    eprintln!(
-                        "  \u{2713} Retry[http]: request succeeded after {} retries",
+                    tracing::info!(
+                        "  [ok] Retry[http]: request succeeded after {} retries",
                         attempt
                     );
                 }
@@ -202,8 +208,8 @@ impl Transport for HttpTransport {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok());
                     let body = response.text().await.unwrap_or_default();
-                    eprintln!(
-                        "  \u{26a0} Retry[http]: 429 Too Many Requests, attempt {}/{}, retry-after: {:?}, body: {}",
+                    tracing::warn!(
+                        "  [warn] Retry[http]: 429 Too Many Requests, attempt {}/{}, retry-after: {:?}, body: {}",
                         attempt + 1,
                         max_retries + 1,
                         retry_after,
@@ -224,8 +230,8 @@ impl Transport for HttpTransport {
 
                 let delay = self.retry_config.compute_delay(attempt, retry_after);
 
-                eprintln!(
-                    "  \u{26a0} Retry[http]: 429 Too Many Requests, attempt {}/{}, waiting {}ms",
+                tracing::warn!(
+                    "  [warn] Retry[http]: 429 Too Many Requests, attempt {}/{}, waiting {}ms",
                     attempt + 1,
                     max_retries + 1,
                     delay
@@ -284,8 +290,15 @@ mod tests {
     use crate::message::Signal;
     use serde_json::json;
 
+    const LOGS_URL: &str = "http://localhost:4318/v1/logs";
+    const TRACES_URL: &str = "http://localhost:4318/v1/traces";
+
     fn retry_config() -> RetryConfig {
         RetryConfig::new(1, 1000, 2000).unwrap()
+    }
+
+    fn logs_endpoints() -> HashMap<Signal, String> {
+        HashMap::from([(Signal::Logs, LOGS_URL.to_string())])
     }
 
     fn message(tenant_id: &str) -> OTLPMessage {
@@ -302,7 +315,7 @@ mod tests {
     #[test]
     fn http_header_uses_message_tenant_id() {
         let transport = HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
+            logs_endpoints(),
             false,
             retry_config(),
             AuthHeaders::default(),
@@ -310,7 +323,7 @@ mod tests {
         .unwrap();
 
         let request = transport
-            .build_request(&message("tenant2"))
+            .build_request(&message("tenant2"), LOGS_URL)
             .build()
             .unwrap();
         assert_eq!(request.headers().get("X-Scope-OrgID").unwrap(), "tenant2");
@@ -319,7 +332,7 @@ mod tests {
     #[test]
     fn consecutive_requests_can_use_different_tenants() {
         let transport = HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
+            logs_endpoints(),
             false,
             retry_config(),
             AuthHeaders::default(),
@@ -327,11 +340,11 @@ mod tests {
         .unwrap();
 
         let first = transport
-            .build_request(&message("tenant1"))
+            .build_request(&message("tenant1"), LOGS_URL)
             .build()
             .unwrap();
         let second = transport
-            .build_request(&message("tenant3"))
+            .build_request(&message("tenant3"), LOGS_URL)
             .build()
             .unwrap();
 
@@ -342,7 +355,7 @@ mod tests {
     #[test]
     fn http_omits_scope_header_when_tenant_id_none() {
         let transport = HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
+            logs_endpoints(),
             false,
             retry_config(),
             AuthHeaders::default(),
@@ -357,7 +370,7 @@ mod tests {
             "source1".to_string(),
             crate::message::OTLPMessageType::Valid,
         );
-        let request = transport.build_request(&msg).build().unwrap();
+        let request = transport.build_request(&msg, LOGS_URL).build().unwrap();
         assert!(request.headers().get("X-Scope-OrgID").is_none());
     }
 
@@ -367,13 +380,7 @@ mod tests {
         // are not observable on a `.build()`-only request. Here we assert the construction path: a
         // valid auth set builds a transport without error (the headers ride on every real request).
         let auth = AuthHeaders::build("x-api-key=secret", Some("xyz"), None).unwrap();
-        assert!(HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
-            false,
-            retry_config(),
-            auth,
-        )
-        .is_ok());
+        assert!(HttpTransport::new(logs_endpoints(), false, retry_config(), auth,).is_ok());
     }
 
     #[tokio::test]
@@ -410,7 +417,7 @@ mod tests {
 
         let auth = AuthHeaders::build("x-api-key=secret", Some("xyz"), None).unwrap();
         let transport = HttpTransport::new(
-            format!("http://{addr}/v1/logs"),
+            HashMap::from([(Signal::Logs, format!("http://{addr}/v1/logs"))]),
             false,
             retry_config(),
             auth,
@@ -433,14 +440,76 @@ mod tests {
     }
 
     #[test]
-    fn http_rejects_invalid_auth_header_name() {
-        let auth = AuthHeaders::build("bad key=value", None, None).unwrap();
-        let result = HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
+    fn build_request_routes_each_signal_to_its_own_endpoint() {
+        let transport = HttpTransport::new(
+            HashMap::from([
+                (Signal::Logs, LOGS_URL.to_string()),
+                (Signal::Traces, TRACES_URL.to_string()),
+            ]),
             false,
             retry_config(),
-            auth,
+            AuthHeaders::default(),
+        )
+        .unwrap();
+
+        let trace_msg = OTLPMessage::new(
+            MessagePayload::Json(json!({"resourceSpans": []})),
+            Signal::Traces,
+            None,
+            "project1".to_string(),
+            "source1".to_string(),
+            crate::message::OTLPMessageType::Valid,
         );
+
+        let logs_req = transport
+            .build_request(
+                &message("tenant1"),
+                transport.endpoints[&Signal::Logs].as_str(),
+            )
+            .build()
+            .unwrap();
+        let trace_req = transport
+            .build_request(&trace_msg, transport.endpoints[&Signal::Traces].as_str())
+            .build()
+            .unwrap();
+
+        assert_eq!(logs_req.url().as_str(), LOGS_URL);
+        assert_eq!(trace_req.url().as_str(), TRACES_URL);
+    }
+
+    #[tokio::test]
+    async fn send_fails_when_no_endpoint_for_signal() {
+        // A traces message hitting a logs-only transport must fail explicitly, not misroute.
+        let transport = HttpTransport::new(
+            logs_endpoints(),
+            false,
+            retry_config(),
+            AuthHeaders::default(),
+        )
+        .unwrap();
+        let trace_msg = OTLPMessage::new(
+            MessagePayload::Json(json!({"resourceSpans": []})),
+            Signal::Traces,
+            None,
+            "project1".to_string(),
+            "source1".to_string(),
+            crate::message::OTLPMessageType::Valid,
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let outcome = transport.send(&trace_msg, &rx).await;
+        assert!(matches!(
+            outcome,
+            SendOutcome::Failure {
+                error: GeneratorError::InvalidConfiguration(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn http_rejects_invalid_auth_header_name() {
+        let auth = AuthHeaders::build("bad key=value", None, None).unwrap();
+        let result = HttpTransport::new(logs_endpoints(), false, retry_config(), auth);
         assert!(matches!(
             result,
             Err(GeneratorError::InvalidConfiguration(_))
@@ -450,12 +519,7 @@ mod tests {
     #[test]
     fn http_rejects_invalid_auth_header_value() {
         let auth = AuthHeaders::build("x-token=bad\u{1}val", None, None).unwrap();
-        let result = HttpTransport::new(
-            "http://localhost:4318/v1/logs".to_string(),
-            false,
-            retry_config(),
-            auth,
-        );
+        let result = HttpTransport::new(logs_endpoints(), false, retry_config(), auth);
         assert!(matches!(
             result,
             Err(GeneratorError::InvalidConfiguration(_))

@@ -12,3 +12,5 @@ pub use trace_plan::{
     AttrValue, PlannedEvent, PlannedResourceSpans, PlannedScopeSpans, PlannedSpan, PlannedTraces,
     SpanAttrs, SpanKind, SpanStatusCode,
 };
+// Orchestration handles for the planners only; not part of the public library API.
+pub(crate) use trace_plan::{SpanAnchor, TraceCorrelation};

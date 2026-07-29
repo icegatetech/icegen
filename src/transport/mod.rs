@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod destination;
 pub mod grpc;
 pub mod grpc_retry;
 pub mod http;
@@ -50,6 +51,7 @@ pub trait Transport: Send + Sync {
 }
 
 pub use auth::AuthHeaders;
-pub use grpc::{LogGrpcTransport, TraceGrpcTransport};
+pub use destination::{Destination, DestinationFlags, TransportFlow};
+pub use grpc::GrpcTransport;
 pub use http::HttpTransport;
 pub use noop::NoopTransport;

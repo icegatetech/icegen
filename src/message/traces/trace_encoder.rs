@@ -65,13 +65,7 @@ impl TraceEncoder for TraceJsonEncoder {
 }
 
 fn encode_resource_spans_json(rs: &PlannedResourceSpans) -> Value {
-    let trace_id_hex = hex::encode(rs.trace_id);
-    let spans: Vec<Value> = rs
-        .scope
-        .spans
-        .iter()
-        .map(|s| encode_span_json(s, &trace_id_hex))
-        .collect();
+    let spans: Vec<Value> = rs.scope.spans.iter().map(encode_span_json).collect();
     json!({
         "resource": {
             "attributes": pairs_to_json_attrs(&rs.resource_attrs),
@@ -90,9 +84,9 @@ fn encode_resource_spans_json(rs: &PlannedResourceSpans) -> Value {
     })
 }
 
-fn encode_span_json(span: &PlannedSpan, trace_id_hex: &str) -> Value {
+fn encode_span_json(span: &PlannedSpan) -> Value {
     let mut obj = json!({
-        "traceId": trace_id_hex,
+        "traceId": hex::encode(span.trace_id),
         "spanId": hex::encode(span.span_id),
         "name": span.name,
         "kind": span_kind_to_i32(span.kind),
@@ -132,7 +126,7 @@ impl TraceEncoder for TraceProtobufEncoder {
                     .spans
                     .iter()
                     .map(|s| Span {
-                        trace_id: rs.trace_id.to_vec(),
+                        trace_id: s.trace_id.to_vec(),
                         span_id: s.span_id.to_vec(),
                         trace_state: String::new(),
                         parent_span_id: s.parent_span_id.map(|p| p.to_vec()).unwrap_or_default(),
@@ -203,13 +197,13 @@ mod tests {
             resource_spans: vec![PlannedResourceSpans {
                 resource_attrs: vec![("service.name".to_string(), "svc-a".to_string())],
                 resource_dropped_attributes_count: 0,
-                trace_id: [0xAB; 16],
                 scope: PlannedScopeSpans {
                     scope_name: "io.trihub.svc-a".to_string(),
                     scope_version: "1.0.0".to_string(),
                     scope_attrs: vec![],
                     spans: vec![
                         PlannedSpan {
+                            trace_id: [0xAB; 16],
                             span_id: [0x01; 8],
                             parent_span_id: None,
                             name: "invoke_agent x".to_string(),
@@ -225,6 +219,7 @@ mod tests {
                             status_message: String::new(),
                         },
                         PlannedSpan {
+                            trace_id: [0xAB; 16],
                             span_id: [0x02; 8],
                             parent_span_id: Some([0x01; 8]),
                             name: "chat gpt-4o".to_string(),
@@ -261,6 +256,77 @@ mod tests {
         assert_eq!(
             spans[0]["attributes"][0]["value"]["intValue"].as_str(),
             Some("42")
+        );
+    }
+
+    /// One `ResourceSpans` group holding the (single-span) trees of two different traces — the
+    /// shape a service shard with `num_traces > 1` produces.
+    fn group_with_two_traces() -> PlannedTraces {
+        let root = |trace_id: [u8; 16], span_id: [u8; 8]| PlannedSpan {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            name: "invoke_agent x".to_string(),
+            kind: SpanKind::Internal,
+            start_ns: 100,
+            end_ns: 900,
+            attributes: vec![],
+            events: vec![],
+            status_code: SpanStatusCode::Unset,
+            status_message: String::new(),
+        };
+        PlannedTraces {
+            project_id: "proj-1".to_string(),
+            resource_spans: vec![PlannedResourceSpans {
+                resource_attrs: vec![("service.name".to_string(), "svc-a".to_string())],
+                resource_dropped_attributes_count: 0,
+                scope: PlannedScopeSpans {
+                    scope_name: "io.trihub.svc-a".to_string(),
+                    scope_version: "1.0.0".to_string(),
+                    scope_attrs: vec![],
+                    spans: vec![root([0xAA; 16], [0x01; 8]), root([0xBB; 16], [0x02; 8])],
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn json_encoder_keeps_per_span_trace_ids_within_one_group() {
+        let MessagePayload::Json(json) = TraceJsonEncoder.encode(&group_with_two_traces()).unwrap()
+        else {
+            panic!("expected JSON");
+        };
+        let groups = json["resourceSpans"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        let spans = groups[0]["scopeSpans"][0]["spans"].as_array().unwrap();
+        let trace_ids: Vec<&str> = spans
+            .iter()
+            .map(|s| s["traceId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            trace_ids,
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+        );
+    }
+
+    #[test]
+    fn protobuf_encoder_keeps_per_span_trace_ids_within_one_group() {
+        let MessagePayload::Protobuf(bytes) = TraceProtobufEncoder
+            .encode(&group_with_two_traces())
+            .unwrap()
+        else {
+            panic!("expected protobuf");
+        };
+        let decoded = ExportTraceServiceRequest::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.resource_spans.len(), 1);
+        let spans = &decoded.resource_spans[0].scope_spans[0].spans;
+        let trace_ids: Vec<&[u8]> = spans.iter().map(|s| s.trace_id.as_slice()).collect();
+        assert_eq!(
+            trace_ids,
+            vec![[0xAA; 16].as_slice(), [0xBB; 16].as_slice()]
         );
     }
 
